@@ -48,3 +48,21 @@ gunicorn app:app
 7. Disconnect Zoom from the Zoom accounts page.
 
 No real provider credentials are included or required.
+
+
+## Reviewer handover state
+
+This package preserves course sync state across Render restarts by default.
+
+Recommended setup before sharing with Zoom:
+1. Deploy this package.
+2. Log in and connect Zoom.
+3. Sync the first two courses only.
+4. Leave the remaining courses not checked.
+5. Disconnect Zoom if you want reviewers to test OAuth from the start.
+
+Manual reset URL while logged in:
+- `/reset-dashboard-data` resets course sync state.
+- `/reset-dashboard-data?disconnect=1` also clears the connected Zoom account.
+
+Only set `TRAINERMATE_RESET_SEEDED_COURSES=1` temporarily if you want the seed process itself to wipe course sync state on restart. Keep it unset or `0` for review.

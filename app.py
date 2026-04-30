@@ -248,7 +248,7 @@ def ensure_reviewer_demo_seed():
             'access': {
                 'allowed': True,
                 'paid': True,
-                'plan': 'reviewer',
+                'plan': 'paid',
                 'features': {
                     'sync_window_days': 84,
                     'automatic_sync': True,
@@ -302,10 +302,18 @@ def ensure_reviewer_demo_seed():
         """)
         now = datetime.now()
         demo_courses = [
-            ('course-efaw', 'Emergency First Aid at Work', now + timedelta(days=12), '09:30'),
-            ('course-manual-handling', 'Manual Handling Refresher', now + timedelta(days=14), '10:00'),
-            ('course-safeguarding', 'Safeguarding Level 2', now + timedelta(days=19), '13:00'),
-            ('course-medication', 'Medication Awareness', now + timedelta(days=23), '09:15'),
+            ('course-efaw-001', 'Emergency First Aid at Work', now + timedelta(days=12), '09:30'),
+            ('course-manual-handling-001', 'Manual Handling Refresher', now + timedelta(days=14), '10:00'),
+            ('course-safeguarding-001', 'Safeguarding Level 2', now + timedelta(days=19), '13:00'),
+            ('course-medication-001', 'Medication Awareness', now + timedelta(days=23), '09:15'),
+            ('course-fire-marshal-001', 'Fire Marshal Training', now + timedelta(days=26), '13:00'),
+            ('course-food-safety-001', 'Food Safety Level 2', now + timedelta(days=31), '09:30'),
+            ('course-moving-handling-001', 'Moving and Handling People', now + timedelta(days=36), '10:00'),
+            ('course-mental-health-001', 'Mental Health Awareness', now + timedelta(days=42), '09:00'),
+            ('course-infection-control-001', 'Infection Prevention and Control', now + timedelta(days=48), '14:00'),
+            ('course-dementia-001', 'Dementia Awareness', now + timedelta(days=55), '09:30'),
+            ('course-health-safety-001', 'Health and Safety in the Workplace', now + timedelta(days=63), '10:00'),
+            ('course-lone-working-001', 'Lone Working and Personal Safety', now + timedelta(days=76), '11:00'),
         ]
         for course_id, title, date_base, time_text in demo_courses:
             hh, mm = [int(x) for x in time_text.split(':')]
@@ -318,10 +326,19 @@ def ensure_reviewer_demo_seed():
                     provider=excluded.provider,
                     title=excluded.title,
                     date_time=excluded.date_time,
+                    meeting_id=CASE WHEN COALESCE(?, '1') != '0' THEN '' ELSE courses.meeting_id END,
+                    meeting_link=CASE WHEN COALESCE(?, '1') != '0' THEN '' ELSE courses.meeting_link END,
+                    meeting_password=CASE WHEN COALESCE(?, '1') != '0' THEN '' ELSE courses.meeting_password END,
+                    last_synced_at=CASE WHEN COALESCE(?, '1') != '0' THEN '' ELSE courses.last_synced_at END,
+                    last_sync_status=CASE WHEN COALESCE(?, '1') != '0' THEN '' ELSE courses.last_sync_status END,
+                    last_sync_action=CASE WHEN COALESCE(?, '1') != '0' THEN 'Course imported from provider schedule.' ELSE courses.last_sync_action END,
                     active_in_portal=1,
                     last_seen_at=excluded.last_seen_at,
                     fobs_course_url=excluded.fobs_course_url
-            """, (course_id, title, dt.strftime('%Y-%m-%d %H:%M'), utc_now_text(), f'https://essex.trainermate.local/courses/{course_id}'))
+            """, (course_id, title, dt.strftime('%Y-%m-%d %H:%M'), utc_now_text(), f'https://essex.trainermate.local/courses/{course_id}',
+                  os.getenv('TRAINERMATE_RESET_SEEDED_COURSES', '0'), os.getenv('TRAINERMATE_RESET_SEEDED_COURSES', '0'),
+                  os.getenv('TRAINERMATE_RESET_SEEDED_COURSES', '0'), os.getenv('TRAINERMATE_RESET_SEEDED_COURSES', '0'),
+                  os.getenv('TRAINERMATE_RESET_SEEDED_COURSES', '0'), os.getenv('TRAINERMATE_RESET_SEEDED_COURSES', '0')))
         conn.commit()
     except Exception:
         pass
@@ -10520,6 +10537,41 @@ def reviewer_course_by_id(course_id):
         return dict(row) if row else None
     finally:
         conn.close()
+
+
+def reset_reviewer_course_state(disconnect_zoom=False):
+    """Reset seeded course rows to a clean trainer-ready state."""
+    if not reviewer_demo_enabled():
+        return
+    conn = sqlite3.connect(str(COURSES_DB_PATH))
+    try:
+        ensure_courses_sync_columns(conn)
+        conn.execute("""
+            UPDATE courses
+               SET meeting_id = '',
+                   meeting_link = '',
+                   meeting_password = '',
+                   last_synced_at = '',
+                   last_sync_status = '',
+                   last_sync_action = 'Course imported from provider schedule.'
+             WHERE provider = 'Essex'
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+    if disconnect_zoom:
+        save_zoom_accounts([])
+
+
+@app.route('/reset-dashboard-data', methods=['GET', 'POST'])
+def reset_dashboard_data():
+    if not reviewer_demo_enabled():
+        return redirect(url_for('home'))
+    if not reviewer_demo_logged_in():
+        return redirect(url_for('trainer_login', next=request.path))
+    reset_reviewer_course_state(disconnect_zoom=request.args.get('disconnect') == '1')
+    set_flash('TrainerMate has refreshed the course list.', 'success')
+    return redirect(url_for('home', section='dashboard', provider='essex'))
 
 
 def reviewer_update_course_zoom(course_id, meeting_id, join_url, password='', action='Zoom meeting created for TrainerMate'):
