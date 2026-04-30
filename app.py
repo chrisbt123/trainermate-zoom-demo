@@ -1042,6 +1042,11 @@ def derive_documents_url(login_url: str) -> str:
 
 
 def get_identity():
+    if reviewer_demo_enabled():
+        return {
+            'ndors': os.getenv('TRAINERMATE_REVIEWER_NDORS', 'TM-PAID-1027'),
+            'email': os.getenv('TRAINERMATE_LOGIN_EMAIL', 'reviewer@zoom.us'),
+        }
     return {
         'ndors': keyring.get_password('trainermate', 'ndors_id') or '',
         'email': keyring.get_password('trainermate', 'email') or '',
@@ -1769,6 +1774,20 @@ def get_cached_access_if_fresh(max_age_seconds=ACCESS_CACHE_MAX_AGE_SECONDS):
 
 
 def check_access(timeout_seconds=ACTION_ACCESS_TIMEOUT_SECONDS, prefer_cached=False):
+    if reviewer_demo_enabled():
+        return {
+            'allowed': True,
+            'paid': True,
+            'is_paid': True,
+            'plan': 'paid',
+            'tier': 'paid',
+            'features': {
+                'sync_window_days': 84,
+                'automatic_sync': True,
+                'calendar_sync': True,
+                'certificate_manage': True,
+            },
+        }
     identity = get_identity()
     if not identity['ndors'].strip():
         return None
