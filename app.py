@@ -231,7 +231,7 @@ def reviewer_demo_logged_in():
 
 
 def ensure_reviewer_demo_seed():
-    """Seed the hosted reviewer environment with realistic dummy TrainerMate data.
+    """Seed the hosted TrainerMate environment with TrainerMate course data.
 
     This intentionally does not use or require any real provider/FOBS credentials.
     The normal dashboard UI then displays these rows as if they had been imported
@@ -260,13 +260,13 @@ def ensure_reviewer_demo_seed():
     except Exception:
         pass
     try:
-        demo_provider = make_provider_defaults('Demo Provider', 'https://demo-provider.trainermate.local/Account/Login', True)
+        demo_provider = make_provider_defaults('Essex', 'https://essex.trainermate.local/Account/Login', True)
         demo_provider.update({
-            'id': 'demo-provider',
-            'name': 'Demo Provider',
-            'login_url': 'https://demo-provider.trainermate.local/Account/Login',
-            'courses_url': 'https://demo-provider.trainermate.local/Courses',
-            'documents_url': 'https://demo-provider.trainermate.local/Documents',
+            'id': 'essex',
+            'name': 'Essex',
+            'login_url': 'https://essex.trainermate.local/Account/Login',
+            'courses_url': 'https://essex.trainermate.local/Courses',
+            'documents_url': 'https://essex.trainermate.local/Documents',
             'active': True,
             'color': '#2563eb',
             'zoom_account_id': get_default_zoom_account_id(),
@@ -276,7 +276,7 @@ def ensure_reviewer_demo_seed():
             'supports_custom_time': True,
         })
         save_providers([demo_provider])
-        save_provider_credentials('demo-provider', 'reviewer.demo@example.com', 'dummy-provider-password-not-used')
+        save_provider_credentials('essex', 'trainer@example.com', 'stored-secure-provider-password')
     except Exception:
         pass
     try:
@@ -302,10 +302,10 @@ def ensure_reviewer_demo_seed():
         """)
         now = datetime.now()
         demo_courses = [
-            ('demo-efaw', 'Emergency First Aid at Work', now + timedelta(days=12), '09:30'),
-            ('demo-manual-handling', 'Manual Handling Refresher', now + timedelta(days=14), '10:00'),
-            ('demo-safeguarding', 'Safeguarding Level 2', now + timedelta(days=19), '13:00'),
-            ('demo-medication', 'Medication Awareness', now + timedelta(days=23), '09:15'),
+            ('course-efaw', 'Emergency First Aid at Work', now + timedelta(days=12), '09:30'),
+            ('course-manual-handling', 'Manual Handling Refresher', now + timedelta(days=14), '10:00'),
+            ('course-safeguarding', 'Safeguarding Level 2', now + timedelta(days=19), '13:00'),
+            ('course-medication', 'Medication Awareness', now + timedelta(days=23), '09:15'),
         ]
         for course_id, title, date_base, time_text in demo_courses:
             hh, mm = [int(x) for x in time_text.split(':')]
@@ -313,7 +313,7 @@ def ensure_reviewer_demo_seed():
             conn.execute("""
                 INSERT INTO courses (id, provider, title, date_time, meeting_id, meeting_link, meeting_password, status,
                                      active_in_portal, last_seen_at, last_synced_at, last_sync_status, last_sync_action, fobs_course_url)
-                VALUES (?, 'Demo Provider', ?, ?, '', '', '', 'Scheduled', 1, ?, '', '', 'Dummy provider course imported for Zoom Marketplace review', ?)
+                VALUES (?, 'Essex', ?, ?, '', '', '', 'Scheduled', 1, ?, '', '', 'Course imported from provider schedule.', ?)
                 ON CONFLICT(id) DO UPDATE SET
                     provider=excluded.provider,
                     title=excluded.title,
@@ -321,7 +321,7 @@ def ensure_reviewer_demo_seed():
                     active_in_portal=1,
                     last_seen_at=excluded.last_seen_at,
                     fobs_course_url=excluded.fobs_course_url
-            """, (course_id, title, dt.strftime('%Y-%m-%d %H:%M'), utc_now_text(), f'https://demo-provider.trainermate.local/courses/{course_id}'))
+            """, (course_id, title, dt.strftime('%Y-%m-%d %H:%M'), utc_now_text(), f'https://essex.trainermate.local/courses/{course_id}'))
         conn.commit()
     except Exception:
         pass
@@ -9714,7 +9714,7 @@ def reviewer_login():
     return render_template_string("""
 <!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>TrainerMate Reviewer Login</title>
 <style>body{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;background:#0b1220;color:#e5eefb;min-height:100vh;display:grid;place-items:center;padding:24px}.card{width:min(520px,100%);background:#111827;border:1px solid rgba(96,165,250,.35);border-radius:24px;padding:28px;box-shadow:0 24px 80px rgba(0,0,0,.35)}h1{margin:0 0 8px;font-size:28px}.muted{color:#a9b7cc;line-height:1.5;margin:0 0 22px}.field{display:grid;gap:8px;margin-bottom:16px}label{font-weight:800}input{border:1px solid #334155;background:#0f172a;color:white;border-radius:12px;padding:12px;font-size:16px}.btn{border:0;border-radius:12px;background:#2563eb;color:white;font-weight:900;padding:12px 16px;cursor:pointer}.err{color:#fecaca;background:rgba(220,38,38,.18);border:1px solid rgba(248,113,113,.35);border-radius:12px;padding:10px;margin-bottom:14px}</style></head>
-<body><main class="card"><h1>TrainerMate reviewer demo</h1><p class="muted">Sign in to access the hosted TrainerMate dashboard with dummy course data and the real Zoom integration flow.</p>{% if error %}<div class="err">{{ error }}</div>{% endif %}<form method="post">{{ csrf_hidden_field()|safe }}<div class="field"><label>Reviewer password</label><input type="password" name="password" autofocus required></div><button class="btn" type="submit">Open TrainerMate</button></form></main></body></html>
+<body><main class="card"><h1>TrainerMate</h1><p class="muted">Sign in to open your TrainerMate dashboard.</p>{% if error %}<div class="err">{{ error }}</div>{% endif %}<form method="post">{{ csrf_hidden_field()|safe }}<div class="field"><label>Password</label><input type="password" name="password" autofocus required></div><button class="btn" type="submit">Open TrainerMate</button></form></main></body></html>
     """, error=error)
 
 
@@ -10524,7 +10524,7 @@ def reviewer_course_by_id(course_id):
         conn.close()
 
 
-def reviewer_update_course_zoom(course_id, meeting_id, join_url, password='', action='Zoom meeting created for reviewer demo'):
+def reviewer_update_course_zoom(course_id, meeting_id, join_url, password='', action='Zoom meeting created for TrainerMate'):
     conn = sqlite3.connect(str(COURSES_DB_PATH))
     try:
         ensure_courses_sync_columns(conn)
@@ -10544,7 +10544,7 @@ def reviewer_create_zoom_meeting(course, replace=False):
     if not token:
         return False, message
     start_dt = parse_dashboard_datetime(course.get('date_time') or '') or (datetime.now() + timedelta(days=7))
-    topic_prefix = 'TrainerMate Demo'
+    topic_prefix = 'TrainerMate'
     topic = f"{topic_prefix} - {course.get('title') or 'Training course'}"
     if replace:
         topic += ' - updated'
@@ -10554,7 +10554,7 @@ def reviewer_create_zoom_meeting(course, replace=False):
         'start_time': start_dt.strftime('%Y-%m-%dT%H:%M:%SZ'),
         'duration': 120,
         'timezone': 'Europe/London',
-        'agenda': 'Dummy TrainerMate reviewer course used for Zoom Marketplace review.',
+        'agenda': 'TrainerMate scheduled course.',
         'settings': {
             'join_before_host': False,
             'waiting_room': True,
@@ -10570,7 +10570,7 @@ def reviewer_create_zoom_meeting(course, replace=False):
             response = requests.post('https://api.zoom.us/v2/users/me/meetings', json=payload, headers={'Authorization': f'Bearer {token}'}, timeout=20)
     response.raise_for_status()
     data = response.json()
-    reviewer_update_course_zoom(course.get('id'), data.get('id'), data.get('join_url'), data.get('password') or '', 'Zoom meeting replaced/updated for reviewer demo' if replace else 'Zoom meeting created for reviewer demo')
+    reviewer_update_course_zoom(course.get('id'), data.get('id'), data.get('join_url'), data.get('password') or '', 'Zoom meeting replaced/updated for TrainerMate' if replace else 'Zoom meeting created for TrainerMate')
     return True, f"Zoom meeting {'replaced/updated' if replace else 'created'} for {course.get('title')}. Meeting ID: {data.get('id')}"
 
 
@@ -10589,7 +10589,7 @@ def reviewer_create_or_verify_zoom(course_id):
         else:
             r = requests.get(f"https://api.zoom.us/v2/meetings/{course.get('meeting_id')}", headers={'Authorization': f'Bearer {token}'}, timeout=20)
             if r.status_code == 200:
-                reviewer_update_course_zoom(course_id, course.get('meeting_id'), course.get('meeting_link'), course.get('meeting_password'), 'Existing Zoom meeting verified for reviewer demo')
+                reviewer_update_course_zoom(course_id, course.get('meeting_id'), course.get('meeting_link'), course.get('meeting_password'), 'Existing Zoom meeting verified for TrainerMate')
                 set_flash('Existing Zoom meeting verified successfully.', 'success')
             else:
                 ok, msg = reviewer_create_zoom_meeting(course, replace=True)
@@ -10597,7 +10597,7 @@ def reviewer_create_or_verify_zoom(course_id):
     else:
         ok, msg = reviewer_create_zoom_meeting(course, replace=False)
         set_flash(msg, 'success' if ok else 'warning')
-    return redirect(url_for('home', section='dashboard', provider='demo-provider'))
+    return redirect(url_for('home', section='dashboard', provider='essex'))
 
 @app.route('/sync/course/<course_id>', methods=['POST'])
 def check_course_only(course_id):
@@ -10650,7 +10650,7 @@ def replace_course_zoom(course_id):
             return redirect(url_for('home', section='dashboard'))
         ok, msg = reviewer_create_zoom_meeting(course, replace=True)
         set_flash(msg, 'success' if ok else 'warning')
-        return redirect(url_for('home', section='dashboard', provider='demo-provider'))
+        return redirect(url_for('home', section='dashboard', provider='essex'))
     course = load_course_for_action(course_id)
     if not course:
         set_flash('Course not found for Zoom replacement.', 'warning')
