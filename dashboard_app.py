@@ -1042,6 +1042,13 @@ def derive_documents_url(login_url: str) -> str:
 
 
 def get_identity():
+    # Hosted Zoom review environment: keep the trainer account setup complete
+    # so reviewers can test the Zoom flow without local/keyring persistence.
+    if reviewer_demo_enabled():
+        return {
+            'ndors': os.getenv('TRAINERMATE_REVIEW_NDORS_ID', '10294').strip() or '10294',
+            'email': os.getenv('TRAINERMATE_REVIEW_EMAIL', 'reviewer.us').strip() or 'reviewer.us',
+        }
     return {
         'ndors': keyring.get_password('trainermate', 'ndors_id') or '',
         'email': keyring.get_password('trainermate', 'email') or '',
