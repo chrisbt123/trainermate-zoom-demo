@@ -1228,6 +1228,22 @@ def get_default_zoom_account_id():
     return (accounts[0].get('id') or '').strip() if accounts else ''
 
 
+def has_connected_zoom_account():
+    """Return True only when a usable Zoom OAuth account exists."""
+    for account in load_zoom_accounts():
+        status = (account.get('status') or 'connected').strip().lower()
+        if status in {'disconnected', 'needs_reconnect', 'needs reconnect', 'revoked', 'error'}:
+            continue
+        account_id = (account.get('id') or '').strip()
+        if account_id and (get_zoom_oauth_token(account_id, 'access') or get_zoom_oauth_token(account_id, 'refresh')):
+            return True
+    return False
+
+
+def zoom_required_sync_message():
+    return 'Zoom is not connected yet. Open Zoom accounts and connect Zoom before syncing courses.'
+
+
 def get_zoom_account_label(account_id=''):
     accounts = load_zoom_accounts()
     selected_id = (account_id or get_default_zoom_account_id() or '').strip()
@@ -6731,6 +6747,9 @@ def start_sync_process(scan_provider='all', scan_days=7, target_course=None, all
         if access.get('reason') == 'free_sync_limit_reached':
             return False, 'Your free sync trial has finished. Activate a paid licence to continue syncing.'
         return False, 'Access is blocked. Check your licence/account status or try again.'
+    if not has_connected_zoom_account():
+        update_app_state(sync_running=False, stop_requested=False, pid=None, last_status='Needs attention', last_message=zoom_required_sync_message())
+        return False, zoom_required_sync_message()
     scan_provider = provider_slug(scan_provider or 'all')
     if scan_provider == 'provider':
         scan_provider = 'all'
@@ -6820,19 +6839,37 @@ def start_sync_process(scan_provider='all', scan_days=7, target_course=None, all
 
 
 def stop_sync_process():
-    state = reconcile_running_state()
-    pid = state.get('pid')
-    update_app_state(stop_requested=True, last_message='Stop requested from dashboard.', last_status='Stopping')
-    if not pid:
-        return True, 'Stop requested.'
-    try:
-        if os.name == 'nt':
-            subprocess.run(['taskkill', '/PID', str(pid), '/T', '/F'], check=False, capture_output=True, text=True)
-        else:
-            os.kill(int(pid), signal.SIGTERM)
-    except Exception:
-        pass
-    return True, 'Stop requested.'
+    state = load_app_state()
+    pid = state.get('pid') or state.get('last_pid')
+    update_app_state(
+        stop_requested=True,
+        sync_running=False,
+        pid=None,
+        last_status='Stopped',
+        last_run_status='stopped',
+        last_message='Sync stopped.',
+        pending_sync_request={},
+        scan_request={},
+    )
+    if pid:
+        try:
+            pid_int = int(pid)
+            if os.name == 'nt':
+                subprocess.run(['taskkill', '/PID', str(pid_int), '/T', '/F'], check=False, capture_output=True, text=True)
+            else:
+                try:
+                    os.kill(pid_int, signal.SIGTERM)
+                    time.sleep(0.4)
+                except Exception:
+                    pass
+                if is_process_running(pid_int):
+                    try:
+                        os.kill(pid_int, signal.SIGKILL)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    return True, 'Sync stopped.'
 
 
 def zoom_redirect_uri():
