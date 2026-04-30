@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: trainermate-reviewer-demo
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: ZOOM_REDIRECT_URI
+        value: https://demo.trainermate.xyz/zoom/callback
+      - key: SESSION_COOKIE_SECURE
+        value: "1"
