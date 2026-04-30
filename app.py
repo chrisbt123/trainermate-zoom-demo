@@ -9719,20 +9719,21 @@ def trainer_login():
     if not reviewer_demo_enabled():
         return redirect(url_for('home'))
     error = ''
+    default_email = os.getenv('TRAINERMATE_LOGIN_EMAIL', 'reviewer@zoom.us').strip() or 'reviewer@zoom.us'
+    entered_email = default_email
     if request.method == 'POST':
+        entered_email = (request.form.get('email') or '').strip().lower()
         supplied = request.form.get('password') or ''
         expected = REVIEWER_PASSWORD or 'zoomreview'
-        if hmac.compare_digest(supplied, expected):
+        if entered_email == default_email.lower() and hmac.compare_digest(supplied, expected):
             session['reviewer_demo_ok'] = True
             return redirect(request.args.get('next') or url_for('home'))
-        error = 'That password was not accepted.'
+        error = 'The email or password was not accepted.'
     return render_template_string("""
 <!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>TrainerMate Login</title>
-<style>body{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;background:#0b1220;color:#e5eefb;min-height:100vh;display:grid;place-items:center;padding:24px}.card{width:min(520px,100%);background:#111827;border:1px solid rgba(96,165,250,.35);border-radius:24px;padding:28px;box-shadow:0 24px 80px rgba(0,0,0,.35)}h1{margin:0 0 8px;font-size:28px}.muted{color:#a9b7cc;line-height:1.5;margin:0 0 22px}.field{display:grid;gap:8px;margin-bottom:16px}label{font-weight:800}input{border:1px solid #334155;background:#0f172a;color:white;border-radius:12px;padding:12px;font-size:16px}.btn{border:0;border-radius:12px;background:#2563eb;color:white;font-weight:900;padding:12px 16px;cursor:pointer}.err{color:#fecaca;background:rgba(220,38,38,.18);border:1px solid rgba(248,113,113,.35);border-radius:12px;padding:10px;margin-bottom:14px}</style></head>
-<body><main class="card"><h1>TrainerMate</h1><p class="muted">Sign in to open your TrainerMate dashboard.</p>{% if error %}<div class="err">{{ error }}</div>{% endif %}<form method="post">{{ csrf_hidden_field()|safe }}<div class="field"><label>Password</label><input type="password" name="password" autofocus required></div><button class="btn" type="submit">Open TrainerMate</button></form></main></body></html>
-    """, error=error, csrf_hidden_field=csrf_hidden_field)
-
-
+<style>body{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;background:#0b1220;color:#e5eefb;min-height:100vh;display:grid;place-items:center;padding:24px}.card{width:min(520px,100%);background:#111827;border:1px solid rgba(96,165,250,.35);border-radius:24px;padding:28px;box-shadow:0 24px 80px rgba(0,0,0,.35)}h1{margin:0 0 8px;font-size:28px}.muted{color:#a9b7cc;line-height:1.5;margin:0 0 22px}.field{display:grid;gap:8px;margin-bottom:16px}label{font-weight:800}input{border:1px solid #334155;background:#0f172a;color:white;border-radius:12px;padding:12px;font-size:16px}.btn{width:100%;border:0;border-radius:12px;background:#2563eb;color:white;font-weight:900;padding:12px 16px;cursor:pointer;font-size:16px}.err{color:#fecaca;background:rgba(220,38,38,.18);border:1px solid rgba(248,113,113,.35);border-radius:12px;padding:10px;margin-bottom:14px}</style></head>
+<body><main class="card"><h1>TrainerMate</h1><p class="muted">Sign in to open your TrainerMate dashboard.</p>{% if error %}<div class="err">{{ error }}</div>{% endif %}<form method="post">{{ csrf_hidden_field()|safe }}<div class="field"><label>Email</label><input type="email" name="email" value="{{ entered_email }}" autocomplete="username" autofocus required></div><div class="field"><label>Password</label><input type="password" name="password" autocomplete="current-password" required></div><button class="btn" type="submit">Sign in</button></form></main></body></html>
+    """, error=error, entered_email=entered_email, csrf_hidden_field=csrf_hidden_field)
 @app.route('/logout', methods=['POST'])
 def trainer_logout():
     session.pop('reviewer_demo_ok', None)
