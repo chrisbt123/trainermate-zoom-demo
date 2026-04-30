@@ -66,6 +66,3 @@ Manual reset URL while logged in:
 - `/reset-dashboard-data?disconnect=1` also clears the connected Zoom account.
 
 Only set `TRAINERMATE_RESET_SEEDED_COURSES=1` temporarily if you want the seed process itself to wipe course sync state on restart. Keep it unset or `0` for review.
-
-
-V9 note: reviewer mode forces the account to TrainerMate Paid, with paid feature gates open and the 12-week sync window enabled.
