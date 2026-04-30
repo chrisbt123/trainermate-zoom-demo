@@ -1,12 +1,19 @@
 services:
   - type: web
-    name: trainermate-reviewer-demo
-    env: python
-    plan: free
+    name: trainermate-zoom-demo
+    runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn app:app
     envVars:
-      - key: ZOOM_REDIRECT_URI
-        value: https://demo.trainermate.xyz/zoom/callback
+      - key: TRAINERMATE_REVIEWER_DEMO
+        value: "1"
+      - key: TRAINERMATE_STARTUP_CERTIFICATE_SCAN
+        value: "0"
+      - key: TRAINERMATE_STARTUP_ZOOM_HEALTH_CHECK
+        value: "0"
+      - key: TRAINERMATE_AUTOMATION_SCHEDULER
+        value: "0"
+      - key: TRAINERMATE_REMOTE_ADMIN
+        value: "0"
       - key: SESSION_COOKIE_SECURE
         value: "1"

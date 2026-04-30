@@ -1,0 +1,23 @@
+{
+  "host_video": true,
+  "participant_video": true,
+  "join_before_host": false,
+  "mute_upon_entry": false,
+  "approval_type": 2,
+  "audio": "both",
+  "auto_recording": "none",
+  "waiting_room": true,
+  "request_permission_to_unmute_participants": false,
+  "meeting_authentication": false,
+  "encryption_type": "enhanced_encryption",
+  "continuous_meeting_chat": {
+    "enable": false,
+    "auto_add_invited_external_users": false,
+    "auto_add_meeting_participants": false
+  },
+  "focus_mode": false,
+  "email_notification": true,
+  "show_join_info": false,
+  "device_testing": false,
+  "private_meeting": false
+}
