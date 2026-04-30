@@ -165,7 +165,7 @@ PROVIDER_PRESETS = {
 }
 
 app = Flask(__name__)
-REVIEWER_DEMO_MODE = os.getenv('TRAINERMATE_REVIEWER_DEMO', '0').strip().lower() in {'1', 'true', 'yes', 'on'}
+REVIEWER_DEMO_MODE = os.getenv('TRAINERMATE_REVIEWER_DEMO', '1').strip().lower() in {'1', 'true', 'yes', 'on'}
 REVIEWER_PASSWORD = os.getenv('REVIEWER_PASSWORD', '').strip()
 REVIEWER_TOKEN_STORE_PATH = BASE_DIR / 'reviewer_zoom_tokens.json'
 REVIEWER_DEMO_SEEDED = False
