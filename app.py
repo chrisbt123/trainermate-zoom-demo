@@ -223,7 +223,7 @@ def reviewer_demo_enabled():
 
 
 def reviewer_demo_public_path():
-    return request.path in {'/reviewer-login', '/health', '/healthz'} or request.path.startswith('/static/')
+    return request.path in {'/login', '/health', '/healthz'} or request.path.startswith('/static/')
 
 
 def reviewer_demo_logged_in():
@@ -392,7 +392,7 @@ def security_before_request():
         if not reviewer_demo_public_path() and not reviewer_demo_logged_in():
             if request_wants_json():
                 return jsonify({'ok': False, 'error': 'Reviewer login required'}), 401
-            return redirect(url_for('reviewer_login', next=request.full_path if request.query_string else request.path))
+            return redirect(url_for('trainer_login', next=request.full_path if request.query_string else request.path))
     elif not is_local_request():
         abort(403)
     if request.method in {'POST', 'PUT', 'PATCH', 'DELETE'} and not validate_csrf():
@@ -9699,8 +9699,8 @@ def compact_activity_items(limit=4):
 
 
 
-@app.route('/reviewer-login', methods=['GET', 'POST'])
-def reviewer_login():
+@app.route('/login', methods=['GET', 'POST'])
+def trainer_login():
     if not reviewer_demo_enabled():
         return redirect(url_for('home'))
     error = ''
@@ -9712,16 +9712,16 @@ def reviewer_login():
             return redirect(request.args.get('next') or url_for('home'))
         error = 'That password was not accepted.'
     return render_template_string("""
-<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>TrainerMate Reviewer Login</title>
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>TrainerMate Login</title>
 <style>body{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;background:#0b1220;color:#e5eefb;min-height:100vh;display:grid;place-items:center;padding:24px}.card{width:min(520px,100%);background:#111827;border:1px solid rgba(96,165,250,.35);border-radius:24px;padding:28px;box-shadow:0 24px 80px rgba(0,0,0,.35)}h1{margin:0 0 8px;font-size:28px}.muted{color:#a9b7cc;line-height:1.5;margin:0 0 22px}.field{display:grid;gap:8px;margin-bottom:16px}label{font-weight:800}input{border:1px solid #334155;background:#0f172a;color:white;border-radius:12px;padding:12px;font-size:16px}.btn{border:0;border-radius:12px;background:#2563eb;color:white;font-weight:900;padding:12px 16px;cursor:pointer}.err{color:#fecaca;background:rgba(220,38,38,.18);border:1px solid rgba(248,113,113,.35);border-radius:12px;padding:10px;margin-bottom:14px}</style></head>
 <body><main class="card"><h1>TrainerMate</h1><p class="muted">Sign in to open your TrainerMate dashboard.</p>{% if error %}<div class="err">{{ error }}</div>{% endif %}<form method="post">{{ csrf_hidden_field()|safe }}<div class="field"><label>Password</label><input type="password" name="password" autofocus required></div><button class="btn" type="submit">Open TrainerMate</button></form></main></body></html>
-    """, error=error)
+    """, error=error, csrf_hidden_field=csrf_hidden_field)
 
 
-@app.route('/reviewer-logout', methods=['POST'])
-def reviewer_logout():
+@app.route('/logout', methods=['POST'])
+def trainer_logout():
     session.pop('reviewer_demo_ok', None)
-    return redirect(url_for('reviewer_login'))
+    return redirect(url_for('trainer_login'))
 
 @app.route('/health')
 def health_check():
