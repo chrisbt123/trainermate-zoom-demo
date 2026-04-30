@@ -7799,14 +7799,12 @@ body{background:linear-gradient(180deg,#0b1728 0,#102237 106px,#d8e2ea 106px,#d8
           <div class='head'><h3>Zoom accounts</h3><p>Connect the Zoom account TrainerMate should use for course meetings. TrainerMate never asks for your Zoom password.</p></div>
           <div class='block stack'>
             {% if ZOOM_CLIENT_ID and ZOOM_CLIENT_SECRET %}
-              <form method='get' action='{{ url_for("zoom_connect_start") }}' style='display:grid;gap:12px;max-width:460px' id='tmZoomConnectForm'>
-                <div class='field'><label>Account label</label><input name='zoom_nickname' id='tmZoomNickname' placeholder='Example: Billy's Zoom'></div>
+              <div class='stack' style='max-width:460px'>
                 <div class='inline-actions'>
-                  <button class='btn' type='submit' onclick="var f=document.getElementById('tmZoomConnectForm'); if(f){ f.submit(); return false; }">Connect Zoom account</button>
-                  <a class='btn soft' id='tmZoomDirectConnect' href='{{ url_for("zoom_connect_start") }}' onclick="var n=document.getElementById('tmZoomNickname'); if(n && n.value){ this.href='{{ url_for("zoom_connect_start") }}?zoom_nickname='+encodeURIComponent(n.value); }">Open Zoom approval page</a>
+                  <a class='btn' href='{{ url_for("zoom_connect_start") }}?zoom_nickname=TrainerMate'>Connect Zoom account</a>
                 </div>
                 <div class='helper'>You will be sent to Zoom to approve TrainerMate. After approval you will return here.</div>
-              </form>
+              </div>
             {% else %}
               <div class='provider-card'>
                 <strong>Zoom connection is not ready yet</strong>
