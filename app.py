@@ -1768,7 +1768,33 @@ def get_cached_access_if_fresh(max_age_seconds=ACCESS_CACHE_MAX_AGE_SECONDS):
     return None
 
 
+def review_paid_access():
+    return {
+        'allowed': True,
+        'paid': True,
+        'is_paid': True,
+        'plan': 'paid',
+        'tier': 'paid',
+        'features': {
+            'sync_window_days': PAID_SYNC_WINDOW_DAYS,
+            'automatic_sync': True,
+            'scheduled_sync': True,
+            'calendar_sync': True,
+            'calendar': True,
+            'certificate_manage': True,
+            'certificate_management': True,
+        },
+    }
+
+
 def check_access(timeout_seconds=ACTION_ACCESS_TIMEOUT_SECONDS, prefer_cached=False):
+    if reviewer_demo_enabled():
+        access = review_paid_access()
+        try:
+            save_cached_access(access)
+        except Exception:
+            pass
+        return access
     identity = get_identity()
     if not identity['ndors'].strip():
         return None
