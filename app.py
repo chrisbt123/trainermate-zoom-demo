@@ -19,7 +19,7 @@ ZOOM_REDIRECT_URI = os.getenv(
 # callback sees one of these states, it does NOT exchange the code itself.
 # It relays the browser back to the local dashboard, which performs the token
 # exchange using the same approved hosted redirect URI.
-LOCAL_RELAY_STATE_PREFIX = os.getenv("LOCAL_RELAY_STATE_PREFIX", "tmrelay_")
+LOCAL_RELAY_STATE_PREFIX = os.getenv("LOCAL_RELAY_STATE_PREFIX", "tmrelay:")
 LOCAL_CALLBACK_URL = os.getenv(
     "LOCAL_CALLBACK_URL",
     "http://127.0.0.1:5000/zoom/callback",
