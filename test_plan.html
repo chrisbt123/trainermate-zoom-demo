@@ -192,7 +192,7 @@
           <td><code>meeting:read:meeting</code></td>
           <td>Reads a specific Zoom meeting by meeting ID to verify that the meeting linked to a course still exists.</td>
           <td>Create or link a meeting, then run the same sync/check action again.</td>
-          <td>TrainerMate verifies the linked Zoom meeting and updates the course status/notes.</td>
+          <td>TrainerMate verifies the linked Zoom meeting and updates the course status/notes, for example showing "Zoom meeting already exists - verified".</td>
         </tr>
         <tr>
           <td><code>meeting:write:meeting</code></td>
@@ -279,7 +279,7 @@
       <ol>
         <li>Run <strong>Sync quietly</strong> again, or use <strong>Verify Zoom meeting</strong> on a course that was synced in Step 4.</li>
       </ol>
-      <p><strong>Expected result:</strong> TrainerMate verifies the existing linked Zoom meeting using the saved meeting ID and meeting search/list behaviour. No duplicate meeting should be created.</p>
+      <p><strong>Expected result:</strong> TrainerMate verifies the existing linked Zoom meeting using the saved meeting ID and meeting search/list behaviour. The course notes/status may show "Zoom meeting already exists - verified". No duplicate meeting should be created.</p>
 
       <h3>Step 6 - Update an existing course meeting</h3>
       <ol>
@@ -326,7 +326,7 @@
         <li>Scheduled course list and course status.</li>
         <li>Zoom account connection and disconnection.</li>
         <li>Friendly message when syncing is attempted before Zoom is connected.</li>
-        <li>Course meeting verification for already-synced courses.</li>
+        <li>Course meeting verification for already-synced courses, including a clear note such as "Zoom meeting already exists - verified".</li>
         <li>Meeting creation for courses without a valid linked meeting.</li>
         <li>Meeting refresh/update behaviour for existing course meetings.</li>
         <li>Duplicate prevention by verifying existing meetings before creating a new meeting.</li>

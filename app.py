@@ -6312,13 +6312,13 @@ def normalize_course_action(action, status='', has_zoom=False):
         or 'existing zoom meeting updated' in lower
         or 'existing zoom meeting verified' in lower
     ):
-        return 'Zoom re-verified'
+        return 'Zoom meeting already exists - verified'
 
     if (
         'existing zoom meeting found and linked' in lower
         or 'existing matching zoom meeting found' in lower
     ):
-        return 'Existing Zoom meeting linked'
+        return 'Zoom meeting already exists - verified'
 
     if (
         'already has valid live zoom' in lower
@@ -6505,12 +6505,8 @@ def build_course_rows(raw_courses, app_state, providers_by_slug, active_sync_win
                 short_message = 'Course replaced by provider'
             elif normalized_message == 'Conflict - check FOBS':
                 short_message = 'Conflict - check FOBS'
-            elif normalized_message == 'Zoom re-verified':
-                short_message = 'Zoom re-verified - FOBS + Zoom OK'
-                status_label = 'Synced'
-                status_class = 'ok'
-            elif normalized_message == 'Existing Zoom meeting linked':
-                short_message = 'Existing Zoom meeting linked - FOBS + Zoom OK'
+            elif normalized_message == 'Zoom meeting already exists - verified':
+                short_message = 'Zoom meeting already exists - verified'
                 status_label = 'Synced'
                 status_class = 'ok'
             elif normalized_message == 'Zoom link updated' and action_is_recent(db_synced_at):
@@ -8608,6 +8604,19 @@ syncManagedZoom(document);
   var tmObservedCertificateRunning = sessionStorage.getItem('tmObservedCertificateRunning') === '1';
   var tmCertificateStayInPlace = sessionStorage.getItem('tmCertificateStayInPlace') === '1';
   var tmCertificateDeleteRow = null;
+  var tmSyncSawRunning = sessionStorage.getItem('tmSyncSawRunning') === '1';
+  function markTrainerMateSyncRunning(){
+    tmSyncSawRunning = true;
+    sessionStorage.setItem('tmSyncSawRunning', '1');
+  }
+  function reloadDashboardAfterSync(){
+    tmSyncSawRunning = false;
+    sessionStorage.removeItem('tmSyncSawRunning');
+    var target = new URL(window.location.href);
+    target.searchParams.set('section', 'dashboard');
+    target.searchParams.set('courses_refreshed', Date.now().toString());
+    window.location.href = target.toString();
+  }
   function markCertificateRefreshStarted(){
     tmCertificateRefreshPending = true;
     tmCertificateRefreshSawRunning = false;
@@ -8667,6 +8676,14 @@ syncManagedZoom(document);
       var r = await fetch('/live-status?_=' + Date.now(), {cache:'no-store'});
       if(!r.ok) throw new Error('HTTP ' + r.status);
       var data = await r.json();
+
+      var syncIsRunning = !!data.sync_running;
+      if(syncIsRunning){
+        markTrainerMateSyncRunning();
+      } else if(tmSyncSawRunning){
+        reloadDashboardAfterSync();
+        return;
+      }
 
       setText('tmLiveBadge', data.running ? 'syncing' : 'idle');
       setText('tmLiveSyncState', data.sync_state || 'Idle');
@@ -9373,13 +9390,13 @@ def live_status_panel():
             lower = action.lower()
 
             if 'already has valid live zoom' in lower or 'already present' in lower or 'zoom joining instructions already present' in lower:
-                result = 'FOBS + Zoom OK'
+                result = 'Zoom meeting already exists - verified'
                 zoom_result = 'Existing Zoom instructions found'
             elif 'updated successfully' in lower or 'fobs updated successfully' in lower:
                 result = 'Zoom link updated successfully'
                 zoom_result = 'Zoom link updated'
             elif status == 'skipped' or lower == 'read course summary':
-                result = 'FOBS + Zoom OK' if lower == 'read course summary' else (action or 'Skipped')
+                result = 'Zoom meeting already exists - verified' if lower == 'read course summary' else (action or 'Skipped')
             elif status == 'success':
                 result = action or 'Ready'
             elif status == 'error':
