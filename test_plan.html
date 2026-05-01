@@ -192,7 +192,7 @@
           <td><code>meeting:read:meeting</code></td>
           <td>Reads a specific Zoom meeting by meeting ID to verify that the meeting linked to a course still exists.</td>
           <td>Create or link a meeting, then run the same sync/check action again.</td>
-          <td>TrainerMate verifies the linked Zoom meeting and updates the course status/notes, for example showing "Zoom meeting already exists - verified".</td>
+          <td>TrainerMate verifies the linked Zoom meeting and updates the course status/notes.</td>
         </tr>
         <tr>
           <td><code>meeting:write:meeting</code></td>
@@ -269,17 +269,22 @@
       <h3>Step 4 - Run seeded course sync</h3>
       <ol>
         <li>Open the dashboard.</li>
+        <li>Before starting sync, check the <strong>Scan window</strong> dropdown.</li>
+        <li>Select a scan window of at least <strong>Next 14 days</strong>. If the dashboard is set to <strong>Next 7 days</strong>, there may be no courses inside that short window.</li>
         <li>Keep the provider set to <strong>All providers</strong> or select <strong>Essex</strong>.</li>
         <li>Click <strong>Sync quietly</strong>.</li>
-        <li>Observe the sync status and course rows.</li>
+        <li>Observe the sync status, progress bubble, and course rows.</li>
       </ol>
-      <p><strong>Expected result:</strong> TrainerMate checks seeded course records, searches the authorized user's Zoom meetings for matching course meetings, creates meetings only where needed, and updates the course status/meeting metadata.</p>
+      <p><strong>Expected result:</strong> TrainerMate checks the courses inside the selected scan window, searches the authorized user's Zoom meetings for matching course meetings, creates meetings only where needed, and updates the course status/meeting metadata.</p>
+      <div class="callout warning">
+        Reviewer note: use <strong>Next 14 days</strong> or a longer scan window for the review flow. The seeded course data may not include courses inside the default 7-day window.
+      </div>
 
       <h3>Step 5 - Verify duplicate prevention</h3>
       <ol>
         <li>Run <strong>Sync quietly</strong> again, or use <strong>Verify Zoom meeting</strong> on a course that was synced in Step 4.</li>
       </ol>
-      <p><strong>Expected result:</strong> TrainerMate verifies the existing linked Zoom meeting using the saved meeting ID and meeting search/list behaviour. The course notes/status may show "Zoom meeting already exists - verified". No duplicate meeting should be created.</p>
+      <p><strong>Expected result:</strong> TrainerMate verifies the existing linked Zoom meeting using the saved meeting ID and meeting search/list behaviour. No duplicate meeting should be created.</p>
 
       <h3>Step 6 - Update an existing course meeting</h3>
       <ol>
@@ -326,7 +331,7 @@
         <li>Scheduled course list and course status.</li>
         <li>Zoom account connection and disconnection.</li>
         <li>Friendly message when syncing is attempted before Zoom is connected.</li>
-        <li>Course meeting verification for already-synced courses, including a clear note such as "Zoom meeting already exists - verified".</li>
+        <li>Course meeting verification for already-synced courses.</li>
         <li>Meeting creation for courses without a valid linked meeting.</li>
         <li>Meeting refresh/update behaviour for existing course meetings.</li>
         <li>Duplicate prevention by verifying existing meetings before creating a new meeting.</li>
@@ -347,7 +352,7 @@
         <li>Reviewer can log in to TrainerMate.</li>
         <li>Reviewer can authorize Zoom using the Production Client ID.</li>
         <li>Reviewer can see the connected Zoom account after callback.</li>
-        <li>Reviewer can run seeded course sync from the dashboard.</li>
+        <li>Reviewer can set the scan window to at least 14 days and run seeded course sync from the dashboard.</li>
         <li>Reviewer can create or link meetings for seeded courses.</li>
         <li>Reviewer can run the same action again without creating a duplicate meeting.</li>
         <li>Reviewer can update or refresh an existing course meeting.</li>
@@ -355,7 +360,7 @@
       </ul>
     </section>
 
-    <p class="small">Last updated for Zoom Marketplace review: May 2026.</p>
+    <p class="small">Last updated for Zoom Marketplace review: May 2026. Includes reviewer guidance to use a 14-day or longer scan window.</p>
   </main>
 </body>
 </html>
