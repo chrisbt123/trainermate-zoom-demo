@@ -10777,8 +10777,8 @@ def reviewer_course_start_datetime(course):
 
 def reviewer_zoom_agenda_for_course(course, note=''):
     bits = [
-        f"TrainerMate seeded review course: {course.get('title') or 'Training course'}",
-        f"Provider: {course.get('provider') or 'Seeded provider'}",
+        f"TrainerMate course meeting: {course.get('title') or 'Training course'}",
+        f"Provider: {course.get('provider') or 'Course provider'}",
         f"Course date/time: {course.get('date_time') or 'Not set'}",
     ]
     if note:
@@ -10795,7 +10795,7 @@ def reviewer_zoom_payload_for_course(course, replace=False):
         'start_time': start_dt.isoformat(),
         'duration': 120,
         'timezone': 'Europe/London',
-        'agenda': reviewer_zoom_agenda_for_course(course, 'TrainerMate detected/reused this meeting for the seeded reviewer course, so it will not create a duplicate.'),
+        'agenda': reviewer_zoom_agenda_for_course(course, 'TrainerMate detected this existing course meeting and reused it to avoid creating a duplicate.'),
         'settings': {
             'join_before_host': False,
             'waiting_room': True,
@@ -10882,7 +10882,7 @@ def reviewer_list_upcoming_zoom_meetings(token):
 
 
 def reviewer_find_existing_zoom_meeting(course, token):
-    """Find an existing Zoom meeting for the seeded course before creating one."""
+    """Find an existing Zoom meeting for the course before creating one."""
     expected_topic = reviewer_zoom_topic_for_course(course).lower()
     expected_start = reviewer_course_start_datetime(course)
     title_text = (course.get('title') or '').strip().lower()
@@ -10971,7 +10971,7 @@ def reviewer_create_zoom_meeting(course, replace=False, progress=None):
 
 
 def reviewer_demo_courses_for_sync(scan_provider='all', scan_days=7):
-    """Return seeded reviewer courses that should be processed by the demo sync."""
+    """Return hosted review courses that should be processed by sync."""
     provider_filter = provider_slug(scan_provider or 'all')
     try:
         days = int(scan_days or 7)
@@ -11007,7 +11007,7 @@ def reviewer_demo_courses_for_sync(scan_provider='all', scan_days=7):
 
 
 def reviewer_sync_seeded_courses(scan_provider='all', scan_days=7):
-    """Run the hosted reviewer demo sync against seeded courses, without FOBS scraping."""
+    """Run hosted review sync against course data, without FOBS scraping."""
     clear_stop_request()
     token, token_message = reviewer_zoom_access_token_or_message()
     if not token:
@@ -11016,14 +11016,14 @@ def reviewer_sync_seeded_courses(scan_provider='all', scan_days=7):
 
     courses = reviewer_demo_courses_for_sync(scan_provider=scan_provider, scan_days=scan_days)
     if not courses:
-        message = 'No seeded courses matched that sync window.'
+        message = 'No courses matched that sync window.'
         update_app_state(sync_running=False, pid=None, last_status='Completed with warnings', last_run_status='completed_with_warnings', last_message=message)
         return False, message
 
     started_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     summary = {
         'outcome': 'running',
-        'message': 'Reviewer demo sync is checking seeded courses.',
+        'message': 'TrainerMate is checking your courses.',
         'providers': sorted({c.get('provider') or 'Provider' for c in courses}),
         'courses_found': len(courses),
         'courses_processed': 0,
@@ -11042,7 +11042,7 @@ def reviewer_sync_seeded_courses(scan_provider='all', scan_days=7):
         last_started_at=started_at,
         last_run_started_at=started_at,
         last_run_finished_at='',
-        last_message='Reviewer demo sync started for seeded courses.',
+        last_message='TrainerMate started checking your courses.',
         current_provider='',
         current_course='',
         run_summary=summary,
@@ -11074,7 +11074,7 @@ def reviewer_sync_seeded_courses(scan_provider='all', scan_days=7):
                 last_message=message,
             )
 
-        progress(f'Checking seeded course: {title}.')
+        progress(f'Checking course: {title}.')
         try:
             ok, message = reviewer_create_zoom_meeting(course, replace=False, progress=progress)
         except Exception as exc:
@@ -11100,16 +11100,16 @@ def reviewer_sync_seeded_courses(scan_provider='all', scan_days=7):
     if stopped:
         outcome = 'stopped'
         final_status = 'Stopped'
-        final_message = 'Reviewer demo sync stopped by user.'
+        final_message = 'Sync stopped.'
     elif failures:
         outcome = 'completed_with_warnings'
         final_status = 'Completed with warnings'
-        final_message = f"Reviewer demo sync finished with {len(failures)} course issue(s)."
+        final_message = f"TrainerMate finished with {len(failures)} course issue(s)."
         summary['health_issues'] = failures[:5]
     else:
         outcome = 'completed'
         final_status = 'Completed'
-        final_message = f"Reviewer demo sync completed. {summary['courses_processed']} seeded course(s) checked."
+        final_message = f"Sync completed. {summary['courses_processed']} course(s) checked."
 
     summary['outcome'] = outcome
     summary['message'] = final_message
@@ -11134,7 +11134,7 @@ def reviewer_sync_seeded_courses(scan_provider='all', scan_days=7):
 
 def fail_reviewer_seeded_sync(message):
     finished_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    safe_message = str(message or 'Reviewer demo sync failed.')[:500]
+    safe_message = str(message or 'Sync failed.')[:500]
     update_app_state(
         sync_running=False,
         pid=None,
@@ -11165,7 +11165,7 @@ def reviewer_seeded_sync_worker(scan_provider='all', scan_days=7):
     try:
         reviewer_sync_seeded_courses(scan_provider=scan_provider, scan_days=scan_days)
     except Exception as exc:
-        fail_reviewer_seeded_sync(f'Reviewer demo sync failed: {type(exc).__name__}: {exc}')
+        fail_reviewer_seeded_sync(f'Sync failed: {type(exc).__name__}: {exc}')
 
 
 def start_reviewer_seeded_sync_async(scan_provider='all', scan_days=7):
@@ -11194,12 +11194,12 @@ def start_reviewer_seeded_sync_async(scan_provider='all', scan_days=7):
         last_started_at=started_at,
         last_run_started_at=started_at,
         last_run_finished_at='',
-        last_message='Reviewer demo sync started for seeded courses.',
+        last_message='TrainerMate started checking your courses.',
         current_provider='',
         current_course='',
         run_summary={
             'outcome': 'running',
-            'message': 'Reviewer demo sync is queued.',
+            'message': 'TrainerMate is preparing to check your courses.',
             'courses_found': 0,
             'courses_processed': 0,
             'fobs_checked': 0,
@@ -11212,7 +11212,7 @@ def start_reviewer_seeded_sync_async(scan_provider='all', scan_days=7):
     thread = threading.Thread(target=reviewer_seeded_sync_worker, args=(provider_id, days), daemon=True)
     thread.start()
     scope_text = 'all providers' if provider_id == 'all' else provider_id
-    return True, f'Reviewer demo sync started for {scope_text}, next {days} days.'
+    return True, f'Sync started for {scope_text}, next {days} days.'
 
 
 @app.post('/reviewer/course/<course_id>/zoom')

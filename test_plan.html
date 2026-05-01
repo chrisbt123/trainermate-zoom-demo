@@ -1,0 +1,361 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TrainerMate Zoom Marketplace Review Test Plan</title>
+  <style>
+    :root {
+      --navy: #071426;
+      --blue: #2563eb;
+      --teal: #0f8794;
+      --bg: #f4f8fb;
+      --card: #ffffff;
+      --border: #d9e4ee;
+      --text: #102033;
+      --muted: #53657a;
+      --ok: #087f5b;
+      --warn: #9a6700;
+    }
+    body {
+      margin: 0;
+      font-family: Arial, Helvetica, sans-serif;
+      color: var(--text);
+      background: var(--bg);
+      line-height: 1.55;
+    }
+    header {
+      background: var(--navy);
+      color: #fff;
+      padding: 34px 28px;
+    }
+    header h1 {
+      margin: 0 0 8px 0;
+      font-size: 30px;
+    }
+    header p {
+      margin: 0;
+      color: #d8e7f7;
+      font-size: 16px;
+    }
+    main {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 28px;
+    }
+    section {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 24px;
+      margin: 0 0 20px 0;
+      box-shadow: 0 10px 24px rgba(16, 32, 51, 0.04);
+    }
+    h2 {
+      margin: 0 0 14px 0;
+      font-size: 22px;
+      color: var(--navy);
+    }
+    h3 {
+      margin: 22px 0 8px 0;
+      font-size: 17px;
+      color: var(--navy);
+    }
+    code, .mono {
+      font-family: Consolas, Monaco, "Courier New", monospace;
+      background: #eef4fb;
+      padding: 2px 6px;
+      border-radius: 6px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 12px 0;
+      font-size: 14px;
+    }
+    th, td {
+      border: 1px solid var(--border);
+      padding: 10px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      background: #edf5fb;
+      color: var(--navy);
+    }
+    ol, ul {
+      padding-left: 24px;
+    }
+    li {
+      margin: 7px 0;
+    }
+    .callout {
+      border-left: 5px solid var(--blue);
+      background: #eef5ff;
+      padding: 14px 16px;
+      border-radius: 10px;
+      margin: 14px 0;
+    }
+    .success {
+      border-left-color: var(--ok);
+      background: #edfdf7;
+    }
+    .warning {
+      border-left-color: var(--warn);
+      background: #fff8e6;
+    }
+    .small {
+      color: var(--muted);
+      font-size: 14px;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>TrainerMate Zoom Marketplace Review Test Plan</h1>
+    <p>Step-by-step reviewer guide for Zoom OAuth authorization, requested scopes, and TrainerMate meeting workflow.</p>
+  </header>
+
+  <main>
+    <section>
+      <h2>1. Reviewer environment</h2>
+      <table>
+        <tr>
+          <th>Item</th>
+          <th>Value</th>
+        </tr>
+        <tr>
+          <td>Reviewer dashboard</td>
+          <td><span class="mono">https://demo.trainermate.xyz</span></td>
+        </tr>
+        <tr>
+          <td>Login email</td>
+          <td><span class="mono">reviewer@zoom.us</span></td>
+        </tr>
+        <tr>
+          <td>Password</td>
+          <td>Provided in the Zoom Marketplace submission notes.</td>
+        </tr>
+        <tr>
+          <td>OAuth redirect URI</td>
+          <td><span class="mono">https://demo.trainermate.xyz/zoom/callback</span></td>
+        </tr>
+        <tr>
+          <td>Client ID</td>
+          <td>The environment uses the Production Zoom Client ID during authorization.</td>
+        </tr>
+        <tr>
+          <td>Submission notes</td>
+          <td>Include this test plan URL/file, the reviewer password, and the support/privacy/documentation URLs in the Zoom Marketplace submission notes.</td>
+        </tr>
+      </table>
+
+      <div class="callout">
+        The review environment uses realistic seeded course data so reviewers can test the TrainerMate Zoom workflow without requiring access to private third-party provider portals.
+      </div>
+    </section>
+
+    <section>
+      <h2>2. Product overview</h2>
+      <p>
+        TrainerMate helps authorised trainers manage scheduled training courses and associated Zoom meetings.
+        A trainer connects their Zoom account, then TrainerMate checks scheduled courses, verifies whether a Zoom meeting already exists for each course, and creates or refreshes meetings where required.
+      </p>
+      <p>
+        The live product also interacts with private provider systems used by trainers. Those provider portals are third-party protected systems and credentials cannot be shared externally.
+        For Marketplace review, this hosted environment uses seeded course records while preserving the customer-facing TrainerMate dashboard and Zoom workflow.
+      </p>
+    </section>
+
+    <section>
+      <h2>3. Requested Zoom scopes and test coverage</h2>
+      <table>
+        <tr>
+          <th>Zoom scope</th>
+          <th>TrainerMate use</th>
+          <th>Reviewer test step</th>
+          <th>Expected result</th>
+        </tr>
+        <tr>
+          <td><code>user:read:user</code></td>
+          <td>Confirms the Zoom user/account that has authorized TrainerMate.</td>
+          <td>Connect Zoom from the Zoom accounts page and return through the OAuth callback.</td>
+          <td>TrainerMate returns from Zoom OAuth and displays the connected Zoom account.</td>
+        </tr>
+        <tr>
+          <td><code>meeting:read:list_meetings</code></td>
+          <td>Lists/searches the authorized user's meetings to find existing matching course meetings and avoid duplicates.</td>
+          <td>Run <strong>Sync quietly</strong> or a course-level check after Zoom is connected.</td>
+          <td>TrainerMate checks existing meetings before creating a new meeting.</td>
+        </tr>
+        <tr>
+          <td><code>meeting:read:meeting</code></td>
+          <td>Reads a specific Zoom meeting by meeting ID to verify that the meeting linked to a course still exists.</td>
+          <td>Create or link a meeting, then run the same sync/check action again.</td>
+          <td>TrainerMate verifies the linked Zoom meeting and updates the course status/notes.</td>
+        </tr>
+        <tr>
+          <td><code>meeting:write:meeting</code></td>
+          <td>Creates a scheduled Zoom meeting for a course when no valid existing meeting is linked or found. It is also used where applicable to refresh the meeting associated with a course.</td>
+          <td>Run sync on an unchecked seeded course, then use <strong>Replace/update Zoom</strong> or re-run sync on the same course.</td>
+          <td>TrainerMate creates one meeting when needed, then verifies or updates the same meeting rather than creating a duplicate.</td>
+        </tr>
+      </table>
+
+      <div class="callout success">
+        Scope coverage summary: the test flow covers Zoom authorization, connected user verification, meeting list/search, specific meeting read/verification, meeting creation, meeting refresh, duplicate prevention, and disconnect/reconnect behaviour.
+      </div>
+    </section>
+
+    <section>
+      <h2>4. Scope description</h2>
+      <p>
+        TrainerMate integrates with the Zoom API to create, read, and manage Zoom meeting data on behalf of an authorized Zoom user.
+      </p>
+      <p>The application uses Zoom data to:</p>
+      <ul>
+        <li>Confirm the connected Zoom user account after OAuth authorization.</li>
+        <li>Retrieve the user's meetings to determine whether a scheduled training course already has a corresponding Zoom meeting.</li>
+        <li>Read a specific meeting by meeting ID to verify whether the meeting currently linked to a course still exists.</li>
+        <li>Create a new scheduled Zoom meeting when no valid existing meeting is linked or found for a course.</li>
+        <li>Refresh or update the local course meeting state where applicable so the course remains aligned with the associated Zoom meeting.</li>
+        <li>Prevent duplicate meeting creation by verifying existing linked meetings and searching for matching meetings before creating a new one.</li>
+      </ul>
+      <p>
+        Zoom access tokens and refresh tokens are stored securely using the operating system's credential manager/keyring where the local desktop version is used, or secured environment/runtime storage where the hosted reviewer environment is used.
+        Tokens are never exposed to end users and are not transmitted to unrelated external services.
+      </p>
+      <p>
+        TrainerMate caches the Zoom access token and uses the Zoom refresh token flow when needed, rather than requesting a new OAuth token before every Zoom API request.
+      </p>
+      <p>
+        Meeting metadata returned by the Zoom API, including meeting ID, join URL, topic, start time, and meeting password where applicable, may be stored locally or in the application's runtime data store.
+        This data is used solely to associate Zoom meetings with scheduled training courses and to verify or refresh those meetings later.
+      </p>
+      <p>
+        No Zoom account passwords are collected, processed, or stored by TrainerMate.
+      </p>
+      <p>
+        TrainerMate does not share Zoom data with third parties. All Zoom data access is limited to the authenticated user's Zoom account and is used strictly for the course meeting functionality described in this test plan.
+      </p>
+    </section>
+
+    <section>
+      <h2>5. Step-by-step test flow</h2>
+
+      <h3>Step 1 - Log in to TrainerMate</h3>
+      <ol>
+        <li>Open <span class="mono">https://demo.trainermate.xyz</span>.</li>
+        <li>Sign in using the reviewer email and password supplied in the submission notes.</li>
+        <li>Confirm the TrainerMate dashboard loads with seeded scheduled courses.</li>
+      </ol>
+      <p><strong>Expected result:</strong> The dashboard loads, the account is available for review, and scheduled courses are visible.</p>
+
+      <h3>Step 2 - Confirm sync is blocked before Zoom is connected</h3>
+      <ol>
+        <li>Before connecting Zoom, click a course sync/check action or click <strong>Sync quietly</strong>.</li>
+      </ol>
+      <p><strong>Expected result:</strong> TrainerMate should not start syncing. It should display a friendly message similar to: <em>Zoom is not connected yet. Open Zoom accounts and connect Zoom before syncing courses.</em></p>
+
+      <h3>Step 3 - Connect Zoom</h3>
+      <ol>
+        <li>Open <strong>Zoom accounts</strong>.</li>
+        <li>Click <strong>Connect Zoom account</strong>.</li>
+        <li>Approve TrainerMate in the Zoom authorization screen.</li>
+        <li>Confirm Zoom redirects back to <span class="mono">https://demo.trainermate.xyz/zoom/callback</span>.</li>
+      </ol>
+      <p><strong>Expected result:</strong> TrainerMate displays the connected Zoom account. This demonstrates OAuth authorization, redirect handling, token exchange, and <code>user:read:user</code> account verification.</p>
+
+      <h3>Step 4 - Run seeded course sync</h3>
+      <ol>
+        <li>Open the dashboard.</li>
+        <li>Keep the provider set to <strong>All providers</strong> or select <strong>Essex</strong>.</li>
+        <li>Click <strong>Sync quietly</strong>.</li>
+        <li>Observe the sync status and course rows.</li>
+      </ol>
+      <p><strong>Expected result:</strong> TrainerMate checks seeded course records, searches the authorized user's Zoom meetings for matching course meetings, creates meetings only where needed, and updates the course status/meeting metadata.</p>
+
+      <h3>Step 5 - Verify duplicate prevention</h3>
+      <ol>
+        <li>Run <strong>Sync quietly</strong> again, or use <strong>Verify Zoom meeting</strong> on a course that was synced in Step 4.</li>
+      </ol>
+      <p><strong>Expected result:</strong> TrainerMate verifies the existing linked Zoom meeting using the saved meeting ID and meeting search/list behaviour. No duplicate meeting should be created.</p>
+
+      <h3>Step 6 - Update an existing course meeting</h3>
+      <ol>
+        <li>On a synced course, click <strong>Replace/update Zoom</strong>.</li>
+      </ol>
+      <p><strong>Expected result:</strong> TrainerMate updates or refreshes the existing Zoom meeting associated with the course, demonstrating the meeting write/update capability without creating a duplicate.</p>
+
+      <h3>Step 7 - Optional deleted meeting scenario</h3>
+      <ol>
+        <li>If a meeting has been deleted directly in Zoom, run the course check/sync action again in TrainerMate.</li>
+      </ol>
+      <p><strong>Expected result:</strong> TrainerMate detects the missing linked meeting, searches for a matching course meeting, and creates a replacement only if no valid existing meeting can be found.</p>
+
+      <h3>Step 8 - Disconnect and reconnect Zoom</h3>
+      <ol>
+        <li>Open <strong>Zoom accounts</strong>.</li>
+        <li>Click <strong>Disconnect</strong>.</li>
+        <li>Confirm the Zoom account is removed from TrainerMate.</li>
+        <li>Click <strong>Connect Zoom account</strong> again to confirm reconnect works.</li>
+      </ol>
+      <p><strong>Expected result:</strong> TrainerMate disconnects and reconnects cleanly. The user is sent through the Zoom authorization flow again when reconnecting.</p>
+    </section>
+
+    <section>
+      <h2>6. Marketplace submission checks</h2>
+      <p>
+        Before submitting, confirm these items are complete in the Zoom Marketplace build flow and submission notes. They are common review blockers and are separate from the in-app test flow above.
+      </p>
+      <ul>
+        <li>Production OAuth redirect URI is set to <span class="mono">https://demo.trainermate.xyz/zoom/callback</span>.</li>
+        <li>Deauthorization/uninstall URL is set to <span class="mono">https://demo.trainermate.xyz/zoom/deauthorize</span>, reachable over HTTPS, and removes the stored Zoom connection/tokens for the deauthorized user.</li>
+        <li>If a Zoom verification token is configured, the hosted environment uses the same value in <span class="mono">ZOOM_DEAUTHORIZATION_VERIFICATION_TOKEN</span> or <span class="mono">ZOOM_VERIFICATION_TOKEN</span>.</li>
+        <li>Requested scopes exactly match the scopes covered in this plan; remove any unused development scopes before submission.</li>
+        <li>Reviewer credentials are included in the submission notes and have seeded course data available immediately after login.</li>
+        <li>Support, documentation, privacy policy, and terms URLs are live and actionable.</li>
+        <li>The Technical Design Document is complete and matches the hosted reviewer environment.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>7. End-user visible functionality</h2>
+      <ul>
+        <li>TrainerMate dashboard login.</li>
+        <li>Scheduled course list and course status.</li>
+        <li>Zoom account connection and disconnection.</li>
+        <li>Friendly message when syncing is attempted before Zoom is connected.</li>
+        <li>Course meeting verification for already-synced courses.</li>
+        <li>Meeting creation for courses without a valid linked meeting.</li>
+        <li>Meeting refresh/update behaviour for existing course meetings.</li>
+        <li>Duplicate prevention by verifying existing meetings before creating a new meeting.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>8. Notes on provider credentials</h2>
+      <p>
+        The live TrainerMate workflow may use private third-party provider portals that are only available to authorised trainers.
+        Those credentials cannot be shared externally. The review environment therefore uses realistic seeded course records so Zoom reviewers can test the complete Zoom-facing TrainerMate workflow without requiring access to those private provider systems.
+      </p>
+    </section>
+
+    <section>
+      <h2>9. Expected reviewer completion criteria</h2>
+      <ul>
+        <li>Reviewer can log in to TrainerMate.</li>
+        <li>Reviewer can authorize Zoom using the Production Client ID.</li>
+        <li>Reviewer can see the connected Zoom account after callback.</li>
+        <li>Reviewer can run seeded course sync from the dashboard.</li>
+        <li>Reviewer can create or link meetings for seeded courses.</li>
+        <li>Reviewer can run the same action again without creating a duplicate meeting.</li>
+        <li>Reviewer can update or refresh an existing course meeting.</li>
+        <li>Reviewer can disconnect and reconnect Zoom.</li>
+      </ul>
+    </section>
+
+    <p class="small">Last updated for Zoom Marketplace review: May 2026.</p>
+  </main>
+</body>
+</html>
