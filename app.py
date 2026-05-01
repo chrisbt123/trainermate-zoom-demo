@@ -8612,6 +8612,7 @@ syncManagedZoom(document);
   var tmSyncSawRunning = sessionStorage.getItem('tmSyncSawRunning') === '1';
   var tmSyncReloading = false;
   var tmSyncReloadTimer = null;
+  var tmSyncCompletionHoldMs = 18000;
   function markSyncRunning(){
     tmSyncSawRunning = true;
     sessionStorage.setItem('tmSyncSawRunning', '1');
@@ -8628,6 +8629,25 @@ syncManagedZoom(document);
     target.searchParams.set('section', 'dashboard');
     target.searchParams.set('sync_refreshed', Date.now().toString());
     window.location.href = target.toString();
+  }
+
+  function rememberSyncCompletion(message){
+    try{
+      if(!message) return;
+      sessionStorage.setItem('tmLastSyncCompletion', JSON.stringify({message:String(message), at:Date.now()}));
+    }catch(e){}
+  }
+  function recentSyncCompletion(){
+    try{
+      var raw = sessionStorage.getItem('tmLastSyncCompletion');
+      if(!raw) return '';
+      var obj = JSON.parse(raw);
+      if(!obj || !obj.message || Date.now() - Number(obj.at || 0) > tmSyncCompletionHoldMs){
+        sessionStorage.removeItem('tmLastSyncCompletion');
+        return '';
+      }
+      return String(obj.message || '');
+    }catch(e){ return ''; }
   }
 
   var tmCertificateRefreshPending = sessionStorage.getItem('tmCertificateRefreshPending') === '1';
@@ -8704,7 +8724,7 @@ syncManagedZoom(document);
         if(terminalState.indexOf('complete') >= 0 || terminalState.indexOf('stopped') >= 0 || terminalState.indexOf('idle') >= 0 || terminalState.indexOf('failed') >= 0 || terminalState.indexOf('warning') >= 0){
           if(!tmSyncReloadTimer){
             // Keep the completion result visible long enough to read, then refresh rows automatically.
-            tmSyncReloadTimer = window.setTimeout(reloadDashboardAfterSync, 6500);
+            tmSyncReloadTimer = window.setTimeout(reloadDashboardAfterSync, 12000);
           }
         }
       }
@@ -8867,6 +8887,10 @@ syncManagedZoom(document);
       });
       if(bubble && body){
         var doneMessage = data.completion_message || data.progress_summary || data.last_message || '';
+        if(doneMessage && doneMessage !== 'No sync running.') rememberSyncCompletion(doneMessage);
+        if((!doneMessage || doneMessage === 'No sync running.') && !data.running){
+          doneMessage = recentSyncCompletion();
+        }
         var hasDoneMessage = !!(doneMessage && doneMessage !== 'No sync running.');
         bubble.classList.remove('idle','running','error','done');
         bubble.classList.add(data.running ? 'running' : ((data.sync_state || '').toLowerCase().indexOf('error') >= 0 ? 'error' : (hasDoneMessage ? 'done' : 'idle')));
@@ -8874,9 +8898,13 @@ syncManagedZoom(document);
         if(subtitle) subtitle.textContent = data.running ? (data.progress_summary || data.current_course || data.current_provider || 'Working on this now.') : (doneMessage || 'No sync running.');
         if(state) state.textContent = data.running ? 'working' : (hasDoneMessage ? 'done' : 'idle');
         if(icon) icon.textContent = data.running ? '...' : (hasDoneMessage ? '✓' : 'OK');
-        if(hasDoneMessage && bubble) bubble.open = true;
+        if((data.running || hasDoneMessage) && bubble) bubble.open = true;
         body.innerHTML = '';
-        (data.rows || []).slice(0, 8).forEach(function(item){
+        var renderedRows = (data.rows || []).slice(0, 8);
+        if(!renderedRows.length && hasDoneMessage){
+          renderedRows = [{left:'Latest sync', right:doneMessage}];
+        }
+        renderedRows.forEach(function(item){
           var step = document.createElement('div');
           step.className = 'tm-progress-step';
           var dot = document.createElement('i');
