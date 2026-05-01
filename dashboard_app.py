@@ -6736,6 +6736,10 @@ def is_process_running(pid):
 def reconcile_running_state():
     state = load_app_state()
     pid = state.get('pid')
+    if state.get('sync_running') and not pid:
+        update_app_state(sync_running=False, pid=None, last_status='Stopped', last_run_status=state.get('last_run_status') or 'stopped', pending_sync_request={})
+        state = load_app_state()
+        return state
     if state.get('sync_running') and pid and not is_process_running(pid):
         source = ((state.get('pending_sync_request') or {}).get('source') or '').strip()
         if source:
@@ -9228,7 +9232,7 @@ def clear_debug_log():
 
 @app.route('/debug-state')
 def debug_state():
-    state = load_app_state()
+    state = reconcile_running_state()
     return jsonify({
         'sync_running': bool(state.get('sync_running')),
         'pid': state.get('pid'),
@@ -9285,7 +9289,7 @@ def _live_course_sort_key(item):
 
 @app.route('/live-status')
 def live_status_panel():
-    state = load_app_state()
+    state = reconcile_running_state()
     cert_snapshot = certificate_scan_snapshot()
 
     running = bool(state.get('sync_running') or state.get('running'))
@@ -10789,6 +10793,151 @@ def reviewer_create_zoom_meeting(course, replace=False):
     return True, f"Zoom meeting created for {course.get('title')}. Meeting ID: {data.get('id')}"
 
 
+def reviewer_demo_courses_for_sync(scan_provider='all', scan_days=7):
+    """Return seeded reviewer courses that should be processed by the demo sync."""
+    provider_filter = provider_slug(scan_provider or 'all')
+    try:
+        days = int(scan_days or 7)
+    except Exception:
+        days = 7
+    days = max(1, min(days, PAID_SYNC_WINDOW_DAYS))
+    start_dt = datetime.now() - timedelta(hours=1)
+    end_dt = datetime.now() + timedelta(days=days)
+
+    conn = sqlite3.connect(str(COURSES_DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        ensure_courses_sync_columns(conn)
+        rows = conn.execute("""
+            SELECT *
+              FROM courses
+             WHERE COALESCE(active_in_portal, 1) = 1
+             ORDER BY date_time ASC, title ASC
+        """).fetchall()
+    finally:
+        conn.close()
+
+    out = []
+    for row in rows:
+        course = dict(row)
+        if provider_filter != 'all' and provider_slug(course.get('provider') or '') != provider_filter:
+            continue
+        course_dt = parse_dashboard_datetime(course.get('date_time') or '')
+        if course_dt and (course_dt < start_dt or course_dt > end_dt):
+            continue
+        out.append(course)
+    return out
+
+
+def reviewer_sync_seeded_courses(scan_provider='all', scan_days=7):
+    """Run the hosted reviewer demo sync against seeded courses, without FOBS scraping."""
+    token, token_message = reviewer_zoom_access_token_or_message()
+    if not token:
+        update_app_state(sync_running=False, pid=None, last_status='Needs attention', last_run_status='blocked', last_message=token_message)
+        return False, token_message
+
+    courses = reviewer_demo_courses_for_sync(scan_provider=scan_provider, scan_days=scan_days)
+    if not courses:
+        message = 'No seeded courses matched that sync window.'
+        update_app_state(sync_running=False, pid=None, last_status='Completed with warnings', last_run_status='completed_with_warnings', last_message=message)
+        return False, message
+
+    started_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    summary = {
+        'outcome': 'running',
+        'message': 'Reviewer demo sync is checking seeded courses.',
+        'providers': sorted({c.get('provider') or 'Provider' for c in courses}),
+        'courses_found': len(courses),
+        'courses_processed': 0,
+        'fobs_checked': 0,
+        'fobs_updated': 0,
+        'fobs_failed': 0,
+        'health_issues': [],
+    }
+    update_app_state(
+        sync_running=True,
+        pid=os.getpid(),
+        last_pid=os.getpid(),
+        stop_requested=False,
+        last_status='Running',
+        last_run_status='running',
+        last_started_at=started_at,
+        last_run_started_at=started_at,
+        last_run_finished_at='',
+        last_message='Reviewer demo sync started for seeded courses.',
+        current_provider='',
+        current_course='',
+        run_summary=summary,
+        scan_request={'provider': provider_slug(scan_provider or 'all'), 'days': scan_days, 'started_at': started_at, 'source': 'reviewer_demo'},
+    )
+
+    course_states = {}
+    failures = []
+    for course in courses:
+        if stop_requested():
+            break
+        provider = course.get('provider') or 'Provider'
+        title = course.get('title') or 'Training course'
+        date_time = course.get('date_time') or ''
+        course_key = f'{provider} | {title} | {date_time}'.strip(' |')
+        update_app_state(current_provider=provider, current_course=course_key, last_message=f'Checking Zoom meeting for {title}.')
+        try:
+            ok, message = reviewer_create_zoom_meeting(course, replace=False)
+        except Exception as exc:
+            ok, message = False, f'Zoom sync failed for {title}: {exc}'
+        summary['courses_processed'] += 1
+        summary['fobs_checked'] += 1
+        if ok:
+            summary['fobs_updated'] += 1
+            status = 'success'
+        else:
+            summary['fobs_failed'] += 1
+            failures.append(message)
+            status = 'error'
+        course_states[course_key] = {
+            'status': status,
+            'last_action': message,
+            'updated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        }
+        update_app_state(courses=course_states, run_summary=summary, last_message=message)
+
+    finished_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    stopped = stop_requested()
+    if stopped:
+        outcome = 'stopped'
+        final_status = 'Stopped'
+        final_message = 'Reviewer demo sync stopped by user.'
+    elif failures:
+        outcome = 'completed_with_warnings'
+        final_status = 'Completed with warnings'
+        final_message = f"Reviewer demo sync finished with {len(failures)} course issue(s)."
+        summary['health_issues'] = failures[:5]
+    else:
+        outcome = 'completed'
+        final_status = 'Completed'
+        final_message = f"Reviewer demo sync completed. {summary['courses_processed']} seeded course(s) checked."
+
+    summary['outcome'] = outcome
+    summary['message'] = final_message
+    update_app_state(
+        sync_running=False,
+        pid=None,
+        current_provider='',
+        current_course='',
+        last_status=final_status,
+        last_run_status=outcome,
+        last_run_finished_at=finished_at,
+        last_stopped_at=finished_at,
+        last_message=final_message,
+        run_summary=summary,
+        health_issues=summary.get('health_issues') or [],
+        pending_sync_request={},
+        scan_request={},
+        **({'last_success_at': finished_at} if outcome == 'completed' else {}),
+    )
+    return not failures and not stopped, final_message
+
+
 @app.post('/reviewer/course/<course_id>/zoom')
 def reviewer_create_or_verify_zoom(course_id):
     if not reviewer_demo_enabled():
@@ -10912,7 +11061,10 @@ def keep_fobs_zoom(course_id):
 def start_sync():
     scan_provider = request.form.get('scan_provider') or request.args.get('provider') or 'all'
     scan_days = request.form.get('scan_days') or 7
-    ok, message = start_sync_process(scan_provider=scan_provider, scan_days=scan_days)
+    if reviewer_demo_enabled():
+        ok, message = reviewer_sync_seeded_courses(scan_provider=scan_provider, scan_days=scan_days)
+    else:
+        ok, message = start_sync_process(scan_provider=scan_provider, scan_days=scan_days)
     set_flash(message, 'success' if ok else 'warning')
     redirect_provider = scan_provider if scan_provider and scan_provider != 'all' else None
     return redirect(url_for('home', section='dashboard', provider=redirect_provider))
