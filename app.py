@@ -9382,6 +9382,16 @@ def live_status_panel():
     last_status = (state.get('last_status') or state.get('status') or '').strip()
     last_message = (state.get('last_message') or state.get('message') or '').strip()
     last_run_status = (state.get('last_run_status') or '').strip()
+    zoom_connected_for_status = has_connected_zoom_account()
+
+    def stale_zoom_disconnected_message(value):
+        text = str(value or '').strip().lower()
+        return 'zoom is not connected yet' in text or 'connect zoom before syncing' in text
+
+    # If Zoom has since been connected, do not keep showing an old
+    # pre-connection warning in the live bubble/status panel.
+    if zoom_connected_for_status and stale_zoom_disconnected_message(last_message) and not running:
+        last_message = ''
 
     sync_state = 'Sync running' if running else ('Certificate refresh running' if cert_running else (last_status or last_run_status or 'Idle'))
     zoom_result = 'Waiting'
@@ -9405,6 +9415,8 @@ def live_status_panel():
     completion_message = ''
     if summary and not running:
         msg = summary.get('message') or last_message or ''
+        if zoom_connected_for_status and stale_zoom_disconnected_message(msg):
+            msg = ''
         if msg:
             completion_message = str(msg)
             rows.append({'left': 'Latest sync', 'right': completion_message})
@@ -9482,7 +9494,7 @@ def live_status_panel():
             rows.append({'left': msg, 'right': detail})
 
     if not rows:
-        if last_message and not running:
+        if last_message and not running and not (zoom_connected_for_status and stale_zoom_disconnected_message(last_message)):
             completion_message = last_message
             rows.append({'left': 'Latest sync', 'right': last_message})
         else:
