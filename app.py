@@ -11040,11 +11040,25 @@ def reviewer_create_zoom_meeting(course, replace=False, progress=None):
         report(f'Verifying saved Zoom meeting ID {saved_meeting_id}.')
         existing = reviewer_zoom_request('GET', f'https://api.zoom.us/v2/meetings/{saved_meeting_id}', token)
         if existing.status_code == 200:
-            report('Saved Zoom meeting exists. Refreshing the meeting notes now.')
-            ok, patch_response = reviewer_patch_zoom_meeting(course, saved_meeting_id, token)
+            report('Saved Zoom meeting exists. Verifying the course link now.')
+            ok, patch_response = reviewer_patch_zoom_meeting(course, saved_meeting_id, token, action='Zoom meeting already exists - verified')
             if ok:
-                return True, f"Existing Zoom meeting verified and updated for {course.get('title')}. Meeting ID: {saved_meeting_id}"
-            return False, 'TrainerMate found the existing Zoom meeting, but Zoom would not update it. Please try reconnecting Zoom.'
+                return True, f"Zoom meeting already exists - verified for {course.get('title')}. Meeting ID: {saved_meeting_id}"
+            # A successful read proves the linked meeting exists. Treat this as a
+            # successful verification rather than a failed sync, even if Zoom does
+            # not accept a metadata refresh for this meeting.
+            try:
+                data = existing.json()
+            except Exception:
+                data = {}
+            reviewer_update_course_zoom(
+                course.get('id'),
+                data.get('id') or saved_meeting_id,
+                data.get('join_url') or course.get('meeting_link') or '',
+                data.get('password') or course.get('meeting_password') or '',
+                'Zoom meeting already exists - verified',
+            )
+            return True, f"Zoom meeting already exists - verified for {course.get('title')}. Meeting ID: {saved_meeting_id}"
         if existing.status_code not in (404, 410):
             return False, 'TrainerMate could not verify the existing Zoom meeting just now. Please try again in a moment.'
         report('Saved Zoom meeting was not found in Zoom. Searching for a matching meeting before creating one.')
@@ -11057,11 +11071,13 @@ def reviewer_create_zoom_meeting(course, replace=False, progress=None):
     if matching and matching.get('meeting_id'):
         meeting_id = matching.get('meeting_id')
         report(f'Matching Zoom meeting found: {meeting_id}. Linking it to this course.')
-        ok, patch_response = reviewer_patch_zoom_meeting(course, meeting_id, token, action='Existing Zoom meeting found and linked for TrainerMate')
+        ok, patch_response = reviewer_patch_zoom_meeting(course, meeting_id, token, action='Zoom meeting already exists - verified')
         if ok:
-            return True, f"Existing Zoom meeting found, linked, and updated for {course.get('title')}. Meeting ID: {meeting_id}"
-        reviewer_update_course_zoom(course.get('id'), meeting_id, matching.get('meeting_link') or '', matching.get('meeting_password') or '', 'Existing Zoom meeting found and linked for TrainerMate')
-        return True, f"Existing Zoom meeting found and linked for {course.get('title')}. Meeting ID: {meeting_id}"
+            return True, f"Zoom meeting already exists - verified for {course.get('title')}. Meeting ID: {meeting_id}"
+        # The meeting was found by list/read, so count this as verified and linked
+        # rather than a failed sync if Zoom declines a metadata refresh.
+        reviewer_update_course_zoom(course.get('id'), meeting_id, matching.get('meeting_link') or '', matching.get('meeting_password') or '', 'Zoom meeting already exists - verified')
+        return True, f"Zoom meeting already exists - verified for {course.get('title')}. Meeting ID: {meeting_id}"
 
     # Only create when there is no saved, verified, or matching meeting.
     report('No existing matching Zoom meeting found. Creating one new meeting now.')
