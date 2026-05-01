@@ -1202,6 +1202,14 @@ def update_app_state(**kwargs):
     return state
 
 
+def stop_requested():
+    return bool(load_app_state().get('stop_requested'))
+
+
+def clear_stop_request():
+    update_app_state(stop_requested=False)
+
+
 def load_zoom_accounts():
     data = load_json(ZOOM_ACCOUNTS_PATH, {'accounts': []})
     accounts = data.get('accounts', []) if isinstance(data, dict) else []
@@ -6874,6 +6882,8 @@ def start_sync_process(scan_provider='all', scan_days=7, target_course=None, all
 def stop_sync_process():
     state = load_app_state()
     pid = state.get('pid') or state.get('last_pid')
+    scan_request = state.get('scan_request') if isinstance(state.get('scan_request'), dict) else {}
+    reviewer_demo_sync = reviewer_demo_enabled() and scan_request.get('source') == 'reviewer_demo'
     update_app_state(
         stop_requested=True,
         sync_running=False,
@@ -6884,7 +6894,7 @@ def stop_sync_process():
         pending_sync_request={},
         scan_request={},
     )
-    if pid:
+    if pid and not reviewer_demo_sync:
         try:
             pid_int = int(pid)
             if os.name == 'nt':
@@ -10701,6 +10711,21 @@ def reset_reviewer_course_state(disconnect_zoom=False):
         conn.close()
     if disconnect_zoom:
         save_zoom_accounts([])
+    update_app_state(
+        sync_running=False,
+        stop_requested=False,
+        pid=None,
+        current_provider='',
+        current_course='',
+        last_status='Idle',
+        last_run_status='',
+        last_message='TrainerMate has refreshed the course list.',
+        pending_sync_request={},
+        scan_request={},
+        run_summary={},
+        health_issues=[],
+        courses={},
+    )
 
 
 @app.route('/reset-dashboard-data', methods=['GET', 'POST'])
@@ -10891,7 +10916,15 @@ def reviewer_patch_zoom_meeting(course, meeting_id, token, action='Existing Zoom
     return True, response
 
 
-def reviewer_create_zoom_meeting(course, replace=False):
+def reviewer_create_zoom_meeting(course, replace=False, progress=None):
+    def report(message):
+        if progress:
+            try:
+                progress(message)
+            except Exception:
+                pass
+
+    report('Checking the connected Zoom account.')
     token, message = reviewer_zoom_access_token_or_message()
     if not token:
         return False, message
@@ -10901,20 +10934,26 @@ def reviewer_create_zoom_meeting(course, replace=False):
     # Saved meeting path: verify first, then update in place. This demonstrates
     # meeting:read plus meeting:update/write behaviour without creating duplicates.
     if saved_meeting_id:
+        report(f'Verifying saved Zoom meeting ID {saved_meeting_id}.')
         existing = reviewer_zoom_request('GET', f'https://api.zoom.us/v2/meetings/{saved_meeting_id}', token)
         if existing.status_code == 200:
+            report('Saved Zoom meeting exists. Refreshing the meeting notes now.')
             ok, patch_response = reviewer_patch_zoom_meeting(course, saved_meeting_id, token)
             if ok:
                 return True, f"Existing Zoom meeting verified and updated for {course.get('title')}. Meeting ID: {saved_meeting_id}"
             return False, 'TrainerMate found the existing Zoom meeting, but Zoom would not update it. Please try reconnecting Zoom.'
         if existing.status_code not in (404, 410):
             return False, 'TrainerMate could not verify the existing Zoom meeting just now. Please try again in a moment.'
+        report('Saved Zoom meeting was not found in Zoom. Searching for a matching meeting before creating one.')
+    else:
+        report('No saved meeting ID yet. Searching Zoom for an existing matching meeting first.')
 
     # No valid saved ID or saved ID was deleted in Zoom: find a matching existing
     # meeting before creating anything, so reviewer testing does not create duplicates.
     matching = reviewer_find_existing_zoom_meeting(course, token)
     if matching and matching.get('meeting_id'):
         meeting_id = matching.get('meeting_id')
+        report(f'Matching Zoom meeting found: {meeting_id}. Linking it to this course.')
         ok, patch_response = reviewer_patch_zoom_meeting(course, meeting_id, token, action='Existing Zoom meeting found and linked for TrainerMate')
         if ok:
             return True, f"Existing Zoom meeting found, linked, and updated for {course.get('title')}. Meeting ID: {meeting_id}"
@@ -10922,6 +10961,7 @@ def reviewer_create_zoom_meeting(course, replace=False):
         return True, f"Existing Zoom meeting found and linked for {course.get('title')}. Meeting ID: {meeting_id}"
 
     # Only create when there is no saved, verified, or matching meeting.
+    report('No existing matching Zoom meeting found. Creating one new meeting now.')
     payload = reviewer_zoom_payload_for_course(course, replace=replace)
     response = reviewer_zoom_request('POST', 'https://api.zoom.us/v2/users/me/meetings', token, json=payload)
     response.raise_for_status()
@@ -10968,6 +11008,7 @@ def reviewer_demo_courses_for_sync(scan_provider='all', scan_days=7):
 
 def reviewer_sync_seeded_courses(scan_provider='all', scan_days=7):
     """Run the hosted reviewer demo sync against seeded courses, without FOBS scraping."""
+    clear_stop_request()
     token, token_message = reviewer_zoom_access_token_or_message()
     if not token:
         update_app_state(sync_running=False, pid=None, last_status='Needs attention', last_run_status='blocked', last_message=token_message)
@@ -11017,9 +11058,25 @@ def reviewer_sync_seeded_courses(scan_provider='all', scan_days=7):
         title = course.get('title') or 'Training course'
         date_time = course.get('date_time') or ''
         course_key = f'{provider} | {title} | {date_time}'.strip(' |')
-        update_app_state(current_provider=provider, current_course=course_key, last_message=f'Checking Zoom meeting for {title}.')
+
+        def progress(message):
+            course_states[course_key] = {
+                'status': 'running',
+                'last_action': message,
+                'updated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            }
+            summary['message'] = message
+            update_app_state(
+                current_provider=provider,
+                current_course=course_key,
+                courses=course_states,
+                run_summary=summary,
+                last_message=message,
+            )
+
+        progress(f'Checking seeded course: {title}.')
         try:
-            ok, message = reviewer_create_zoom_meeting(course, replace=False)
+            ok, message = reviewer_create_zoom_meeting(course, replace=False, progress=progress)
         except Exception as exc:
             ok, message = False, f'Zoom sync failed for {title}: {exc}'
         summary['courses_processed'] += 1
@@ -11073,6 +11130,89 @@ def reviewer_sync_seeded_courses(scan_provider='all', scan_days=7):
         **({'last_success_at': finished_at} if outcome == 'completed' else {}),
     )
     return not failures and not stopped, final_message
+
+
+def fail_reviewer_seeded_sync(message):
+    finished_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    safe_message = str(message or 'Reviewer demo sync failed.')[:500]
+    update_app_state(
+        sync_running=False,
+        pid=None,
+        current_provider='',
+        current_course='',
+        last_status='Failed',
+        last_run_status='failed',
+        last_run_finished_at=finished_at,
+        last_stopped_at=finished_at,
+        last_message=safe_message,
+        run_summary={
+            'outcome': 'failed',
+            'message': safe_message,
+            'courses_found': 0,
+            'courses_processed': 0,
+            'fobs_checked': 0,
+            'fobs_updated': 0,
+            'fobs_failed': 1,
+            'health_issues': [safe_message],
+        },
+        health_issues=[safe_message],
+        pending_sync_request={},
+        scan_request={},
+    )
+
+
+def reviewer_seeded_sync_worker(scan_provider='all', scan_days=7):
+    try:
+        reviewer_sync_seeded_courses(scan_provider=scan_provider, scan_days=scan_days)
+    except Exception as exc:
+        fail_reviewer_seeded_sync(f'Reviewer demo sync failed: {type(exc).__name__}: {exc}')
+
+
+def start_reviewer_seeded_sync_async(scan_provider='all', scan_days=7):
+    state = reconcile_running_state()
+    if state.get('sync_running'):
+        return False, 'Sync is already running.'
+    if not has_connected_zoom_account():
+        message = zoom_required_sync_message()
+        update_app_state(sync_running=False, stop_requested=False, pid=None, last_status='Needs attention', last_message=message)
+        return False, message
+    try:
+        days = int(scan_days or 7)
+    except Exception:
+        days = 7
+    days = max(1, min(days, PAID_SYNC_WINDOW_DAYS))
+    provider_id = provider_slug(scan_provider or 'all')
+    clear_stop_request()
+    started_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    update_app_state(
+        sync_running=True,
+        stop_requested=False,
+        pid=os.getpid(),
+        last_pid=os.getpid(),
+        last_status='Running',
+        last_run_status='running',
+        last_started_at=started_at,
+        last_run_started_at=started_at,
+        last_run_finished_at='',
+        last_message='Reviewer demo sync started for seeded courses.',
+        current_provider='',
+        current_course='',
+        run_summary={
+            'outcome': 'running',
+            'message': 'Reviewer demo sync is queued.',
+            'courses_found': 0,
+            'courses_processed': 0,
+            'fobs_checked': 0,
+            'fobs_updated': 0,
+            'fobs_failed': 0,
+            'health_issues': [],
+        },
+        scan_request={'provider': provider_id, 'days': days, 'started_at': started_at, 'source': 'reviewer_demo'},
+    )
+    thread = threading.Thread(target=reviewer_seeded_sync_worker, args=(provider_id, days), daemon=True)
+    thread.start()
+    scope_text = 'all providers' if provider_id == 'all' else provider_id
+    return True, f'Reviewer demo sync started for {scope_text}, next {days} days.'
 
 
 @app.post('/reviewer/course/<course_id>/zoom')
@@ -11203,7 +11343,7 @@ def start_sync():
     scan_provider = request.form.get('scan_provider') or request.args.get('provider') or 'all'
     scan_days = request.form.get('scan_days') or 7
     if reviewer_demo_enabled():
-        ok, message = reviewer_sync_seeded_courses(scan_provider=scan_provider, scan_days=scan_days)
+        ok, message = start_reviewer_seeded_sync_async(scan_provider=scan_provider, scan_days=scan_days)
     else:
         ok, message = start_sync_process(scan_provider=scan_provider, scan_days=scan_days)
     set_flash(message, 'success' if ok else 'warning')
