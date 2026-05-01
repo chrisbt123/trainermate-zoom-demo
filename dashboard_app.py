@@ -6292,6 +6292,19 @@ def normalize_course_action(action, status='', has_zoom=False):
     status_lower = (status or '').strip().lower()
 
     if (
+        'existing zoom meeting verified and updated' in lower
+        or 'existing zoom meeting updated' in lower
+        or 'existing zoom meeting verified' in lower
+    ):
+        return 'Zoom re-verified'
+
+    if (
+        'existing zoom meeting found and linked' in lower
+        or 'existing matching zoom meeting found' in lower
+    ):
+        return 'Existing Zoom meeting linked'
+
+    if (
         'already has valid live zoom' in lower
         or 'already present' in lower
         or 'zoom joining instructions already present' in lower
@@ -6476,6 +6489,14 @@ def build_course_rows(raw_courses, app_state, providers_by_slug, active_sync_win
                 short_message = 'Course replaced by provider'
             elif normalized_message == 'Conflict - check FOBS':
                 short_message = 'Conflict - check FOBS'
+            elif normalized_message == 'Zoom re-verified':
+                short_message = 'Zoom re-verified - FOBS + Zoom OK'
+                status_label = 'Synced'
+                status_class = 'ok'
+            elif normalized_message == 'Existing Zoom meeting linked':
+                short_message = 'Existing Zoom meeting linked - FOBS + Zoom OK'
+                status_label = 'Synced'
+                status_class = 'ok'
             elif normalized_message == 'Zoom link updated' and action_is_recent(db_synced_at):
                 short_message = 'Zoom link updated'
             elif (normalized_message == 'FOBS + Zoom OK' or has_zoom) and checked_source:
@@ -10660,16 +10681,10 @@ def reviewer_update_course_zoom(course_id, meeting_id, join_url, password='', ac
         conn.close()
 
 
-def reviewer_create_zoom_meeting(course, replace=False):
-    token, message = reviewer_zoom_access_token_or_message()
-    if not token:
-        return False, message
+def reviewer_zoom_payload_for_course(course, replace=False):
     start_dt = parse_dashboard_datetime(course.get('date_time') or '') or (datetime.now() + timedelta(days=7))
-    topic_prefix = 'TrainerMate'
-    topic = f"{topic_prefix} - {course.get('title') or 'Training course'}"
-    if replace:
-        topic += ' - updated'
-    payload = {
+    topic = f"TrainerMate - {course.get('title') or 'Training course'}"
+    return {
         'topic': topic,
         'type': 2,
         'start_time': start_dt.strftime('%Y-%m-%dT%H:%M:%SZ'),
@@ -10682,17 +10697,96 @@ def reviewer_create_zoom_meeting(course, replace=False):
             'approval_type': 2,
         },
     }
-    response = requests.post('https://api.zoom.us/v2/users/me/meetings', json=payload, headers={'Authorization': f'Bearer {token}'}, timeout=20)
+
+
+def reviewer_zoom_request(method, url, token, **kwargs):
+    headers = kwargs.pop('headers', {}) or {}
+    headers['Authorization'] = f'Bearer {token}'
+    response = requests.request(method, url, headers=headers, timeout=kwargs.pop('timeout', 20), **kwargs)
     if response.status_code == 401:
-        # Try one refresh and retry before asking the reviewer to reconnect.
         account = next((a for a in load_zoom_accounts() if a.get('id') == get_default_zoom_account_id()), None)
         if account and refresh_zoom_oauth_account(account, quiet=True)[0]:
             token = get_zoom_oauth_token(account.get('id') or '', 'access')
-            response = requests.post('https://api.zoom.us/v2/users/me/meetings', json=payload, headers={'Authorization': f'Bearer {token}'}, timeout=20)
+            headers['Authorization'] = f'Bearer {token}'
+            response = requests.request(method, url, headers=headers, timeout=20, **kwargs)
+    return response
+
+
+def reviewer_find_existing_zoom_meeting(course, token):
+    """Find an existing Zoom meeting for the seeded course before creating one."""
+    expected_topic = f"TrainerMate - {course.get('title') or 'Training course'}".strip().lower()
+    expected_start = parse_dashboard_datetime(course.get('date_time') or '')
+    for meeting_type in ('upcoming', 'scheduled'):
+        response = reviewer_zoom_request('GET', 'https://api.zoom.us/v2/users/me/meetings', token, params={'type': meeting_type, 'page_size': 100})
+        if response.status_code >= 400:
+            continue
+        for meeting in (response.json().get('meetings') or []):
+            topic = (meeting.get('topic') or '').strip().lower()
+            if topic != expected_topic and not topic.startswith(expected_topic + ' -'):
+                continue
+            if expected_start:
+                meeting_start_raw = meeting.get('start_time') or ''
+                try:
+                    meeting_start = datetime.fromisoformat(meeting_start_raw.replace('Z', '+00:00')).replace(tzinfo=None)
+                    if abs((meeting_start - expected_start).total_seconds()) > 12 * 60 * 60:
+                        continue
+                except Exception:
+                    pass
+            return meeting
+    return None
+
+
+def reviewer_patch_zoom_meeting(course, meeting_id, token):
+    payload = reviewer_zoom_payload_for_course(course, replace=True)
+    response = reviewer_zoom_request('PATCH', f'https://api.zoom.us/v2/meetings/{meeting_id}', token, json=payload)
+    if response.status_code not in (200, 204):
+        return False, response
+    get_response = reviewer_zoom_request('GET', f'https://api.zoom.us/v2/meetings/{meeting_id}', token)
+    if get_response.status_code == 200:
+        data = get_response.json()
+        reviewer_update_course_zoom(course.get('id'), data.get('id') or meeting_id, data.get('join_url') or course.get('meeting_link'), data.get('password') or course.get('meeting_password') or '', 'Existing Zoom meeting verified and updated for TrainerMate')
+    else:
+        reviewer_update_course_zoom(course.get('id'), meeting_id, course.get('meeting_link'), course.get('meeting_password'), 'Existing Zoom meeting updated for TrainerMate')
+    return True, response
+
+
+def reviewer_create_zoom_meeting(course, replace=False):
+    token, message = reviewer_zoom_access_token_or_message()
+    if not token:
+        return False, message
+
+    saved_meeting_id = ''.join(ch for ch in str(course.get('meeting_id') or '') if ch.isdigit())
+
+    # Saved meeting path: verify first, then update in place. This demonstrates
+    # meeting:read plus meeting:update/write behaviour without creating duplicates.
+    if saved_meeting_id:
+        existing = reviewer_zoom_request('GET', f'https://api.zoom.us/v2/meetings/{saved_meeting_id}', token)
+        if existing.status_code == 200:
+            ok, patch_response = reviewer_patch_zoom_meeting(course, saved_meeting_id, token)
+            if ok:
+                return True, f"Existing Zoom meeting verified and updated for {course.get('title')}. Meeting ID: {saved_meeting_id}"
+            return False, 'TrainerMate found the existing Zoom meeting, but Zoom would not update it. Please try reconnecting Zoom.'
+        if existing.status_code not in (404, 410):
+            return False, 'TrainerMate could not verify the existing Zoom meeting just now. Please try again in a moment.'
+
+    # No valid saved ID or saved ID was deleted in Zoom: find a matching existing
+    # meeting before creating anything, so reviewer testing does not create duplicates.
+    matching = reviewer_find_existing_zoom_meeting(course, token)
+    if matching and matching.get('id'):
+        meeting_id = matching.get('id')
+        ok, patch_response = reviewer_patch_zoom_meeting(course, meeting_id, token)
+        if ok:
+            return True, f"Existing Zoom meeting found, linked, and updated for {course.get('title')}. Meeting ID: {meeting_id}"
+        reviewer_update_course_zoom(course.get('id'), meeting_id, matching.get('join_url') or '', matching.get('password') or '', 'Existing Zoom meeting found and linked for TrainerMate')
+        return True, f"Existing Zoom meeting found and linked for {course.get('title')}. Meeting ID: {meeting_id}"
+
+    # Only create when there is no saved, verified, or matching meeting.
+    payload = reviewer_zoom_payload_for_course(course, replace=replace)
+    response = reviewer_zoom_request('POST', 'https://api.zoom.us/v2/users/me/meetings', token, json=payload)
     response.raise_for_status()
     data = response.json()
-    reviewer_update_course_zoom(course.get('id'), data.get('id'), data.get('join_url'), data.get('password') or '', 'Zoom meeting replaced/updated for TrainerMate' if replace else 'Zoom meeting created for TrainerMate')
-    return True, f"Zoom meeting {'replaced/updated' if replace else 'created'} for {course.get('title')}. Meeting ID: {data.get('id')}"
+    reviewer_update_course_zoom(course.get('id'), data.get('id'), data.get('join_url'), data.get('password') or '', 'Zoom meeting created for TrainerMate')
+    return True, f"Zoom meeting created for {course.get('title')}. Meeting ID: {data.get('id')}"
 
 
 @app.post('/reviewer/course/<course_id>/zoom')
@@ -10711,7 +10805,7 @@ def reviewer_create_or_verify_zoom(course_id):
             r = requests.get(f"https://api.zoom.us/v2/meetings/{course.get('meeting_id')}", headers={'Authorization': f'Bearer {token}'}, timeout=20)
             if r.status_code == 200:
                 reviewer_update_course_zoom(course_id, course.get('meeting_id'), course.get('meeting_link'), course.get('meeting_password'), 'Existing Zoom meeting verified for TrainerMate')
-                set_flash('Existing Zoom meeting verified successfully.', 'success')
+                set_flash('Existing Zoom meeting re-verified. The course note has been refreshed.', 'success')
             else:
                 ok, msg = reviewer_create_zoom_meeting(course, replace=True)
                 set_flash(msg, 'success' if ok else 'warning')
