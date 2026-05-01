@@ -8860,10 +8860,12 @@ syncManagedZoom(document);
       if(bubble && body){
         bubble.classList.remove('idle','running','error');
         bubble.classList.add(data.running ? 'running' : ((data.sync_state || '').toLowerCase().indexOf('error') >= 0 ? 'error' : 'idle'));
-        if(title) title.textContent = data.certificate_running ? 'Checking certificates' : (data.running ? 'Syncing TrainerMate' : 'TrainerMate ready');
-        if(subtitle) subtitle.textContent = data.running ? (data.progress_summary || data.current_course || data.current_provider || 'Working on this now.') : 'No sync running.';
-        if(state) state.textContent = data.running ? 'working' : 'idle';
-        if(icon) icon.textContent = data.running ? '...' : 'OK';
+        var doneMessage = data.completion_message || data.progress_summary || data.last_message || '';
+        if(title) title.textContent = data.certificate_running ? 'Checking certificates' : (data.running ? 'Syncing TrainerMate' : (doneMessage && doneMessage !== 'No sync running.' ? 'Sync update' : 'TrainerMate ready'));
+        if(subtitle) subtitle.textContent = data.running ? (data.progress_summary || data.current_course || data.current_provider || 'Working on this now.') : (doneMessage || 'No sync running.');
+        if(state) state.textContent = data.running ? 'working' : (doneMessage && doneMessage !== 'No sync running.' ? 'done' : 'idle');
+        if(icon) icon.textContent = data.running ? '...' : (doneMessage && doneMessage !== 'No sync running.' ? '✓' : 'OK');
+        if(doneMessage && doneMessage !== 'No sync running.' && bubble) bubble.open = true;
         body.innerHTML = '';
         (data.rows || []).slice(0, 8).forEach(function(item){
           var step = document.createElement('div');
@@ -8909,6 +8911,28 @@ syncManagedZoom(document);
       }
     }
   }
+
+  document.querySelectorAll('form.scan-form, form[action*="/sync/start"]').forEach(function(form){
+    if(form.dataset.tmSyncSubmitBound === '1') return;
+    form.dataset.tmSyncSubmitBound = '1';
+    form.addEventListener('submit', function(){
+      markSyncRunning();
+      var bubble = document.getElementById('tmProgressBubble');
+      var title = document.getElementById('tmProgressTitle');
+      var subtitle = document.getElementById('tmProgressSubtitle');
+      var state = document.getElementById('tmProgressState');
+      var icon = document.getElementById('tmProgressIcon');
+      if(bubble){
+        bubble.classList.remove('idle','error');
+        bubble.classList.add('running');
+        bubble.open = true;
+      }
+      if(title) title.textContent = 'Syncing TrainerMate';
+      if(subtitle) subtitle.textContent = 'Starting sync. TrainerMate will update this panel as courses are checked.';
+      if(state) state.textContent = 'working';
+      if(icon) icon.textContent = '...';
+    });
+  });
 
   if(document.readyState === 'loading'){
     document.addEventListener('DOMContentLoaded', refreshTrainerMateLiveStatus);
@@ -9372,6 +9396,25 @@ def live_status_panel():
         rows.append({'left': 'Requested scan', 'right': f'{provider_text} - {days_text}'})
 
     summary = state.get('run_summary') if isinstance(state.get('run_summary'), dict) else {}
+    completion_message = ''
+    if summary and not running:
+        msg = summary.get('message') or last_message or ''
+        if msg:
+            completion_message = str(msg)
+            rows.append({'left': 'Latest sync', 'right': completion_message})
+        counters = []
+        for label, key in (
+            ('found', 'courses_found'),
+            ('processed', 'courses_processed'),
+            ('checked', 'fobs_checked'),
+            ('updated', 'fobs_updated'),
+            ('failed', 'fobs_failed'),
+        ):
+            if summary.get(key) is not None:
+                counters.append(f"{summary.get(key)} {label}")
+        if counters:
+            rows.append({'left': 'Course totals', 'right': ' - '.join(counters)})
+
     if summary and running:
         msg = summary.get('message') or summary.get('outcome') or ''
         if msg:
@@ -9433,7 +9476,11 @@ def live_status_panel():
             rows.append({'left': msg, 'right': detail})
 
     if not rows:
-        rows.append({'left': 'No sync running', 'right': 'Start sync or refresh certificates to see live progress here.'})
+        if last_message and not running:
+            completion_message = last_message
+            rows.append({'left': 'Latest sync', 'right': last_message})
+        else:
+            rows.append({'left': 'No sync running', 'right': 'Start sync or refresh certificates to see live progress here.'})
 
     if cert_running:
         latest_cert = cert_snapshot.get('latest') or {}
@@ -9441,7 +9488,7 @@ def live_status_panel():
     elif running:
         progress_summary = current_course or last_message or (rows[0].get('right') if rows else '')
     else:
-        progress_summary = 'No sync running.'
+        progress_summary = completion_message or last_message or 'No sync running.'
 
     return jsonify({
         'running': running or cert_running,
@@ -9452,6 +9499,9 @@ def live_status_panel():
         'current_course': current_course or '-',
         'zoom_result': zoom_result,
         'progress_summary': progress_summary,
+        'completion_message': completion_message,
+        'last_message': last_message,
+        'last_run_status': last_run_status,
         'certificate_scan': cert_snapshot,
         'rows': rows,
     })
@@ -11051,9 +11101,38 @@ def reviewer_sync_seeded_courses(scan_provider='all', scan_days=7):
 
     courses = reviewer_demo_courses_for_sync(scan_provider=scan_provider, scan_days=scan_days)
     if not courses:
-        message = 'No courses matched that sync window.'
-        update_app_state(sync_running=False, pid=None, last_status='Completed with warnings', last_run_status='completed_with_warnings', last_message=message)
-        return False, message
+        try:
+            days_text = int(scan_days or 7)
+        except Exception:
+            days_text = 7
+        message = f'Sync completed. No courses found in the next {days_text} days.'
+        finished_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        update_app_state(
+            sync_running=False,
+            pid=None,
+            current_provider='',
+            current_course='',
+            last_status='Completed',
+            last_run_status='completed',
+            last_run_finished_at=finished_at,
+            last_stopped_at=finished_at,
+            last_message=message,
+            run_summary={
+                'outcome': 'completed',
+                'message': message,
+                'courses_found': 0,
+                'courses_processed': 0,
+                'fobs_checked': 0,
+                'fobs_updated': 0,
+                'fobs_failed': 0,
+                'health_issues': [],
+            },
+            health_issues=[],
+            pending_sync_request={},
+            scan_request={},
+            last_success_at=finished_at,
+        )
+        return True, message
 
     started_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     summary = {
@@ -11229,12 +11308,12 @@ def start_reviewer_seeded_sync_async(scan_provider='all', scan_days=7):
         last_started_at=started_at,
         last_run_started_at=started_at,
         last_run_finished_at='',
-        last_message='TrainerMate started checking your courses.',
+        last_message=f'TrainerMate is starting a sync for {"all providers" if provider_id == "all" else provider_id}, next {days} days.',
         current_provider='',
         current_course='',
         run_summary={
             'outcome': 'running',
-            'message': 'TrainerMate is queued to check your courses.',
+            'message': f'TrainerMate is starting a sync for {"all providers" if provider_id == "all" else provider_id}, next {days} days.',
             'courses_found': 0,
             'courses_processed': 0,
             'fobs_checked': 0,
