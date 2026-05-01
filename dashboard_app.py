@@ -7186,6 +7186,7 @@ TEMPLATE = """
 .tm-progress-body{border-top:1px solid var(--line);padding:12px 14px 14px;display:grid;gap:10px;max-height:320px;overflow:auto;background:#0b1220}
 .tm-progress-step{display:grid;grid-template-columns:18px minmax(0,1fr);gap:8px;align-items:start;color:#dbeafe;font-size:13px;line-height:1.35}.tm-progress-step i{width:10px;height:10px;border-radius:999px;background:#60a5fa;margin-top:4px}.tm-progress-step span{min-width:0;overflow-wrap:anywhere}.tm-progress-step small{display:block;color:#9ca8bb;font-size:12px;line-height:1.35;margin-top:2px;overflow-wrap:anywhere}
 .tm-progress-bubble.idle .tm-progress-icon{background:#475569}.tm-progress-bubble.running .tm-progress-icon{animation:tmPulse 1.2s infinite}.tm-progress-bubble.error .tm-progress-icon{background:#991b1b}
+.tm-sync-overlay{position:fixed;inset:0;z-index:9998;display:none;align-items:center;justify-content:center;background:rgba(8,18,32,.42);backdrop-filter:blur(2px);pointer-events:none}.tm-sync-overlay.is-visible{display:flex}.tm-sync-overlay-card{display:flex;align-items:center;gap:14px;padding:18px 22px;border-radius:22px;background:rgba(15,23,42,.92);border:1px solid rgba(125,211,252,.34);box-shadow:0 24px 70px rgba(0,0,0,.42);color:#f8fafc;max-width:min(520px,calc(100vw - 36px))}.tm-sync-overlay-spinner{width:34px;height:34px;border-radius:999px;border:4px solid rgba(147,197,253,.25);border-top-color:#60a5fa;animation:tmSpin .85s linear infinite;flex:0 0 auto}.tm-sync-overlay-title{font-weight:900;font-size:17px}.tm-sync-overlay-detail{display:block;font-size:13px;color:#bfdbfe;margin-top:3px}
 .setup-list{display:grid;gap:12px}
 .setup-provider{border:1px solid var(--line);border-radius:14px;background:rgba(15,23,42,.56);padding:14px;display:grid;gap:12px}
 .setup-provider-main{display:flex;align-items:center;justify-content:space-between;gap:12px}
@@ -8727,6 +8728,8 @@ syncManagedZoom(document);
       var state = document.getElementById('tmProgressState');
       var icon = document.getElementById('tmProgressIcon');
       var body = document.getElementById('tmProgressBody');
+      var syncOverlay = document.getElementById('tmSyncOverlay');
+      if(syncOverlay) syncOverlay.classList.toggle('is-visible', !!data.sync_running);
       var certProgress = document.getElementById('tmCertificateProgress');
       var certTitle = document.getElementById('tmCertificateProgressTitle');
       var certDetail = document.getElementById('tmCertificateProgressDetail');
@@ -8910,6 +8913,8 @@ syncManagedZoom(document);
         certState.textContent = 'idle';
         certState.className = 'status-tag neutral';
       }
+      var syncOverlay = document.getElementById('tmSyncOverlay');
+      if(syncOverlay) syncOverlay.classList.remove('is-visible');
       var list = document.getElementById('tmLiveList');
       if(list){
         list.innerHTML = '';
@@ -8928,6 +8933,8 @@ syncManagedZoom(document);
       var subtitle = document.getElementById('tmProgressSubtitle');
       var state = document.getElementById('tmProgressState');
       var icon = document.getElementById('tmProgressIcon');
+      var syncOverlay = document.getElementById('tmSyncOverlay');
+      if(syncOverlay) syncOverlay.classList.add('is-visible');
       if(bubble){
         bubble.classList.remove('idle','error');
         bubble.classList.add('running');
@@ -8963,6 +8970,13 @@ syncManagedZoom(document);
 
 
 
+
+<div class="tm-sync-overlay" id="tmSyncOverlay" aria-live="polite" aria-hidden="true">
+  <div class="tm-sync-overlay-card">
+    <span class="tm-sync-overlay-spinner"></span>
+    <span><span class="tm-sync-overlay-title">TrainerMate is checking your courses</span><span class="tm-sync-overlay-detail">This will clear automatically when sync completes.</span></span>
+  </div>
+</div>
 
 <details class="tm-progress-bubble idle" id="tmProgressBubble">
   <summary>
@@ -9425,7 +9439,8 @@ def live_status_panel():
             ('found', 'courses_found'),
             ('processed', 'courses_processed'),
             ('checked', 'fobs_checked'),
-            ('updated', 'fobs_updated'),
+            ('verified existing', 'zoom_existing_verified'),
+            ('created/refreshed', 'fobs_updated'),
             ('failed', 'fobs_failed'),
         ):
             if summary.get(key) is not None:
@@ -9443,7 +9458,8 @@ def live_status_panel():
             ('found', 'courses_found'),
             ('processed', 'courses_processed'),
             ('checked', 'fobs_checked'),
-            ('updated', 'fobs_updated'),
+            ('verified existing', 'zoom_existing_verified'),
+            ('created/refreshed', 'fobs_updated'),
             ('failed', 'fobs_failed'),
         ):
             if summary.get(key) is not None:
@@ -9451,10 +9467,12 @@ def live_status_panel():
         if counters and running:
             rows.append({'left': 'Course totals', 'right': ' - '.join(counters)})
 
-        if summary.get('fobs_updated') is not None:
-            zoom_result = f"{summary.get('fobs_updated')} Zoom link(s) updated"
+        if int(summary.get('zoom_existing_verified') or 0):
+            zoom_result = f"{summary.get('zoom_existing_verified')} existing Zoom meeting(s) verified"
+        elif summary.get('fobs_updated') is not None:
+            zoom_result = f"{summary.get('fobs_updated')} Zoom meeting(s) created/refreshed"
         elif summary.get('fobs_checked') is not None:
-            zoom_result = f"{summary.get('fobs_checked')} Zoom link(s) checked"
+            zoom_result = f"{summary.get('fobs_checked')} Zoom meeting(s) checked"
 
     if running:
         courses = state.get('courses') if isinstance(state.get('courses'), dict) else {}
@@ -11158,6 +11176,7 @@ def reviewer_sync_seeded_courses(scan_provider='all', scan_days=7):
                 'courses_processed': 0,
                 'fobs_checked': 0,
                 'fobs_updated': 0,
+                'zoom_existing_verified': 0,
                 'fobs_failed': 0,
                 'health_issues': [],
             },
@@ -11177,6 +11196,7 @@ def reviewer_sync_seeded_courses(scan_provider='all', scan_days=7):
         'courses_processed': 0,
         'fobs_checked': 0,
         'fobs_updated': 0,
+        'zoom_existing_verified': 0,
         'fobs_failed': 0,
         'health_issues': [],
     }
@@ -11230,7 +11250,10 @@ def reviewer_sync_seeded_courses(scan_provider='all', scan_days=7):
         summary['courses_processed'] += 1
         summary['fobs_checked'] += 1
         if ok:
-            summary['fobs_updated'] += 1
+            if 'zoom meeting already exists - verified' in str(message or '').lower():
+                summary['zoom_existing_verified'] = int(summary.get('zoom_existing_verified') or 0) + 1
+            else:
+                summary['fobs_updated'] += 1
             status = 'success'
         else:
             summary['fobs_failed'] += 1
@@ -11257,7 +11280,14 @@ def reviewer_sync_seeded_courses(scan_provider='all', scan_days=7):
     else:
         outcome = 'completed'
         final_status = 'Completed'
-        final_message = f"Sync completed. {summary['courses_processed']} course(s) checked."
+        verified_existing = int(summary.get('zoom_existing_verified') or 0)
+        created_or_refreshed = int(summary.get('fobs_updated') or 0)
+        if verified_existing and not created_or_refreshed:
+            final_message = f"Sync completed. {summary['courses_processed']} course(s) checked; {verified_existing} existing Zoom meeting(s) verified."
+        elif verified_existing and created_or_refreshed:
+            final_message = f"Sync completed. {summary['courses_processed']} course(s) checked; {verified_existing} existing meeting(s) verified and {created_or_refreshed} course(s) created/refreshed."
+        else:
+            final_message = f"Sync completed. {summary['courses_processed']} course(s) checked."
 
     summary['outcome'] = outcome
     summary['message'] = final_message
@@ -11352,6 +11382,7 @@ def start_reviewer_seeded_sync_async(scan_provider='all', scan_days=7):
             'courses_processed': 0,
             'fobs_checked': 0,
             'fobs_updated': 0,
+            'zoom_existing_verified': 0,
             'fobs_failed': 0,
             'health_issues': [],
         },
