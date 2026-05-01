@@ -8610,6 +8610,7 @@ syncManagedZoom(document);
 
   var tmSyncSawRunning = sessionStorage.getItem('tmSyncSawRunning') === '1';
   var tmSyncReloading = false;
+  var tmSyncReloadTimer = null;
   function markSyncRunning(){
     tmSyncSawRunning = true;
     sessionStorage.setItem('tmSyncSawRunning', '1');
@@ -8695,11 +8696,15 @@ syncManagedZoom(document);
 
       var syncIsRunning = !!data.sync_running;
       if(syncIsRunning){
+        if(tmSyncReloadTimer){ window.clearTimeout(tmSyncReloadTimer); tmSyncReloadTimer = null; }
         markSyncRunning();
       } else if(tmSyncSawRunning){
         var terminalState = String(data.sync_state || '').toLowerCase();
         if(terminalState.indexOf('complete') >= 0 || terminalState.indexOf('stopped') >= 0 || terminalState.indexOf('idle') >= 0 || terminalState.indexOf('failed') >= 0 || terminalState.indexOf('warning') >= 0){
-          window.setTimeout(reloadDashboardAfterSync, 450);
+          if(!tmSyncReloadTimer){
+            // Keep the completion result visible long enough to read, then refresh rows automatically.
+            tmSyncReloadTimer = window.setTimeout(reloadDashboardAfterSync, 6500);
+          }
         }
       }
 
@@ -8858,14 +8863,15 @@ syncManagedZoom(document);
         });
       });
       if(bubble && body){
-        bubble.classList.remove('idle','running','error');
-        bubble.classList.add(data.running ? 'running' : ((data.sync_state || '').toLowerCase().indexOf('error') >= 0 ? 'error' : 'idle'));
         var doneMessage = data.completion_message || data.progress_summary || data.last_message || '';
-        if(title) title.textContent = data.certificate_running ? 'Checking certificates' : (data.running ? 'Syncing TrainerMate' : (doneMessage && doneMessage !== 'No sync running.' ? 'Sync update' : 'TrainerMate ready'));
+        var hasDoneMessage = !!(doneMessage && doneMessage !== 'No sync running.');
+        bubble.classList.remove('idle','running','error','done');
+        bubble.classList.add(data.running ? 'running' : ((data.sync_state || '').toLowerCase().indexOf('error') >= 0 ? 'error' : (hasDoneMessage ? 'done' : 'idle')));
+        if(title) title.textContent = data.certificate_running ? 'Checking certificates' : (data.running ? 'Syncing TrainerMate' : (hasDoneMessage ? 'Sync completed' : 'TrainerMate ready'));
         if(subtitle) subtitle.textContent = data.running ? (data.progress_summary || data.current_course || data.current_provider || 'Working on this now.') : (doneMessage || 'No sync running.');
-        if(state) state.textContent = data.running ? 'working' : (doneMessage && doneMessage !== 'No sync running.' ? 'done' : 'idle');
-        if(icon) icon.textContent = data.running ? '...' : (doneMessage && doneMessage !== 'No sync running.' ? '✓' : 'OK');
-        if(doneMessage && doneMessage !== 'No sync running.' && bubble) bubble.open = true;
+        if(state) state.textContent = data.running ? 'working' : (hasDoneMessage ? 'done' : 'idle');
+        if(icon) icon.textContent = data.running ? '...' : (hasDoneMessage ? '✓' : 'OK');
+        if(hasDoneMessage && bubble) bubble.open = true;
         body.innerHTML = '';
         (data.rows || []).slice(0, 8).forEach(function(item){
           var step = document.createElement('div');
