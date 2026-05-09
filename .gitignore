@@ -1,0 +1,30 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+
+# Runtime state
+*.db
+*.sqlite
+*.sqlite3
+*.log
+app_state.json
+activity_history.json
+course_removal_confirmed.json
+dashboard_alerts_ack.json
+providers.json
+reviewer_zoom_tokens.json
+zoom_accounts.json
+zoom_oauth_config*.json
+!zoom_oauth_config.example.json
+zoom_settings.json
+
+# Local secrets
+dashboard_secret.key
+admin_token_local.txt
+*_secret*.json
+
+# User documents and backups
+trainer_documents/
+backup/
+archive/

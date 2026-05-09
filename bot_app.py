@@ -157,7 +157,21 @@ def _load_zoom_oauth_config_file():
 
 _zoom_oauth_config = _load_zoom_oauth_config_file()
 ZOOM_CLIENT_ID = (os.getenv("ZOOM_CLIENT_ID") or _zoom_oauth_config.get("client_id") or "").strip()
-ZOOM_CLIENT_SECRET = (os.getenv("ZOOM_CLIENT_SECRET") or _zoom_oauth_config.get("client_secret") or "").strip()
+_legacy_zoom_client_secret = (_zoom_oauth_config.get("client_secret") or "").strip()
+if _legacy_zoom_client_secret:
+    try:
+        keyring.set_password(ZOOM_OAUTH_KEYRING_SERVICE, "client_secret", _legacy_zoom_client_secret)
+    except Exception:
+        pass
+    try:
+        sanitized = dict(_zoom_oauth_config)
+        sanitized.pop("client_secret", None)
+        with ZOOM_OAUTH_CONFIG_PATH.open("w", encoding="utf-8") as f:
+            json.dump(sanitized, f, indent=2)
+        _zoom_oauth_config = sanitized
+    except Exception as exc:
+        print(f"[ZOOM] Could not sanitize local OAuth config: {exc}")
+ZOOM_CLIENT_SECRET = (os.getenv("ZOOM_CLIENT_SECRET") or keyring.get_password(ZOOM_OAUTH_KEYRING_SERVICE, "client_secret") or "").strip()
 
 
 def _first_non_empty(*values):

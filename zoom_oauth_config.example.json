@@ -1,0 +1,4 @@
+{
+  "client_id": "YOUR_ZOOM_CLIENT_ID",
+  "redirect_uri": "https://demo.trainermate.xyz/zoom/callback"
+}

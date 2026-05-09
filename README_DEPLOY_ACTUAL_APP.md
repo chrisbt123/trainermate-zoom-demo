@@ -48,6 +48,7 @@ gunicorn app:app
 7. Disconnect Zoom from the Zoom accounts page.
 
 No real provider credentials are included or required.
+Do not commit the Zoom client secret, OAuth tokens, local database files or uploaded certificate files to GitHub. If a real secret was ever present in a submitted repository, rotate the Zoom client secret and update Render before resubmitting.
 
 
 ## Reviewer handover state

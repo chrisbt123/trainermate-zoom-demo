@@ -29,6 +29,7 @@ SESSION_COOKIE_SECURE=1
 ```
 
 Do not commit real secrets to GitHub.
+If a real Zoom client secret was ever committed or submitted in an old repo, rotate it in Zoom Marketplace and update Render with the new value before resubmitting.
 
 ## Render start command
 

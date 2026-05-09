@@ -140,9 +140,24 @@ def _load_zoom_oauth_config_file():
 
 _zoom_oauth_config = _load_zoom_oauth_config_file()
 ZOOM_CLIENT_ID = (os.getenv('ZOOM_CLIENT_ID') or _zoom_oauth_config.get('client_id') or '').strip()
-ZOOM_CLIENT_SECRET = (os.getenv('ZOOM_CLIENT_SECRET') or _zoom_oauth_config.get('client_secret') or '').strip()
+ZOOM_OAUTH_KEYRING_SERVICE = 'trainermate_zoom_oauth'
+_legacy_zoom_client_secret = (_zoom_oauth_config.get('client_secret') or '').strip()
+if _legacy_zoom_client_secret:
+    try:
+        keyring.set_password(ZOOM_OAUTH_KEYRING_SERVICE, 'client_secret', _legacy_zoom_client_secret)
+    except Exception:
+        pass
+    try:
+        sanitized = dict(_zoom_oauth_config)
+        sanitized.pop('client_secret', None)
+        with ZOOM_OAUTH_CONFIG_PATH.open('w', encoding='utf-8') as f:
+            json.dump(sanitized, f, indent=2)
+        _zoom_oauth_config = sanitized
+    except Exception:
+        pass
+ZOOM_CLIENT_SECRET = (os.getenv('ZOOM_CLIENT_SECRET') or keyring.get_password(ZOOM_OAUTH_KEYRING_SERVICE, 'client_secret') or '').strip()
 LOCAL_ZOOM_CALLBACK_URI = 'http://127.0.0.1:5000/zoom/callback'
-ZOOM_APPROVED_RELAY_URI = 'https://demo.trainermate.xyz/zoom/callback'
+ZOOM_APPROVED_RELAY_URI = (os.getenv('TRAINERMATE_ZOOM_REDIRECT_URI') or os.getenv('ZOOM_REDIRECT_URI') or _zoom_oauth_config.get('redirect_uri') or 'https://demo.trainermate.xyz/zoom/callback').strip()
 ZOOM_DEAUTHORIZATION_VERIFICATION_TOKEN = (
     os.getenv('ZOOM_DEAUTHORIZATION_VERIFICATION_TOKEN')
     or os.getenv('ZOOM_VERIFICATION_TOKEN')
@@ -1016,9 +1031,14 @@ def provider_catalogue_options():
 
 
 def save_zoom_oauth_config(client_id: str, client_secret: str, redirect_uri: str = ''):
+    clean_secret = (client_secret or '').strip()
+    if clean_secret:
+        try:
+            keyring.set_password(ZOOM_OAUTH_KEYRING_SERVICE, 'client_secret', clean_secret)
+        except Exception:
+            pass
     save_json(ZOOM_OAUTH_CONFIG_PATH, {
         'client_id': (client_id or '').strip(),
-        'client_secret': (client_secret or '').strip(),
         'redirect_uri': ZOOM_APPROVED_RELAY_URI,
         'saved_at': utc_now_text() if 'utc_now_text' in globals() else ''
     })
@@ -5859,7 +5879,9 @@ def build_calendar_events(provider_filter='all'):
 
     raw_courses = load_courses(provider_filter)
     state = load_app_state()
-    rows = build_course_rows(raw_courses, state, providers_by_slug, active_days, is_free)
+    rows = suppress_stale_same_provider_slot_duplicates(
+        build_course_rows(raw_courses, state, providers_by_slug, active_days, is_free)
+    )
 
     events = []
     for row in rows:
@@ -7022,7 +7044,7 @@ TEMPLATE = """
 .cert-provider-card{position:relative}
 .cert-provider-card[open]>.provider-refresh-form{position:absolute;top:9px;right:104px;margin:0;z-index:2}
 .cert-provider-card[open]>.provider-refresh-form .btn{white-space:nowrap}
-.document-provider-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+.document-provider-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.document-provider-grid .checkbox.is-disabled{opacity:.58;background:rgba(148,163,184,.14);cursor:not-allowed}.document-provider-grid .checkbox.is-disabled span{color:var(--muted)}
 /* Certificates page readability polish: page-scoped colours only, no behaviour changes */
 .certificate-panel{background:linear-gradient(180deg,rgba(13,27,52,.96),rgba(11,18,32,.94));border-color:rgba(125,211,252,.20);box-shadow:0 16px 36px rgba(0,0,0,.16)}
 .certificate-panel .hero{background:linear-gradient(135deg,rgba(14,116,144,.16),rgba(37,99,235,.08));border-bottom:1px solid rgba(125,211,252,.16)}
@@ -8986,9 +9008,24 @@ syncManagedZoom(document);
   const master = document.getElementById('selectAllDocumentProviders');
   const boxes = Array.from(document.querySelectorAll('.document-provider-checkbox'));
   if (!master || !boxes.length) return;
-  const syncMaster = () => { master.checked = boxes.every((box) => box.checked); };
+  const setProviderLockedState = () => {
+    boxes.forEach((box) => {
+      box.disabled = master.checked;
+      if (master.checked) box.checked = true;
+      const label = box.closest('label');
+      if (label) {
+        label.classList.toggle('is-disabled', master.checked);
+        label.setAttribute('aria-disabled', master.checked ? 'true' : 'false');
+      }
+    });
+  };
+  const syncMaster = () => {
+    master.checked = boxes.every((box) => box.checked);
+    setProviderLockedState();
+  };
   master.addEventListener('change', () => {
     boxes.forEach((box) => { box.checked = master.checked; });
+    setProviderLockedState();
   });
   boxes.forEach((box) => box.addEventListener('change', syncMaster));
   syncMaster();
