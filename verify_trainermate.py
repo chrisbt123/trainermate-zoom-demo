@@ -190,7 +190,7 @@ checks = {
         "status_text in {'paid', 'licenced', 'licensed'}",
         "reason in {'ok', 'account_inactive', 'free_sync_limit_reached', 'update_required'}",
         "old paid cache must not mask a deliberate downgrade",
-        "Lock TrainerMate",
+        "Logout",
         "hashlib.pbkdf2_hmac",
         "requests.post(f'{API_URL}/register-account'",
     ],

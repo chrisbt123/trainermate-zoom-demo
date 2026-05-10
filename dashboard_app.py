@@ -8027,17 +8027,9 @@ TEMPLATE = """
       {% if last_sync_text %}<div class='pill'>Last sync {{ last_sync_text }}</div>{% endif %}
       <div class='top-account'>
         <details>
-          <summary>{% if identity.ndors or identity.email %}Account - {{ account_plan_label }}{% else %}Set up account{% endif %}</summary>
+          <summary>{% if identity.ndors %}NDORS ID: {{ identity.ndors }} - {{ account_plan_label }}{% else %}Account - {{ account_plan_label }}{% endif %}</summary>
           <div class='dropdown'>
-            {% if identity.ndors or identity.email %}<div class='helper'>NDORS {{ identity.ndors or '-' }}{% if identity.email %} - {{ masked_email }}{% endif %}</div>{% endif %}
-            <form method='post' action='{{ url_for("save_account") }}' class='stack'>
-              <div class='field'><label>NDORS trainer ID</label><input name='ndors' placeholder='NDORS trainer ID' value='{{ identity.ndors }}'></div>
-              <div class='field'><label>Email</label><input name='email' placeholder='Email address' value='{{ identity.email }}'></div>
-              <div class='inline-actions'>
-                <button class='btn small' type='submit'>Save account</button>
-                <a class='btn soft small' href='{{ url_for("test_access") }}'>Check access</a>
-              </div>
-            </form>
+            <div class='tm-account-note'><b>Logged in as NDORS ID: {{ identity.ndors or '-' }}</b><br>{{ account_plan_label }} account{% if identity.email %} - {{ masked_email }}{% endif %}</div>
             {% if identity.ndors %}
               {% if account_plan_label == 'Free' %}
                 <div class='tm-account-note'><b>Free account active</b><br>You can keep using TrainerMate for setup, providers, Zoom and course viewing. Paid unlocks the 12-week sync window, Automatic Sync, Calendar, and certificate management.</div>
@@ -8049,11 +8041,10 @@ TEMPLATE = """
                 <form method='post' action='{{ url_for("redeem") }}' style='display:grid;gap:10px;margin-top:10px'><input name='key' placeholder='Enter licence key'><button class='btn small' type='submit'>Activate licence</button></form>
               {% endif %}
             {% endif %}
-            <form method='post' action='{{ url_for("update_remember_me") }}' class='stack' style='margin-top:10px'>
-              <label class='checkbox'><input type='checkbox' name='remember_me' value='1' {% if remember_me_enabled %}checked{% endif %}> <span>Remember me on this computer</span></label>
-              <button class='btn soft small' type='submit'>Save sign-in setting</button>
+            <form method='post' action='{{ url_for("update_remember_me") }}' class='stack tm-remember-form' style='margin-top:10px'>
+              <label class='checkbox'><input type='checkbox' name='remember_me' value='1' {% if remember_me_enabled %}checked{% endif %} onchange='this.form.submit()'> <span>Remember me on this computer</span></label>
             </form>
-            <form method='post' action='{{ url_for("auth_logout") }}' style='margin-top:10px'><button class='btn soft small' type='submit'>Lock TrainerMate</button></form>
+            <form method='post' action='{{ url_for("auth_logout") }}' style='margin-top:10px'><button class='btn soft small' type='submit'>Logout</button></form>
           </div>
         </details>
       </div>
@@ -10250,7 +10241,6 @@ def auth_logout():
 @app.post('/account/remember-me')
 def update_remember_me():
     set_local_remember_me(request.form.get('remember_me') == '1')
-    set_flash('Remember me setting updated.', 'success')
     return redirect(url_for('home'))
 
 @app.route('/')
