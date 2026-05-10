@@ -17,6 +17,8 @@ from urllib.parse import urlparse
 from dateutil.relativedelta import relativedelta
 from playwright.sync_api import sync_playwright, TimeoutError, Error as PlaywrightError
 
+import trainermate_profiles
+
 APP_NAME = "TrainerMate"
 APP_VERSION = "1.0.0"
 BUILD_CHANNEL = "Production"
@@ -141,9 +143,8 @@ def get_zoom_credentials():
 ZOOM_USER_ID = "me"
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = Path(os.getenv("TRAINERMATE_DATA_DIR") or BASE_DIR)
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-TRAINERMATE_PROFILE_SLUG = (os.getenv("TRAINERMATE_PROFILE_SLUG") or "signed-out").strip() or "signed-out"
+DATA_DIR = trainermate_profiles.data_dir_from_env(BASE_DIR)
+TRAINERMATE_PROFILE_SLUG = trainermate_profiles.profile_slug_from_env()
 
 try:
     from dotenv import load_dotenv

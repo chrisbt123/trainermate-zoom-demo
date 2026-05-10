@@ -5,9 +5,10 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
+import trainermate_profiles
+
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = Path(os.getenv("TRAINERMATE_DATA_DIR") or BASE_DIR)
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR = trainermate_profiles.data_dir_from_env(BASE_DIR)
 STATE_PATH = DATA_DIR / "app_state.json"
 _LOCK = threading.Lock()
 

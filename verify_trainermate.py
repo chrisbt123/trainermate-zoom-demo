@@ -8,6 +8,7 @@ diagnostics = (root / "trainermate_diagnostics.py").read_text(encoding="utf-8")
 certificates = (root / "trainermate_certificates.py").read_text(encoding="utf-8")
 utils = (root / "trainermate_utils.py").read_text(encoding="utf-8")
 activity = (root / "trainermate_activity.py").read_text(encoding="utf-8")
+profiles = (root / "trainermate_profiles.py").read_text(encoding="utf-8")
 api = (root / "main.py").read_text(encoding="utf-8")
 provider_picker = (root / "static" / "document_provider_picker.js").read_text(encoding="utf-8")
 support_js = (root / "static" / "support.js").read_text(encoding="utf-8")
@@ -139,6 +140,14 @@ checks = {
     "shared provider utils": [
         "from trainermate_utils import provider_slug",
     ],
+    "trainer profile module": [
+        "import trainermate_profiles",
+        "def profile_paths(",
+        "def data_dir_from_env(",
+        "TRAINERMATE_DATA_DIR",
+        "TRAINERMATE_PROFILE_SLUG",
+        "trainer_profiles",
+    ],
     "provider util module": [
         "def provider_slug(value):",
     ],
@@ -266,6 +275,8 @@ for name, required in checks.items():
         haystack = utils
     elif name == "activity helper module":
         haystack = activity + text
+    elif name == "trainer profile module":
+        haystack = profiles + text + (root / "bot_app.py").read_text(encoding="utf-8") + (root / "course_state.py").read_text(encoding="utf-8")
     elif name == "zoom marketplace review pack":
         haystack = zoom_review + text
     elif name == "zoom deauthorization docs":

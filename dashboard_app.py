@@ -20,6 +20,7 @@ from trainermate_activity import (
 )
 import trainermate_certificates as certificate_helpers
 import trainermate_identity as identity_helpers
+import trainermate_profiles
 from trainermate_courses import (
     parse_dashboard_datetime,
     suppress_stale_same_provider_slot_duplicates,
@@ -106,7 +107,6 @@ PROVIDER_CACHE_VERSION = 'v3_exact_document_cache'
 
 API_URL = os.getenv('TRAINERMATE_API_URL', 'http://127.0.0.1:8000')
 BASE_DIR = Path(__file__).resolve().parent
-PROFILE_BASE_DIR = BASE_DIR / 'trainer_profiles'
 APP_STATE_PATH = BASE_DIR / 'app_state.json'
 PROVIDERS_PATH = BASE_DIR / 'providers.json'
 PROVIDER_CATALOGUE_PATH = BASE_DIR / 'provider_catalogue.json'
@@ -491,29 +491,13 @@ def save_json(path: Path, data):
     raise last_exc
 
 
-PROFILED_FILENAMES = {
-    'APP_STATE_PATH': 'app_state.json',
-    'PROVIDERS_PATH': 'providers.json',
-    'COURSES_DB_PATH': 'courses.db',
-    'ZOOM_ACCOUNTS_PATH': 'zoom_accounts.json',
-    'ALERT_ACK_PATH': 'dashboard_alerts_ack.json',
-    'COURSE_REMOVAL_CONFIRM_PATH': 'course_removal_confirmed.json',
-    'PROVIDER_CERTIFICATE_MANIFEST_PATH': 'provider_certificate_cache_manifest.json',
-    'AUTOMATION_SETTINGS_PATH': 'automation_settings.json',
-    'ACCESS_CACHE_PATH': 'access_cache.json',
-    'BOT_LOG_PATH': 'bot_debug.log',
-}
-
-
 def active_profile_slug():
     ndors = keyring.get_password('trainermate', 'ndors_id') or ''
-    return identity_helpers.profile_slug_for_ndors(ndors)
+    return trainermate_profiles.profile_slug_for_ndors(ndors)
 
 
 def active_profile_dir():
-    root = PROFILE_BASE_DIR / active_profile_slug()
-    root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    return root
+    return trainermate_profiles.profile_dir(BASE_DIR, slug=active_profile_slug())
 
 
 def set_active_data_paths():
@@ -521,18 +505,18 @@ def set_active_data_paths():
     global APP_STATE_PATH, PROVIDERS_PATH, COURSES_DB_PATH, ZOOM_ACCOUNTS_PATH
     global ALERT_ACK_PATH, COURSE_REMOVAL_CONFIRM_PATH, DOCUMENTS_DIR
     global PROVIDER_CERTIFICATE_MANIFEST_PATH, AUTOMATION_SETTINGS_PATH, ACCESS_CACHE_PATH, BOT_LOG_PATH
-    root = active_profile_dir()
-    APP_STATE_PATH = root / PROFILED_FILENAMES['APP_STATE_PATH']
-    PROVIDERS_PATH = root / PROFILED_FILENAMES['PROVIDERS_PATH']
-    COURSES_DB_PATH = root / PROFILED_FILENAMES['COURSES_DB_PATH']
-    ZOOM_ACCOUNTS_PATH = root / PROFILED_FILENAMES['ZOOM_ACCOUNTS_PATH']
-    ALERT_ACK_PATH = root / PROFILED_FILENAMES['ALERT_ACK_PATH']
-    COURSE_REMOVAL_CONFIRM_PATH = root / PROFILED_FILENAMES['COURSE_REMOVAL_CONFIRM_PATH']
-    PROVIDER_CERTIFICATE_MANIFEST_PATH = root / PROFILED_FILENAMES['PROVIDER_CERTIFICATE_MANIFEST_PATH']
-    AUTOMATION_SETTINGS_PATH = root / PROFILED_FILENAMES['AUTOMATION_SETTINGS_PATH']
-    ACCESS_CACHE_PATH = root / PROFILED_FILENAMES['ACCESS_CACHE_PATH']
-    BOT_LOG_PATH = root / PROFILED_FILENAMES['BOT_LOG_PATH']
-    DOCUMENTS_DIR = root / 'trainer_documents'
+    paths = trainermate_profiles.profile_paths(BASE_DIR, slug=active_profile_slug())
+    APP_STATE_PATH = paths['app_state']
+    PROVIDERS_PATH = paths['providers']
+    COURSES_DB_PATH = paths['courses_db']
+    ZOOM_ACCOUNTS_PATH = paths['zoom_accounts']
+    ALERT_ACK_PATH = paths['alert_ack']
+    COURSE_REMOVAL_CONFIRM_PATH = paths['course_removal_confirm']
+    PROVIDER_CERTIFICATE_MANIFEST_PATH = paths['provider_certificate_manifest']
+    AUTOMATION_SETTINGS_PATH = paths['automation_settings']
+    ACCESS_CACHE_PATH = paths['access_cache']
+    BOT_LOG_PATH = paths['bot_log']
+    DOCUMENTS_DIR = paths['documents_dir']
 
 
 set_active_data_paths()
