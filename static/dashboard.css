@@ -429,6 +429,32 @@ body{background:linear-gradient(180deg,#0b1728 0,#102237 106px,#d8e2ea 106px,#d8
 @media(max-width:640px){.tm-metric-row{grid-template-columns:1fr}}
 @media(max-width:720px){.modal-grid,.setup-provider-fields{grid-template-columns:1fr}.fc .fc-toolbar{display:grid;gap:8px}.fc .fc-toolbar-chunk{display:flex;justify-content:center;flex-wrap:wrap}}
 
+/* First-run setup: keep new trainers focused and avoid catalogue overload */
+.section-setup .main>.panel>.head.setup-head{min-height:auto;padding:20px 22px;background:#eef5fb!important;color:#172033!important;border-bottom:1px solid rgba(42,55,72,.12)!important;box-shadow:none!important}
+.section-setup .main>.panel>.head.setup-head h3{font-size:22px!important;color:#172033!important;margin:0 0 4px!important}
+.section-setup .main>.panel>.head.setup-head p{font-size:14px!important;color:#526579!important;max-width:none!important}
+.section-setup .hero{align-items:center;background:#eef5fb!important}
+.section-setup .hero h2{font-size:24px;color:#172033}.section-setup .hero .muted{font-size:15px;color:#526579}
+.setup-checklist{min-width:220px;margin-top:0;padding:10px 12px;border:1px solid rgba(42,55,72,.10);border-radius:14px;background:rgba(255,255,255,.55)}
+.setup-checklist div{color:#334155!important;font-size:13px}.setup-checklist b{background:#dbeafe!important;border-color:#bfdbfe!important;color:#1e40af!important}
+.setup-list{grid-template-columns:repeat(auto-fit,minmax(260px,1fr));align-items:start}
+.setup-provider{gap:10px;padding:13px!important;border-radius:14px!important}
+.setup-provider.disabled{display:none}
+.setup-provider-main{min-height:34px}
+.setup-provider-title{color:#172033!important;font-size:15px}
+.setup-provider-fields{display:none;grid-template-columns:1fr;gap:10px;padding-top:10px;border-top:1px solid rgba(42,55,72,.10)}
+.setup-provider:has(.setup-provider-check:checked) .setup-provider-fields{display:grid}
+.setup-provider:has(.setup-provider-check:checked){border-color:rgba(37,99,235,.26)!important;background:#f8fbff!important}
+.setup-provider .helper{display:none}.setup-provider:has(.setup-provider-check:checked) .helper{display:block}
+.setup-more-providers{border:1px solid rgba(42,55,72,.12);border-radius:14px;background:#edf4f9;overflow:hidden}
+.setup-more-providers summary{cursor:pointer;list-style:none;padding:13px 15px;font-weight:900;color:#1d4ed8;background:#f8fbff}
+.setup-more-providers summary::-webkit-details-marker{display:none}
+.setup-more-providers[open] summary{border-bottom:1px solid rgba(42,55,72,.10)}
+.setup-list-more{padding:14px}
+.top-right{max-width:min(720px,52vw)}
+.top-account details{min-width:0}.top-account summary{max-width:360px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#0f172a!important;background:#f8fbff!important}
+@media(max-width:1100px){.top-right{max-width:none}.section-setup .hero{display:grid}.setup-checklist{width:100%}}
+
 /* Final certificates simplification: quiet, scannable, and action-led */
 .section-files .certificate-workspace{display:grid;gap:18px}
 .section-files .certificate-panel{background:#eef5fb!important;border:1px solid rgba(64,87,112,.16)!important;border-radius:18px!important;box-shadow:0 10px 24px rgba(15,35,58,.08)!important;color:#142235!important}

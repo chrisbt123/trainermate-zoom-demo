@@ -1626,17 +1626,20 @@ def pause_provider_after_failed_auto_login(provider_id, provider_name='', reason
 def setup_provider_rows(existing_providers=None):
     existing = {provider.get('id'): provider for provider in (existing_providers or load_providers())}
     rows = []
+    suggested_provider_ids = {'essex', 'lincolnshire', 'west-mids'}
     for option in provider_catalogue_options():
         if option.get('id') == 'manual':
             continue
+        option_id = option.get('id') or ''
         preset = provider_presets_for_ui().get(option.get('id') or '', {})
-        provider = existing.get(option.get('id'))
+        provider = existing.get(option_id)
         ready = bool(preset.get('login_url'))
         rows.append({
-            'id': option.get('id'),
+            'id': option_id,
             'name': option.get('name'),
             'ready': ready,
             'configured': bool(provider),
+            'show_initial': bool(provider) or option_id in suggested_provider_ids,
             'username': ((provider or {}).get('credentials') or {}).get('username') or '',
             'has_password': bool(((provider or {}).get('credentials') or {}).get('password')),
             'read_only': bool(preset.get('read_only') or (provider or {}).get('read_only')),
@@ -8143,7 +8146,7 @@ TEMPLATE = """
             <div>
               <div class='kicker'>First setup</div>
               <h2>Welcome to TrainerMate</h2>
-              <div class='muted'>Choose the providers you work with and save the FOBS login details for each one.</div>
+              <div class='muted'>Start with the provider you use most. You can add more later.</div>
             </div>
             <div class='setup-checklist'>
               <div><b>{% if zoom_accounts %}OK{% else %}1{% endif %}</b> Zoom account{% if zoom_accounts %} connected{% else %} not connected yet{% endif %}</div>
@@ -8153,15 +8156,16 @@ TEMPLATE = """
           </div>
         </div>
         <div class='panel'>
-          <div class='head'><h3>Which providers do you work with?</h3><p>TrainerMate will keep the technical FOBS addresses in the background where it can.</p></div>
+          <div class='head setup-head'><h3>Choose providers</h3><p>Tick a provider to add its FOBS login. Unticked providers stay out of the way.</p></div>
           <div class='block'>
             <form method='post' action='{{ url_for("setup_providers") }}' class='stack'>
               <div class='setup-list'>
                 {% for item in setup_provider_rows %}
-                  <div class='setup-provider {% if not item.ready %}disabled{% endif %}'>
+                  {% if item.show_initial %}
+                  <div class='setup-provider {% if not item.ready %}disabled{% endif %} {% if item.configured %}is-selected{% endif %}'>
                     <div class='setup-provider-main'>
                       <label class='setup-provider-title'>
-                        <input type='checkbox' name='setup_provider' value='{{ item.id }}' {% if item.configured %}checked{% endif %} {% if not item.ready %}disabled{% endif %}>
+                        <input class='setup-provider-check' type='checkbox' name='setup_provider' value='{{ item.id }}' {% if item.configured %}checked{% endif %} {% if not item.ready %}disabled{% endif %}>
                         <span>{{ item.name }}</span>
                       </label>
                       <span class='status-tag {% if item.configured %}ok{% elif item.ready %}neutral{% else %}due{% endif %}'>{% if item.configured %}Selected{% elif item.ready %}Ready{% else %}Coming soon{% endif %}</span>
@@ -8177,8 +8181,37 @@ TEMPLATE = """
                       <div class='helper'>This provider is in the catalogue, but TrainerMate still needs the confirmed FOBS setup details before it can be selected here.</div>
                     {% endif %}
                   </div>
+                  {% endif %}
                 {% endfor %}
               </div>
+              <details class='setup-more-providers'>
+                <summary>More providers</summary>
+                <div class='setup-list setup-list-more'>
+                  {% for item in setup_provider_rows %}
+                    {% if not item.show_initial %}
+                    <div class='setup-provider {% if not item.ready %}disabled{% endif %} {% if item.configured %}is-selected{% endif %}'>
+                      <div class='setup-provider-main'>
+                        <label class='setup-provider-title'>
+                          <input class='setup-provider-check' type='checkbox' name='setup_provider' value='{{ item.id }}' {% if item.configured %}checked{% endif %} {% if not item.ready %}disabled{% endif %}>
+                          <span>{{ item.name }}</span>
+                        </label>
+                        <span class='status-tag {% if item.configured %}ok{% elif item.ready %}neutral{% else %}due{% endif %}'>{% if item.configured %}Selected{% elif item.ready %}Ready{% else %}Coming soon{% endif %}</span>
+                      </div>
+                      {% if item.ready %}
+                        <div class='setup-provider-fields'>
+                          <div class='field'><label>Username</label><input name='username_{{ item.id }}' value='{{ item.username }}' placeholder='FOBS username'></div>
+                          <div class='field'><label>Password</label><input type='password' name='password_{{ item.id }}' placeholder='{% if item.has_password %}Saved - leave blank to keep{% else %}FOBS password{% endif %}'></div>
+                        </div>
+                        {% if item.read_only %}<div class='helper'>Read-only provider. TrainerMate can check courses but will not write Zoom details here.</div>{% endif %}
+                        {% if item.last_login_test_message %}<div class='helper'>{{ item.last_login_test_message }}</div>{% endif %}
+                      {% else %}
+                        <div class='helper'>This provider is in the catalogue, but TrainerMate still needs the confirmed FOBS setup details before it can be selected here.</div>
+                      {% endif %}
+                    </div>
+                    {% endif %}
+                  {% endfor %}
+                </div>
+              </details>
               <div class='inline-actions'>
                 <button class='btn' type='submit'>Save providers</button>
                 <a class='btn soft' href='{{ url_for("home", section="zoom_accounts") }}'>Connect Zoom</a>
