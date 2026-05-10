@@ -72,6 +72,12 @@ class _SafeKeyring:
 keyring = _SafeKeyring()
 
 try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
+try:
     from playwright.sync_api import sync_playwright
 except Exception:
     sync_playwright = None
@@ -146,12 +152,6 @@ PAID_SYNC_WINDOW_DAYS = 84
 
 # Zoom OAuth credentials can come from environment variables, a local .env file,
 # or TrainerMate's local advanced setup. Secrets are stored in keyring, not JSON.
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except Exception:
-    pass
-
 ZOOM_OAUTH_CONFIG_PATH = BASE_DIR / 'zoom_oauth_config.json'
 ZOOM_OAUTH_KEYRING_SERVICE = 'trainermate_zoom_oauth'
 
@@ -765,6 +765,23 @@ def mask_email(email: str) -> str:
     else:
         masked_name = name[:2] + '-' * max(1, len(name) - 2)
     return f'{masked_name}@{domain}'
+
+
+def friendly_password_reset_error(detail: str) -> str:
+    text = str(detail or '').strip()
+    lower_text = text.lower()
+    if (
+        'password email is not configured' in lower_text
+        or 'resend_api_key' in lower_text
+        or 'resend_from_email' in lower_text
+        or 'smtp' in lower_text
+    ):
+        return 'Password reset email is not set up on this TrainerMate service yet. Please contact TrainerMate support to reset your password.'
+    if 'password email could not be sent' in lower_text or 'email provider rejected' in lower_text:
+        return 'TrainerMate could not send the reset email just now. Please try again shortly or contact support.'
+    if text:
+        return text
+    return 'Password reset could not be completed just now. Please try again shortly.'
 
 
 def get_device_id():
@@ -10151,7 +10168,7 @@ def auth_forgot_password():
                 detail = response.json().get('detail') or response.text
             except Exception:
                 detail = response.text or 'Password reset could not be verified.'
-            session['auth_message'] = str(detail)
+            session['auth_message'] = friendly_password_reset_error(detail)
             session['auth_mode'] = 'forgot'
             return redirect(url_for('auth_welcome', next=next_url, mode='forgot'))
         keyring.set_password('trainermate', 'ndors_id', ndors)
