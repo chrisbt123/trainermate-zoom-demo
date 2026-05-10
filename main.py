@@ -1490,6 +1490,17 @@ def get_accounts_by_ndors(ndors_trainer_id: str):
     return result.data or []
 
 
+def update_accounts_by_ndors(ndors_trainer_id: str, updates: dict, operation: str):
+    ndors = (ndors_trainer_id or "").strip()
+    if not ndors:
+        return []
+    execute_supabase(
+        supabase.table("accounts").update(updates).eq("ndors_trainer_id", ndors),
+        operation,
+    )
+    return get_accounts_by_ndors(ndors)
+
+
 def get_account_by_ndors(ndors_trainer_id: str):
     return best_account_row(get_accounts_by_ndors(ndors_trainer_id))
 
@@ -2774,11 +2785,8 @@ def admin_update_account(ndors_trainer_id: str, payload: AdminAccountUpdateReque
     if not updates:
         raise HTTPException(status_code=400, detail="No valid account changes supplied")
     # Update every duplicate row for this NDORS ID so admin and dashboard cannot disagree.
-    updated_result = execute_supabase(
-        supabase.table("accounts").update(updates).eq("ndors_trainer_id", ndors_trainer_id).select("*"),
-        "admin update account",
-    )
-    updated_account = best_account_row(updated_result.data or []) or dict(account, **updates)
+    updated_rows = update_accounts_by_ndors(ndors_trainer_id, updates, "admin update account")
+    updated_account = best_account_row(updated_rows) or dict(account, **updates)
     try:
         cache_access_response(ndors_trainer_id, access_response_for_account(updated_account, None))
     except Exception:
@@ -2864,11 +2872,8 @@ def admin_force_password_reset(ndors_trainer_id: str, payload: AdminPasswordRese
         "password_must_change": True,
         "updated_at": utc_now(),
     }
-    updated = execute_supabase(
-        supabase.table("accounts").update(updates).eq("ndors_trainer_id", ndors).select("*"),
-        "admin force password reset",
-    )
-    account = best_account_row(updated.data or []) or best_account_row(accounts)
+    updated_rows = update_accounts_by_ndors(ndors, updates, "admin force password reset")
+    account = best_account_row(updated_rows) or best_account_row(accounts)
     try:
         if account:
             cache_access_response(ndors, access_response_for_account(account, None))
@@ -3662,11 +3667,8 @@ def register_account(payload: AccountRegisterRequest, request: Request):
                 updates["password_must_change"] = False
             if primary_email and supplied_email and primary_email != supplied_email and existing_hash:
                 raise HTTPException(status_code=403, detail="That email does not match the registered account.")
-            updated = execute_supabase(
-                supabase.table("accounts").update(updates).eq("ndors_trainer_id", payload.ndors_trainer_id).select("*"),
-                "register existing account"
-            )
-            account = best_account_row(updated.data or []) or dict(account, **updates)
+            updated_rows = update_accounts_by_ndors(payload.ndors_trainer_id, updates, "register existing account")
+            account = best_account_row(updated_rows) or dict(account, **updates)
         ensure_device(account["id"], payload.device_id, payload.device_name)
         response = access_response_for_account(account, payload.app_version)
         cache_access_response(payload.ndors_trainer_id, response)
@@ -3746,15 +3748,12 @@ def confirm_password_reset(payload: PasswordResetConfirmRequest, request: Reques
             "last_login_at": utc_now(),
             "password_must_change": False,
         }
-        updated = execute_supabase(
-            supabase.table("accounts").update(updates).eq("ndors_trainer_id", payload.ndors_trainer_id).select("*"),
-            "confirm password reset",
-        )
+        updated_rows = update_accounts_by_ndors(payload.ndors_trainer_id, updates, "confirm password reset")
         execute_supabase(
             supabase.table("password_reset_tokens").update({"used_at": utc_now()}).eq("id", token_row.get("id")),
             "mark password reset token used",
         )
-        account = best_account_row(updated.data or []) or account
+        account = best_account_row(updated_rows) or account
         if account:
             ensure_device(account["id"], payload.device_id, payload.device_name)
             response = access_response_for_account(account, payload.app_version)
@@ -3816,11 +3815,8 @@ def change_password(payload: AccountPasswordChangeRequest, request: Request):
             "password_must_change": False,
             "last_login_at": utc_now(),
         }
-        updated = execute_supabase(
-            supabase.table("accounts").update(updates).eq("ndors_trainer_id", payload.ndors_trainer_id).select("*"),
-            "change account password",
-        )
-        account = best_account_row(updated.data or []) or dict(account, **updates)
+        updated_rows = update_accounts_by_ndors(payload.ndors_trainer_id, updates, "change account password")
+        account = best_account_row(updated_rows) or dict(account, **updates)
         ensure_device(account["id"], payload.device_id, payload.device_name)
         response = access_response_for_account(account, payload.app_version)
         cache_access_response(payload.ndors_trainer_id, response)
