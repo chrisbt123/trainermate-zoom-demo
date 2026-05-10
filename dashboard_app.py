@@ -767,6 +767,14 @@ def mask_email(email: str) -> str:
     return f'{masked_name}@{domain}'
 
 
+def mask_ndors(ndors: str) -> str:
+    text = re.sub(r'\s+', '', str(ndors or '').strip())
+    if not text:
+        return ''
+    suffix = text[-3:] if len(text) > 3 else text[-1:]
+    return ('*' * max(3, len(text) - len(suffix))) + suffix
+
+
 def friendly_password_reset_error(detail: str) -> str:
     text = str(detail or '').strip()
     lower_text = text.lower()
@@ -8027,9 +8035,9 @@ TEMPLATE = """
       {% if last_sync_text %}<div class='pill'>Last sync {{ last_sync_text }}</div>{% endif %}
       <div class='top-account'>
         <details>
-          <summary>{% if identity.ndors %}NDORS ID: {{ identity.ndors }} - {{ account_plan_label }}{% else %}Account - {{ account_plan_label }}{% endif %}</summary>
+          <summary>{% if identity.ndors %}NDORS ID: {{ masked_ndors }} - {{ account_plan_label }}{% else %}Account - {{ account_plan_label }}{% endif %}</summary>
           <div class='dropdown'>
-            <div class='tm-account-note'><b>Logged in as NDORS ID: {{ identity.ndors or '-' }}</b><br>{{ account_plan_label }} account{% if identity.email %} - {{ masked_email }}{% endif %}</div>
+            <div class='tm-account-note'><b>Logged in as NDORS ID: {{ masked_ndors or '-' }}</b><br>{{ account_plan_label }} account{% if identity.email %} - {{ masked_email }}{% endif %}</div>
             {% if identity.ndors %}
               {% if account_plan_label == 'Free' %}
                 <div class='tm-account-note'><b>Free account active</b><br>You can keep using TrainerMate for setup, providers, Zoom and course viewing. Paid unlocks the 12-week sync window, Automatic Sync, Calendar, and certificate management.</div>
@@ -10415,6 +10423,7 @@ def home():
         identity=identity,
         remember_me_enabled=local_remember_me_enabled(),
         masked_email=mask_email(identity.get('email', '')),
+        masked_ndors=mask_ndors(identity.get('ndors', '')),
         state=state,
         providers=providers,
         zoom_accounts=zoom_accounts,
