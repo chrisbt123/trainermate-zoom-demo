@@ -73,7 +73,7 @@ keyring = _SafeKeyring()
 
 try:
     from dotenv import load_dotenv
-    load_dotenv()
+    load_dotenv(Path(__file__).resolve().parent / '.env', encoding='utf-8-sig')
 except Exception:
     pass
 

@@ -19,13 +19,13 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from pydantic import BaseModel, Field
 from supabase import create_client, Client
 
-load_dotenv()
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env", encoding="utf-8-sig")
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 FREE_SYNC_LIMIT = int(os.getenv("FREE_SYNC_LIMIT", "3"))
 
-BASE_DIR = Path(__file__).resolve().parent
 LICENSING_CACHE_PATH = BASE_DIR / "licensing_cache.json"
 PENDING_SYNC_RECORDS_PATH = BASE_DIR / "pending_sync_records.json"
 ADMIN_STATE_PATH = BASE_DIR / "admin_state.json"
