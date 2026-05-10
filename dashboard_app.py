@@ -1,13 +1,36 @@
 import shutil
 import json, os, signal, sqlite3, subprocess, sys, uuid, threading, time, secrets, hmac, mimetypes, re, hashlib, ctypes
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import urljoin, urlparse, urlencode
-from zoneinfo import ZoneInfo
+from urllib.parse import quote, urljoin, urlparse, urlencode
 
 import requests
 from flask import Flask, Response, abort, jsonify, redirect, render_template_string, request, send_file, session, url_for
 from werkzeug.exceptions import HTTPException, RequestEntityTooLarge
+
+from trainermate_activity import (
+    activity_counts,
+    add_activity_item,
+    build_sync_activity_from_state,
+    compact_activity_items,
+    dismiss_activity,
+    latest_popup_activity,
+    load_activity_history,
+    mark_activity_read,
+)
+import trainermate_certificates as certificate_helpers
+from trainermate_courses import (
+    parse_dashboard_datetime,
+    suppress_stale_same_provider_slot_duplicates,
+    visible_course_where_clause,
+)
+from trainermate_diagnostics import (
+    debug_tools_enabled,
+    support_message_text,
+    support_summary_lines,
+    tail_log,
+)
+from trainermate_utils import provider_slug
 
 APP_NAME = "TrainerMate"
 APP_VERSION = "1.0.0"
@@ -23,28 +46,28 @@ except Exception:
 
 class _SafeKeyring:
     def get_password(self, service, username):
-        if _real_keyring is None:
-            return None
-        try:
-            return _real_keyring.get_password(service, username)
-        except Exception:
-            return None
+        if _real_keyring is not None:
+            try:
+                return _real_keyring.get_password(service, username)
+            except Exception:
+                return None
+        return None
 
     def set_password(self, service, username, password):
-        if _real_keyring is None:
-            return None
-        try:
-            return _real_keyring.set_password(service, username, password)
-        except Exception:
-            return None
+        if _real_keyring is not None:
+            try:
+                return _real_keyring.set_password(service, username, password)
+            except Exception:
+                return None
+        return None
 
     def delete_password(self, service, username):
-        if _real_keyring is None:
-            return None
-        try:
-            return _real_keyring.delete_password(service, username)
-        except Exception:
-            return None
+        if _real_keyring is not None:
+            try:
+                return _real_keyring.delete_password(service, username)
+            except Exception:
+                return None
+        return None
 
 keyring = _SafeKeyring()
 
@@ -72,7 +95,7 @@ PROVIDER_UPLOAD_QUEUE_LOCK = threading.Lock()
 PROVIDER_UPLOAD_QUEUE_ACTIVE = False
 PROVIDER_DELETE_CANCEL_LOCK = threading.Lock()
 PROVIDER_DELETE_CANCEL_REQUESTS = set()
-PROVIDER_CACHE_VERSION = 'v2_exact_download'
+PROVIDER_CACHE_VERSION = 'v3_exact_document_cache'
 
 API_URL = os.getenv('TRAINERMATE_API_URL', 'http://127.0.0.1:8000')
 BASE_DIR = Path(__file__).resolve().parent
@@ -86,8 +109,9 @@ BOT_LOG_PATH = BASE_DIR / 'bot_debug.log'
 ALERT_ACK_PATH = BASE_DIR / 'dashboard_alerts_ack.json'
 COURSE_REMOVAL_CONFIRM_PATH = BASE_DIR / 'course_removal_confirmed.json'
 DOCUMENTS_DIR = BASE_DIR / 'trainer_documents'
+PROVIDER_CERTIFICATE_MANIFEST_PATH = BASE_DIR / 'provider_certificate_cache_manifest.json'
 AUTOMATION_SETTINGS_PATH = BASE_DIR / 'automation_settings.json'
-ACTIVITY_HISTORY_PATH = BASE_DIR / 'activity_history.json'
+FAVICON_PATH = BASE_DIR / 'static' / 'favicon.ico'
 
 def env_int(name, default, minimum=None, maximum=None):
     try:
@@ -99,6 +123,9 @@ def env_int(name, default, minimum=None, maximum=None):
     if maximum is not None:
         value = min(maximum, value)
     return value
+
+PROVIDER_CERT_CACHE_MAX_MB = env_int('TRAINERMATE_PROVIDER_CERT_CACHE_MAX_MB', 250, minimum=25, maximum=4096)
+PROVIDER_CERT_CACHE_KEEP_DAYS = env_int('TRAINERMATE_PROVIDER_CERT_CACHE_KEEP_DAYS', 30, minimum=1, maximum=365)
 
 
 def env_float(name, default, minimum=None, maximum=None):
@@ -118,8 +145,7 @@ FREE_SYNC_WINDOW_DAYS = 21
 PAID_SYNC_WINDOW_DAYS = 84
 
 # Zoom OAuth credentials can come from environment variables, a local .env file,
-# or TrainerMate's local zoom_oauth_config.json file.
-# This lets trainers connect another Zoom account without editing Python files.
+# or TrainerMate's local advanced setup. Secrets are stored in keyring, not JSON.
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -127,6 +153,7 @@ except Exception:
     pass
 
 ZOOM_OAUTH_CONFIG_PATH = BASE_DIR / 'zoom_oauth_config.json'
+ZOOM_OAUTH_KEYRING_SERVICE = 'trainermate_zoom_oauth'
 
 def _load_zoom_oauth_config_file():
     try:
@@ -139,36 +166,22 @@ def _load_zoom_oauth_config_file():
     return {}
 
 _zoom_oauth_config = _load_zoom_oauth_config_file()
-ZOOM_CLIENT_ID = (os.getenv('ZOOM_CLIENT_ID') or _zoom_oauth_config.get('client_id') or '').strip()
-ZOOM_OAUTH_KEYRING_SERVICE = 'trainermate_zoom_oauth'
 _legacy_zoom_client_secret = (_zoom_oauth_config.get('client_secret') or '').strip()
-if _legacy_zoom_client_secret:
+if _legacy_zoom_client_secret and not keyring.get_password(ZOOM_OAUTH_KEYRING_SERVICE, 'client_secret'):
+    keyring.set_password(ZOOM_OAUTH_KEYRING_SERVICE, 'client_secret', _legacy_zoom_client_secret)
+    _zoom_oauth_config.pop('client_secret', None)
     try:
-        keyring.set_password(ZOOM_OAUTH_KEYRING_SERVICE, 'client_secret', _legacy_zoom_client_secret)
+        ZOOM_OAUTH_CONFIG_PATH.write_text(json.dumps(_zoom_oauth_config, indent=2), encoding='utf-8')
     except Exception:
         pass
-    try:
-        sanitized = dict(_zoom_oauth_config)
-        sanitized.pop('client_secret', None)
-        with ZOOM_OAUTH_CONFIG_PATH.open('w', encoding='utf-8') as f:
-            json.dump(sanitized, f, indent=2)
-        _zoom_oauth_config = sanitized
-    except Exception:
-        pass
+ZOOM_CLIENT_ID = (os.getenv('ZOOM_CLIENT_ID') or _zoom_oauth_config.get('client_id') or '').strip()
 ZOOM_CLIENT_SECRET = (os.getenv('ZOOM_CLIENT_SECRET') or keyring.get_password(ZOOM_OAUTH_KEYRING_SERVICE, 'client_secret') or '').strip()
 LOCAL_ZOOM_CALLBACK_URI = 'http://127.0.0.1:5000/zoom/callback'
-ZOOM_APPROVED_RELAY_URI = (os.getenv('TRAINERMATE_ZOOM_REDIRECT_URI') or os.getenv('ZOOM_REDIRECT_URI') or _zoom_oauth_config.get('redirect_uri') or 'https://demo.trainermate.xyz/zoom/callback').strip()
-ZOOM_DEAUTHORIZATION_VERIFICATION_TOKEN = (
-    os.getenv('ZOOM_DEAUTHORIZATION_VERIFICATION_TOKEN')
-    or os.getenv('ZOOM_VERIFICATION_TOKEN')
-    or ''
-).strip()
+ZOOM_APPROVED_RELAY_URI = (os.getenv('TRAINERMATE_ZOOM_REDIRECT_URI') or _zoom_oauth_config.get('redirect_uri') or 'https://www.trainermate.xyz/zoom/callback').strip()
 # Keep the pending Zoom Marketplace redirect stable. Localhost is only used
 # after the hosted callback relays the browser back to the desktop app.
 ZOOM_REDIRECT_URI = ZOOM_APPROVED_RELAY_URI
 ZOOM_RELAY_STATE_PREFIX = 'tmrelay:'
-LOCAL_TIMEZONE = ZoneInfo('Europe/London')
-ZOOM_MATCH_WINDOW_MINUTES = 5
 ACCESS_CACHE_PATH = BASE_DIR / 'access_cache.json'
 # Keep licence cache deliberately short so admin plan changes show quickly.
 ACCESS_CACHE_MAX_AGE_SECONDS = env_int('TRAINERMATE_ACCESS_CACHE_MAX_AGE_SECONDS', 20, minimum=0, maximum=300)
@@ -188,12 +201,7 @@ PROVIDER_PRESETS = {
 }
 
 app = Flask(__name__)
-REVIEWER_DEMO_MODE = os.getenv('TRAINERMATE_REVIEWER_DEMO', '1').strip().lower() in {'1', 'true', 'yes', 'on'}
-REVIEWER_PASSWORD = os.getenv('REVIEWER_PASSWORD', '').strip()
-REVIEWER_TOKEN_STORE_PATH = BASE_DIR / 'reviewer_zoom_tokens.json'
-REVIEWER_DEMO_SEEDED = False
-
-app.secret_key = os.getenv('TRAINERMATE_DASHBOARD_SECRET') or os.getenv('FLASK_SECRET_KEY') or 'dev-secret'
+app.secret_key = os.getenv('TRAINERMATE_DASHBOARD_SECRET', 'dev-secret')
 if app.secret_key == 'dev-secret':
     _stored_dashboard_secret = keyring.get_password('trainermate', 'dashboard_secret') or ''
     if not _stored_dashboard_secret:
@@ -203,7 +211,11 @@ if app.secret_key == 'dev-secret':
 app.config['MAX_CONTENT_LENGTH'] = env_int('TRAINERMATE_MAX_UPLOAD_MB', 20, minimum=1, maximum=100) * 1024 * 1024
 app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
-app.config['SESSION_COOKIE_SECURE'] = (os.getenv('TRAINERMATE_COOKIE_SECURE') or os.getenv('SESSION_COOKIE_SECURE') or '0') == '1'
+app.config['SESSION_COOKIE_SECURE'] = os.getenv('TRAINERMATE_COOKIE_SECURE', '0') == '1'
+
+@app.route('/favicon.ico')
+def favicon():
+    return send_file(FAVICON_PATH, mimetype='image/x-icon')
 
 ALLOWED_DOCUMENT_EXTENSIONS = {'.pdf', '.jpg', '.jpeg', '.png', '.doc', '.docx', '.xls', '.xlsx', '.odt', '.tif', '.tiff'}
 ALLOWED_DOCUMENT_MIME_TYPES = {
@@ -239,147 +251,6 @@ def validate_csrf():
 
 def csrf_hidden_field():
     return f"<input type='hidden' name='_csrf_token' value='{csrf_token()}'>"
-
-
-def reviewer_demo_enabled():
-    return REVIEWER_DEMO_MODE
-
-
-def reviewer_demo_public_path():
-    return request.path in {'/login', '/health', '/healthz'} or request.path.startswith('/static/')
-
-
-def reviewer_demo_logged_in():
-    return bool(session.get('reviewer_demo_ok'))
-
-
-def ensure_reviewer_demo_seed():
-    """Seed the hosted TrainerMate environment with TrainerMate course data.
-
-    This intentionally does not use or require any real provider/FOBS credentials.
-    The normal dashboard UI then displays these rows as if they had been imported
-    from a provider system.
-    """
-    global REVIEWER_DEMO_SEEDED
-    if REVIEWER_DEMO_SEEDED or not reviewer_demo_enabled():
-        return
-    REVIEWER_DEMO_SEEDED = True
-    try:
-        # Keep paid gates out of the reviewer's way so they can see the whole UI.
-        save_json(ACCESS_CACHE_PATH, {
-            'checked_at': utc_now_text(),
-            'access': {
-                'allowed': True,
-                'paid': True,
-                'plan': 'paid',
-                'features': {
-                    'sync_window_days': 84,
-                    'automatic_sync': True,
-                    'calendar_sync': True,
-                    'certificate_manage': True,
-                },
-            },
-        })
-    except Exception:
-        pass
-    try:
-        demo_provider = make_provider_defaults('Essex', 'https://essex.trainermate.local/Account/Login', True)
-        demo_provider.update({
-            'id': 'essex',
-            'name': 'Essex',
-            'login_url': 'https://essex.trainermate.local/Account/Login',
-            'courses_url': 'https://essex.trainermate.local/Courses',
-            'documents_url': 'https://essex.trainermate.local/Documents',
-            'active': True,
-            'color': '#2563eb',
-            'zoom_account_id': get_default_zoom_account_id(),
-            'provider_manages_zoom': False,
-            'never_overwrite_existing_zoom': False,
-            'read_only': False,
-            'supports_custom_time': True,
-        })
-        save_providers([demo_provider])
-        save_provider_credentials('essex', 'trainer@example.com', 'stored-secure-provider-password')
-    except Exception:
-        pass
-    try:
-        conn = sqlite3.connect(str(COURSES_DB_PATH))
-        ensure_courses_sync_columns(conn)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS courses (
-                id TEXT PRIMARY KEY,
-                provider TEXT,
-                title TEXT,
-                date_time TEXT,
-                meeting_id TEXT,
-                meeting_link TEXT,
-                meeting_password TEXT,
-                status TEXT,
-                active_in_portal INTEGER DEFAULT 1,
-                last_seen_at TEXT,
-                last_synced_at TEXT,
-                last_sync_status TEXT,
-                last_sync_action TEXT,
-                fobs_course_url TEXT
-            )
-        """)
-        now = datetime.now()
-        demo_courses = [
-            ('course-efaw-001', 'Emergency First Aid at Work', now + timedelta(days=12), '09:30'),
-            ('course-manual-handling-001', 'Manual Handling Refresher', now + timedelta(days=14), '10:00'),
-            ('course-safeguarding-001', 'Safeguarding Level 2', now + timedelta(days=19), '13:00'),
-            ('course-medication-001', 'Medication Awareness', now + timedelta(days=23), '09:15'),
-            ('course-fire-marshal-001', 'Fire Marshal Training', now + timedelta(days=26), '13:00'),
-            ('course-food-safety-001', 'Food Safety Level 2', now + timedelta(days=31), '09:30'),
-            ('course-moving-handling-001', 'Moving and Handling People', now + timedelta(days=36), '10:00'),
-            ('course-mental-health-001', 'Mental Health Awareness', now + timedelta(days=42), '09:00'),
-            ('course-infection-control-001', 'Infection Prevention and Control', now + timedelta(days=48), '14:00'),
-            ('course-dementia-001', 'Dementia Awareness', now + timedelta(days=55), '09:30'),
-            ('course-health-safety-001', 'Health and Safety in the Workplace', now + timedelta(days=63), '10:00'),
-            ('course-lone-working-001', 'Lone Working and Personal Safety', now + timedelta(days=76), '11:00'),
-        ]
-        for course_id, title, date_base, time_text in demo_courses:
-            hh, mm = [int(x) for x in time_text.split(':')]
-            dt = date_base.replace(hour=hh, minute=mm, second=0, microsecond=0)
-            conn.execute("""
-                INSERT INTO courses (id, provider, title, date_time, meeting_id, meeting_link, meeting_password, status,
-                                     active_in_portal, last_seen_at, last_synced_at, last_sync_status, last_sync_action, fobs_course_url)
-                VALUES (?, 'Essex', ?, ?, '', '', '', 'Scheduled', 1, ?, '', '', 'Course imported from provider schedule.', ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    provider=excluded.provider,
-                    title=excluded.title,
-                    date_time=excluded.date_time,
-                    meeting_id=CASE WHEN COALESCE(?, '1') != '0' THEN '' ELSE courses.meeting_id END,
-                    meeting_link=CASE WHEN COALESCE(?, '1') != '0' THEN '' ELSE courses.meeting_link END,
-                    meeting_password=CASE WHEN COALESCE(?, '1') != '0' THEN '' ELSE courses.meeting_password END,
-                    last_synced_at=CASE WHEN COALESCE(?, '1') != '0' THEN '' ELSE courses.last_synced_at END,
-                    last_sync_status=CASE WHEN COALESCE(?, '1') != '0' THEN '' ELSE courses.last_sync_status END,
-                    last_sync_action=CASE WHEN COALESCE(?, '1') != '0' THEN 'Course imported from provider schedule.' ELSE courses.last_sync_action END,
-                    active_in_portal=1,
-                    last_seen_at=excluded.last_seen_at,
-                    fobs_course_url=excluded.fobs_course_url
-            """, (course_id, title, dt.strftime('%Y-%m-%d %H:%M'), utc_now_text(), f'https://essex.trainermate.local/courses/{course_id}',
-                  os.getenv('TRAINERMATE_RESET_SEEDED_COURSES', '0'), os.getenv('TRAINERMATE_RESET_SEEDED_COURSES', '0'),
-                  os.getenv('TRAINERMATE_RESET_SEEDED_COURSES', '0'), os.getenv('TRAINERMATE_RESET_SEEDED_COURSES', '0'),
-                  os.getenv('TRAINERMATE_RESET_SEEDED_COURSES', '0'), os.getenv('TRAINERMATE_RESET_SEEDED_COURSES', '0')))
-        conn.commit()
-    except Exception:
-        pass
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-
-def reviewer_token_store_load():
-    data = load_json(REVIEWER_TOKEN_STORE_PATH, {})
-    return data if isinstance(data, dict) else {}
-
-
-def reviewer_token_store_save(data):
-    if isinstance(data, dict):
-        save_json(REVIEWER_TOKEN_STORE_PATH, data)
 
 def request_wants_json():
     accept = (request.headers.get('Accept') or '').lower()
@@ -427,16 +298,16 @@ body.tm-modal-open{overflow:hidden}.tm-top-flash{display:none}
 
 @app.before_request
 def security_before_request():
-    if reviewer_demo_enabled():
-        ensure_reviewer_demo_seed()
-        if not reviewer_demo_public_path() and not reviewer_demo_logged_in():
-            if request_wants_json():
-                return jsonify({'ok': False, 'error': 'Reviewer login required'}), 401
-            return redirect(url_for('trainer_login', next=request.full_path if request.query_string else request.path))
-    elif not is_local_request():
+    if not is_local_request():
         abort(403)
     if request.method in {'POST', 'PUT', 'PATCH', 'DELETE'} and not validate_csrf():
         abort(400, description='Security check failed. Please refresh the dashboard and try again.')
+    if not auth_public_path() and not dashboard_unlocked():
+        if session.get('password_must_change'):
+            return redirect(url_for('auth_change_password_page', next=request.full_path if request.query_string else request.path))
+        if request_wants_json():
+            return jsonify({'ok': False, 'error': 'TrainerMate is locked. Please unlock the dashboard.'}), 401
+        return redirect(url_for('auth_welcome', next=request.full_path if request.query_string else request.path))
 
 @app.after_request
 def security_after_request(response):
@@ -476,39 +347,17 @@ def security_after_request(response):
 
     if request.method == 'GET' and response.status_code == 200 and 'text/html' in response.headers.get('Content-Type', ''):
         try:
+            # Only load the activity popup after the dashboard is unlocked.
+            # Loading it on /welcome or /login caused repeated /api/activity 401s in the console.
             body = response.get_data(as_text=True)
-            if '</body>' in body and 'tmActivityPopupScript' not in body:
-                body = body.replace('</body>', """
-<script id="tmActivityPopupScript">
-(function(){
-  let seen = localStorage.getItem('tmActivitySeen') || '';
-  function esc(v){return String(v||'').replace(/[&<>\"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c];});}
-  function ensure(){
-    let box=document.getElementById('tmActivityBubble');
-    if(box) return box;
-    const style=document.createElement('style');
-    style.textContent='.tm-activity-bubble{position:fixed;right:22px;bottom:22px;z-index:9999;width:min(420px,calc(100vw - 32px));background:#0f172a;color:#fff;border:1px solid rgba(125,211,252,.38);border-radius:18px;box-shadow:0 18px 60px rgba(0,0,0,.42);padding:16px;display:none}.tm-activity-bubble.show{display:block}.tm-activity-bubble h3{margin:0 0 6px;font-size:17px}.tm-activity-bubble p{margin:0 0 12px;color:#dbeafe;line-height:1.4}.tm-activity-bubble .row{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap}.tm-activity-bubble a,.tm-activity-bubble button{border:0;border-radius:11px;padding:9px 12px;font-weight:900;text-decoration:none;cursor:pointer}.tm-activity-bubble a{background:#2563eb;color:#fff}.tm-activity-bubble button{background:#1e293b;color:#dbeafe}';
-    document.head.appendChild(style);
-    box=document.createElement('div'); box.id='tmActivityBubble'; box.className='tm-activity-bubble';
-    box.innerHTML='<h3></h3><p></p><div class="row"><button type="button">Close</button><a href="/activity">View details</a></div>';
-    box.querySelector('button').onclick=function(){box.classList.remove('show');};
-    document.body.appendChild(box); return box;
-  }
-  async function poll(){
-    try{
-      const res=await fetch('/api/activity?_='+Date.now(),{cache:'no-store'}); if(!res.ok) return;
-      const data=await res.json();
-      document.querySelectorAll('.message-count,.activity-count').forEach(function(b){ if(data.counts&&data.counts.unread){b.textContent=data.counts.unread;} });
-      const item=data.popup; if(!item||!item.id||item.id===seen) return;
-      seen=item.id; localStorage.setItem('tmActivitySeen', seen);
-      const box=ensure(); box.querySelector('h3').innerHTML=esc(item.title||'TrainerMate update'); box.querySelector('p').innerHTML=esc(item.summary||item.message||''); box.classList.add('show');
-      fetch('/activity/'+encodeURIComponent(item.id)+'/read',{method:'POST',headers:{'X-CSRF-Token':'""" + csrf_token() + """'}}).catch(function(){});
-    }catch(e){}
-  }
-  window.addEventListener('load',function(){poll(); setInterval(poll,7000);});
-})();
-</script>
-</body>""")
+            if dashboard_unlocked() and '</body>' in body and 'tmActivityPopupScript' not in body:
+                activity_script = (
+                    "<script id=\"tmActivityPopupScript\">"
+                    "window.TRAINERMATE_ACTIVITY_CONFIG={csrfToken:'" + csrf_token() + "'};"
+                    "</script>"
+                    "<script src=\"/static/activity_popup.js\"></script>"
+                )
+                body = body.replace('</body>', activity_script + '</body>')
                 response.set_data(body)
                 response.headers['Content-Length'] = str(len(response.get_data()))
         except Exception:
@@ -731,165 +580,6 @@ def save_automation_settings(settings):
     return current
 
 
-def load_activity_history():
-    data = load_json(ACTIVITY_HISTORY_PATH, {'items': []})
-    items = data.get('items', []) if isinstance(data, dict) else []
-    return [item for item in items if isinstance(item, dict)]
-
-
-def save_activity_history(items, keep=300):
-    clean = [item for item in (items or []) if isinstance(item, dict)]
-    save_json(ACTIVITY_HISTORY_PATH, {'items': clean[-keep:]})
-
-
-def activity_counts(items=None):
-    items = load_activity_history() if items is None else items
-    active = [item for item in items if not item.get('dismissed_at')]
-    return {
-        'total': len(active),
-        'unread': sum(1 for item in active if not item.get('read_at')),
-        'problems': sum(1 for item in active if item.get('severity') in {'warning', 'error'}),
-    }
-
-
-def add_activity_item(kind, title, summary, severity='info', details=None, items=None, source='trainermate', notify=True):
-    now = utc_now_text()
-    item = {
-        'id': f"{provider_slug(kind)}_{uuid.uuid4().hex[:12]}",
-        'type': kind,
-        'severity': severity,
-        'title': title or 'TrainerMate update',
-        'summary': summary or '',
-        'message': summary or '',
-        'created_at': now,
-        'read_at': '',
-        'dismissed_at': '',
-        'source': source,
-        'notify': bool(notify),
-        'details': details or {},
-        'items': items or [],
-    }
-    history = load_activity_history()
-    history.append(item)
-    save_activity_history(history)
-    return item
-
-
-def parse_activity_course_key(key, course_state=None):
-    text = str(key or '')
-    parts = [part.strip() for part in text.split(' | ')]
-    provider = parts[0] if len(parts) > 0 else ''
-    course_type = parts[1] if len(parts) > 1 else ''
-    date_time = parts[2] if len(parts) > 2 else ''
-    return {
-        'provider': provider,
-        'course_type': course_type,
-        'date_time': date_time,
-        'status': (course_state or {}).get('status') or '',
-        'action': (course_state or {}).get('last_action') or '',
-        'error': (course_state or {}).get('error') or '',
-    }
-
-
-def build_sync_activity_from_state(state, source='manual'):
-    state = state if isinstance(state, dict) else load_app_state()
-    summary = state.get('run_summary') if isinstance(state.get('run_summary'), dict) else {}
-    courses_state = state.get('courses') if isinstance(state.get('courses'), dict) else {}
-    created = int(summary.get('db_created') or 0)
-    updated = int(summary.get('db_updated') or 0)
-    fobs_updated = int(summary.get('fobs_updated') or 0)
-    checked = int(summary.get('courses_processed') or 0) or len(courses_state)
-    issues = summary.get('health_issues') if isinstance(summary.get('health_issues'), list) else []
-    failed = int(summary.get('fobs_failed') or 0) + int(summary.get('providers_failed') or 0)
-    severity = 'warning' if issues or failed else 'info'
-    if created or updated or fobs_updated:
-        title = 'TrainerMate found updates'
-        bits = []
-        if created:
-            bits.append(f'{created} new course' + ('' if created == 1 else 's'))
-        if updated:
-            bits.append(f'{updated} course update' + ('' if updated == 1 else 's'))
-        if fobs_updated:
-            bits.append(f'{fobs_updated} Zoom/FOBS update' + ('' if fobs_updated == 1 else 's'))
-        summary_text = '. '.join(bits) + '.'
-    elif severity == 'warning':
-        title = 'TrainerMate needs attention'
-        summary_text = str((issues or ['A provider or Zoom item needs attention.'])[0])[:220]
-    else:
-        title = 'TrainerMate scan complete'
-        summary_text = f'{checked} course' + ('' if checked == 1 else 's') + ' checked. No action needed.'
-
-    detail_items = []
-    for key, value in sorted(courses_state.items(), key=lambda item: (item[1] or {}).get('updated_at') or '', reverse=True)[:30]:
-        detail_items.append(parse_activity_course_key(key, value if isinstance(value, dict) else {}))
-    details = {
-        'source': source,
-        'courses_checked': checked,
-        'new_courses': created,
-        'course_updates': updated,
-        'zoom_or_fobs_updates': fobs_updated,
-        'needs_attention': len(issues) + failed,
-        'message': summary.get('message') or '',
-        'providers': summary.get('providers') or [],
-    }
-    return add_activity_item('automatic_sync' if source.startswith('auto') else 'sync', title, summary_text, severity, details=details, items=detail_items, source=source)
-
-
-def notification_allowed_for_activity(item):
-    settings = load_automation_settings()
-    if not settings.get('notifications_enabled', True) or not settings.get('popup_bubbles', True):
-        return False
-    if item.get('type') == 'support_message':
-        return bool(settings.get('notify_support_messages', True))
-    severity = item.get('severity') or 'info'
-    details = item.get('details') if isinstance(item.get('details'), dict) else {}
-    if severity in {'warning', 'error'}:
-        return bool(settings.get('notify_problems', True))
-    changed = bool((details.get('new_courses') or 0) or (details.get('course_updates') or 0) or (details.get('zoom_or_fobs_updates') or 0))
-    if changed:
-        return bool(settings.get('notify_course_changes', True))
-    return bool(settings.get('notify_success_no_changes', False))
-
-
-def latest_popup_activity():
-    for item in reversed(load_activity_history()):
-        if item.get('dismissed_at') or item.get('read_at'):
-            continue
-        if item.get('notify') is False:
-            continue
-        if notification_allowed_for_activity(item):
-            return item
-    return None
-
-
-def mark_activity_read(activity_id):
-    items = load_activity_history()
-    now = utc_now_text()
-    changed = False
-    for item in items:
-        if item.get('id') == activity_id and not item.get('read_at'):
-            item['read_at'] = now
-            changed = True
-    if changed:
-        save_activity_history(items)
-    return changed
-
-
-def dismiss_activity(activity_id):
-    items = load_activity_history()
-    now = utc_now_text()
-    changed = False
-    for item in items:
-        if item.get('id') == activity_id and not item.get('dismissed_at'):
-            item['dismissed_at'] = now
-            if not item.get('read_at'):
-                item['read_at'] = now
-            changed = True
-    if changed:
-        save_activity_history(items)
-    return changed
-
-
 def date_from_isoish(value):
     try:
         return datetime.fromisoformat(str(value).replace('Z', '+00:00')).date()
@@ -1031,12 +721,8 @@ def provider_catalogue_options():
 
 
 def save_zoom_oauth_config(client_id: str, client_secret: str, redirect_uri: str = ''):
-    clean_secret = (client_secret or '').strip()
-    if clean_secret:
-        try:
-            keyring.set_password(ZOOM_OAUTH_KEYRING_SERVICE, 'client_secret', clean_secret)
-        except Exception:
-            pass
+    if (client_secret or '').strip():
+        keyring.set_password(ZOOM_OAUTH_KEYRING_SERVICE, 'client_secret', (client_secret or '').strip())
     save_json(ZOOM_OAUTH_CONFIG_PATH, {
         'client_id': (client_id or '').strip(),
         'redirect_uri': ZOOM_APPROVED_RELAY_URI,
@@ -1045,14 +731,7 @@ def save_zoom_oauth_config(client_id: str, client_secret: str, redirect_uri: str
 
 
 def utc_now_text():
-    return datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
-
-
-def provider_slug(value: str) -> str:
-    cleaned = ''.join(ch.lower() if ch.isalnum() else '-' for ch in (value or '').strip())
-    while '--' in cleaned:
-        cleaned = cleaned.replace('--', '-')
-    return cleaned.strip('-') or 'provider'
+    return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 
 
 def derive_courses_url(login_url: str) -> str:
@@ -1070,13 +749,6 @@ def derive_documents_url(login_url: str) -> str:
 
 
 def get_identity():
-    # Hosted Zoom review environment: keep the trainer account setup complete
-    # so reviewers can test the Zoom flow without local/keyring persistence.
-    if reviewer_demo_enabled():
-        return {
-            'ndors': os.getenv('TRAINERMATE_REVIEW_NDORS_ID', '10294').strip() or '10294',
-            'email': os.getenv('TRAINERMATE_REVIEW_EMAIL', 'reviewer.us').strip() or 'reviewer.us',
-        }
     return {
         'ndors': keyring.get_password('trainermate', 'ndors_id') or '',
         'email': keyring.get_password('trainermate', 'email') or '',
@@ -1101,6 +773,130 @@ def get_device_id():
         device_id = str(uuid.uuid4())
         keyring.set_password('trainermate', 'device_id', device_id)
     return device_id
+
+AUTH_KEYRING_SERVICE = 'trainermate_auth'
+AUTH_ITERATIONS = 260000
+REMEMBERED_AUTH_MARKER = 'remembered'
+LOCAL_AUTH_RATE_LIMITS = {}
+LOCAL_AUTH_RATE_LIMIT_LOCK = threading.Lock()
+LOCAL_AUTH_RATE_LIMIT_WINDOW_SECONDS = env_int('TRAINERMATE_LOCAL_AUTH_RATE_LIMIT_WINDOW_SECONDS', 900, minimum=60, maximum=3600)
+LOCAL_AUTH_RATE_LIMIT_MAX_ATTEMPTS = env_int('TRAINERMATE_LOCAL_AUTH_RATE_LIMIT_MAX_ATTEMPTS', 8, minimum=3, maximum=50)
+LOCAL_AUTH_RESET_RATE_LIMIT_MAX_ATTEMPTS = env_int('TRAINERMATE_LOCAL_AUTH_RESET_RATE_LIMIT_MAX_ATTEMPTS', 5, minimum=3, maximum=30)
+
+
+def local_auth_rate_key(scope, identity=''):
+    clean_identity = re.sub(r'[^a-z0-9_.@-]', '', (identity or '').strip().lower())[:80]
+    return f'{scope}:{request.remote_addr or "local"}:{clean_identity}'
+
+
+def check_local_auth_rate_limit(scope, identity='', max_attempts=LOCAL_AUTH_RATE_LIMIT_MAX_ATTEMPTS):
+    key = local_auth_rate_key(scope, identity)
+    now = time.time()
+    with LOCAL_AUTH_RATE_LIMIT_LOCK:
+        attempts = [item for item in LOCAL_AUTH_RATE_LIMITS.get(key, []) if now - item < LOCAL_AUTH_RATE_LIMIT_WINDOW_SECONDS]
+        if len(attempts) >= max(1, int(max_attempts or 1)):
+            retry_after = max(1, int(LOCAL_AUTH_RATE_LIMIT_WINDOW_SECONDS - (now - attempts[0])))
+            minutes = retry_after // 60 + 1
+            return False, f'Too many attempts. Please wait {minutes} minute(s) before trying again.'
+        attempts.append(now)
+        LOCAL_AUTH_RATE_LIMITS[key] = attempts
+    return True, ''
+
+
+def clear_local_auth_rate_limit(scope, identity=''):
+    with LOCAL_AUTH_RATE_LIMIT_LOCK:
+        LOCAL_AUTH_RATE_LIMITS.pop(local_auth_rate_key(scope, identity), None)
+
+def password_record_exists():
+    return bool(keyring.get_password(AUTH_KEYRING_SERVICE, 'password_hash'))
+
+
+def hash_local_password(password, salt_hex=None):
+    salt_hex = salt_hex or secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac(
+        'sha256',
+        (password or '').encode('utf-8'),
+        bytes.fromhex(salt_hex),
+        AUTH_ITERATIONS,
+    ).hex()
+    return f'pbkdf2_sha256${AUTH_ITERATIONS}${salt_hex}${digest}'
+
+
+def verify_local_password(password):
+    record = keyring.get_password(AUTH_KEYRING_SERVICE, 'password_hash') or ''
+    try:
+        method, iterations_text, salt_hex, expected = record.split('$', 3)
+        if method != 'pbkdf2_sha256':
+            return False
+        digest = hashlib.pbkdf2_hmac(
+            'sha256',
+            (password or '').encode('utf-8'),
+            bytes.fromhex(salt_hex),
+            int(iterations_text),
+        ).hex()
+        return hmac.compare_digest(digest, expected)
+    except Exception:
+        return False
+
+
+def set_local_password(password):
+    keyring.set_password(AUTH_KEYRING_SERVICE, 'password_hash', hash_local_password(password))
+
+
+def dashboard_unlocked():
+    if os.getenv('TRAINERMATE_DISABLE_LOCAL_LOGIN', '0') == '1':
+        return True
+    if session.get('password_must_change'):
+        return False
+    if session.get('trainer_auth_ok'):
+        return True
+    if (
+        password_record_exists()
+        and (get_identity().get('ndors') or '').strip()
+        and local_remember_me_enabled()
+        and keyring.get_password(AUTH_KEYRING_SERVICE, 'remembered_login') == REMEMBERED_AUTH_MARKER
+    ):
+        return True
+    return False
+
+
+def remember_dashboard_login(ndors):
+    session['trainer_auth_ok'] = True
+    session['trainer_auth_ndors'] = (ndors or '').strip()
+
+
+def require_password_change(ndors):
+    session['trainer_auth_ok'] = False
+    session['password_must_change'] = True
+    session['password_change_ndors'] = (ndors or '').strip()
+
+
+def clear_password_change_required():
+    session.pop('password_must_change', None)
+    session.pop('password_change_ndors', None)
+
+
+def local_remember_me_enabled():
+    return (keyring.get_password(AUTH_KEYRING_SERVICE, 'remember_me') or '0') == '1'
+
+
+def set_local_remember_me(enabled):
+    keyring.set_password(AUTH_KEYRING_SERVICE, 'remember_me', '1' if enabled else '0')
+    if enabled:
+        keyring.set_password(AUTH_KEYRING_SERVICE, 'remembered_login', REMEMBERED_AUTH_MARKER)
+    else:
+        try:
+            keyring.delete_password(AUTH_KEYRING_SERVICE, 'remembered_login')
+        except Exception:
+            pass
+
+
+def auth_public_path():
+    endpoint = request.endpoint or ''
+    path = request.path or ''
+    if endpoint in {'static', 'favicon', 'auth_welcome', 'auth_register_page', 'auth_login_page', 'auth_register', 'auth_login', 'auth_forgot_password', 'auth_confirm_password_reset_page', 'auth_confirm_password_reset', 'auth_change_password_page', 'auth_change_password', 'health_check', 'app_status', 'api_activity'}:
+        return True
+    return bool(path.startswith('/static/') or path in {'/favicon.ico', '/healthz', '/status'})
 
 
 def provider_keyring_service(provider_id: str) -> str:
@@ -1222,14 +1018,6 @@ def update_app_state(**kwargs):
     return state
 
 
-def stop_requested():
-    return bool(load_app_state().get('stop_requested'))
-
-
-def clear_stop_request():
-    update_app_state(stop_requested=False)
-
-
 def load_zoom_accounts():
     data = load_json(ZOOM_ACCOUNTS_PATH, {'accounts': []})
     accounts = data.get('accounts', []) if isinstance(data, dict) else []
@@ -1264,22 +1052,6 @@ def get_default_zoom_account_id():
     return (accounts[0].get('id') or '').strip() if accounts else ''
 
 
-def has_connected_zoom_account():
-    """Return True only when a usable Zoom OAuth account exists."""
-    for account in load_zoom_accounts():
-        status = (account.get('status') or 'connected').strip().lower()
-        if status in {'disconnected', 'needs_reconnect', 'needs reconnect', 'revoked', 'error'}:
-            continue
-        account_id = (account.get('id') or '').strip()
-        if account_id and (get_zoom_oauth_token(account_id, 'access') or get_zoom_oauth_token(account_id, 'refresh')):
-            return True
-    return False
-
-
-def zoom_required_sync_message():
-    return 'Zoom is not connected yet. Open Zoom accounts and connect Zoom before syncing courses.'
-
-
 def get_zoom_account_label(account_id=''):
     accounts = load_zoom_accounts()
     selected_id = (account_id or get_default_zoom_account_id() or '').strip()
@@ -1289,6 +1061,69 @@ def get_zoom_account_label(account_id=''):
     if not selected:
         return 'Linked Zoom account not selected'
     return (selected.get('nickname') or selected.get('email') or 'Zoom account').strip()
+
+def zoom_account_is_usable(account):
+    """True when TrainerMate has a linked Zoom account it can actually use for sync.
+
+    A row in zoom_accounts.json is not enough: the refresh token may be missing or
+    Zoom may already have marked the account as needing reconnect. This check is
+    deliberately local and quick so the dashboard can stop before starting a
+    confusing bot run.
+    """
+    if not isinstance(account, dict):
+        return False
+    status = (account.get('status') or 'connected').strip().lower()
+    if status not in {'connected', 'ok', 'active'}:
+        return False
+    account_id = (account.get('id') or '').strip()
+    if not account_id:
+        return False
+    return bool(get_zoom_oauth_token(account_id, 'refresh'))
+
+
+def has_usable_zoom_account(account_id=''):
+    accounts = load_zoom_accounts()
+    requested = (account_id or '').strip()
+    if requested:
+        account = next((a for a in accounts if (a.get('id') or '').strip() == requested), None)
+        return zoom_account_is_usable(account)
+    return any(zoom_account_is_usable(account) for account in accounts)
+
+
+def provider_needs_trainer_zoom(provider_id_or_name):
+    """Return True when this provider relies on TrainerMate to create/update Zoom links."""
+    pid = provider_slug(provider_id_or_name or '')
+    for provider in load_providers():
+        if provider_slug(provider.get('id') or provider.get('name') or '') == pid:
+            return not bool(provider.get('provider_manages_zoom') or provider.get('never_overwrite_existing_zoom') or provider.get('read_only'))
+    return True
+
+
+def sync_zoom_precheck_message(scan_provider='all', target_course=None):
+    """Return a friendly blocking message if a sync would need Zoom but none is usable."""
+    providers = load_providers()
+    provider_ids = []
+    if isinstance(target_course, dict) and (target_course.get('provider') or scan_provider):
+        provider_ids = [provider_slug(target_course.get('provider') or scan_provider)]
+    else:
+        scan_provider = provider_slug(scan_provider or 'all')
+        if scan_provider and scan_provider != 'all':
+            provider_ids = [scan_provider]
+        else:
+            provider_ids = [provider_slug(p.get('id') or p.get('name') or '') for p in providers if p.get('active', True)]
+    needs_zoom = any(provider_needs_trainer_zoom(pid) for pid in provider_ids if pid)
+    if not needs_zoom:
+        return ''
+    if has_usable_zoom_account():
+        return ''
+    course_text = ''
+    if isinstance(target_course, dict) and target_course.get('title'):
+        course_text = f" for {target_course.get('title')}"
+    return (
+        f"TrainerMate has not started the check{course_text} because Zoom is not connected. "
+        "This course/provider needs TrainerMate to create or check meeting links, so reconnect Zoom first, then run the check again."
+    )
+
 
 def save_zoom_accounts(accounts):
     cleaned = []
@@ -1322,21 +1157,10 @@ def save_zoom_accounts(accounts):
 def set_zoom_tokens(account_id: str, access_token: str, refresh_token: str):
     keyring.set_password('trainermate_zoom_oauth', f'access::{account_id}', access_token)
     keyring.set_password('trainermate_zoom_oauth', f'refresh::{account_id}', refresh_token)
-    if reviewer_demo_enabled():
-        store = reviewer_token_store_load()
-        store.setdefault(account_id, {})
-        store[account_id]['access'] = access_token
-        store[account_id]['refresh'] = refresh_token
-        reviewer_token_store_save(store)
 
 
 def get_zoom_oauth_token(account_id: str, token_kind: str):
-    value = keyring.get_password('trainermate_zoom_oauth', f'{token_kind}::{account_id}') or ''
-    if value:
-        return value
-    if reviewer_demo_enabled():
-        return ((reviewer_token_store_load().get(account_id) or {}).get(token_kind) or '')
-    return ''
+    return keyring.get_password('trainermate_zoom_oauth', f'{token_kind}::{account_id}') or ''
 
 
 def clear_zoom_tokens(account_id: str):
@@ -1345,10 +1169,6 @@ def clear_zoom_tokens(account_id: str):
             keyring.delete_password('trainermate_zoom_oauth', f'{prefix}::{account_id}')
         except Exception:
             pass
-    if reviewer_demo_enabled():
-        store = reviewer_token_store_load()
-        store.pop(account_id, None)
-        reviewer_token_store_save(store)
 
 
 def upsert_zoom_account(email: str, nickname: str, access_token: str, refresh_token: str):
@@ -1693,7 +1513,8 @@ def sync_provider_login_failures_from_state():
         provider['last_login_test_status'] = 'failed'
         provider['last_login_test_message'] = (
             f'TrainerMate can no longer log in to {provider_name}. '
-            'If the FOBS password has changed, reconfirm it here before syncing again.'
+            'Automatic checks are paused for this provider to avoid repeated failed logins or account lockout. '
+            'Reconfirm the FOBS username/password, then use Test login to resume.'
         )
         provider['last_login_test_at'] = utc_now_text()
         provider['paused_for_login'] = True
@@ -1702,6 +1523,35 @@ def sync_provider_login_failures_from_state():
     if changed:
         save_providers(providers)
 
+
+
+def pause_provider_after_failed_auto_login(provider_id, provider_name='', reason=''):
+    """Pause a provider after an automatic login failure so TrainerMate does not keep retrying and risk lockout."""
+    provider_id = provider_slug(provider_id or provider_name or '')
+    if not provider_id:
+        return False
+    providers = load_providers()
+    changed = False
+    for provider in providers:
+        if provider_slug(provider.get('id') or provider.get('name') or '') != provider_id:
+            continue
+        name = provider.get('name') or provider_name or provider_id
+        detail = (reason or '').strip()
+        provider['last_login_test_status'] = 'failed'
+        provider['last_login_test_message'] = (
+            f'TrainerMate could not log in to {name}. Automatic checks are paused for this provider to avoid repeated failed logins or account lockout. '
+            'Open Manage providers, reconfirm the FOBS username/password, then use Test login to resume.'
+        )
+        if detail:
+            provider['last_login_test_message'] += f' Last issue: {shorten_message(detail, 160)}'
+        provider['last_login_test_at'] = utc_now_text()
+        provider['paused_for_login'] = True
+        provider['active'] = False
+        changed = True
+        break
+    if changed:
+        save_providers(providers)
+    return changed
 
 def setup_provider_rows(existing_providers=None):
     existing = {provider.get('id'): provider for provider in (existing_providers or load_providers())}
@@ -1806,7 +1656,101 @@ def load_cached_access():
     return data if isinstance(data, dict) else {}
 
 
+
+def normalize_access_payload(access):
+    """Return a consistent access payload so the dashboard and admin agree on paid/free."""
+    if not isinstance(access, dict):
+        return {}
+    out = dict(access)
+    features = out.get('features') if isinstance(out.get('features'), dict) else {}
+    features = dict(features)
+    plan_text = str(out.get('plan') or out.get('tier') or out.get('subscription_plan') or out.get('account_plan') or '').strip().lower()
+    status_text = str(out.get('status') or out.get('subscription_status') or out.get('licence_status') or '').strip().lower()
+    paid_flag = out.get('paid') is True or out.get('is_paid') is True or out.get('paid_account') is True
+    paid_flag = paid_flag or plan_text in {'paid', 'pro', 'premium', 'admin', 'licenced', 'licensed'}
+    paid_flag = paid_flag or status_text in {'paid', 'licenced', 'licensed'}
+    try:
+        paid_flag = paid_flag or int(features.get('sync_window_days') or 0) > FREE_SYNC_WINDOW_DAYS
+    except Exception:
+        pass
+    if paid_flag:
+        out['allowed'] = True if out.get('allowed') is not False else out.get('allowed')
+        out['paid'] = True
+        out['is_paid'] = True
+        out['plan'] = 'paid'
+        paid_defaults = {
+            'manual_sync': True,
+            'provider_setup': True,
+            'zoom_connection': True,
+            'zoom_creation': True,
+            'certificate_view': True,
+            'certificate_manage': True,
+            'calendar': True,
+            'calendar_sync': True,
+            'automatic_sync': True,
+            'scheduled_sync': True,
+            'automation': True,
+            'admin_triggered_sync': True,
+            'sync_window_days': PAID_SYNC_WINDOW_DAYS,
+        }
+        for key, value in paid_defaults.items():
+            if key not in features or features.get(key) in (None, '', False, 0):
+                features[key] = value
+        out['features'] = features
+    elif not out.get('plan'):
+        out['plan'] = 'free'
+    return out
+
+
+def cached_access_for_identity(ndors=None):
+    """Read the newest local paid/free state for this trainer from either cache file."""
+    ndors = (ndors or get_identity().get('ndors') or '').strip()
+    candidates = []
+    cached = load_cached_access()
+    if isinstance(cached.get('access'), dict):
+        candidates.append(normalize_access_payload(cached.get('access')))
+    try:
+        legacy = load_json(BASE_DIR / 'licensing_cache.json', {})
+        if isinstance(legacy, dict):
+            entry = legacy.get(ndors) or legacy.get(str(ndors).lower()) or legacy.get(str(ndors).upper())
+            if isinstance(entry, dict):
+                response = entry.get('response') if isinstance(entry.get('response'), dict) else entry
+                if isinstance(response, dict):
+                    candidates.append(normalize_access_payload(response))
+    except Exception:
+        pass
+    # Prefer any paid local state so a bad/free API response cannot accidentally downgrade a paid admin account.
+    for item in candidates:
+        if account_is_paid(item):
+            return item
+    for item in candidates:
+        if item:
+            return item
+    return None
+
+
+def should_keep_paid_cache(new_access, cached_access):
+    """Avoid downgrading a paid admin account to Free because of a stale/partial API response."""
+    if not isinstance(cached_access, dict) or not isinstance(new_access, dict):
+        return False
+    if not account_is_paid(cached_access) or account_is_paid(new_access):
+        return False
+    reason = str(new_access.get('reason') or new_access.get('detail') or '').strip().lower()
+    plan = str(new_access.get('plan') or new_access.get('tier') or '').strip().lower()
+    # A clean backend response is authoritative. This lets admin deliberately
+    # move an account between Paid and Free without the desktop preserving an
+    # older paid cache forever.
+    if reason in {'ok', 'account_inactive', 'free_sync_limit_reached', 'update_required'}:
+        return False
+    if new_access.get('licensing_cache_used') is False and reason not in {'licensing_temporarily_unavailable', 'cached_access', 'account_not_available_temporarily'}:
+        return False
+    # If admin deliberately blocks/revokes access, respect that. Otherwise, keep the local paid state.
+    if new_access.get('allowed') is False and any(word in reason for word in ('blocked', 'revoked', 'suspended', 'expired', 'cancelled', 'canceled')):
+        return False
+    return plan in {'', 'free', 'trial', 'starter'} or not account_is_paid(new_access)
+
 def save_cached_access(access):
+    access = normalize_access_payload(access)
     if isinstance(access, dict) and access:
         save_json(ACCESS_CACHE_PATH, {'checked_at': utc_now_text(), 'access': access})
 
@@ -1819,59 +1763,43 @@ def get_cached_access_if_fresh(max_age_seconds=ACCESS_CACHE_MAX_AGE_SECONDS):
         return None
     try:
         checked = datetime.strptime(checked_at, '%Y-%m-%dT%H:%M:%SZ')
-        age = (datetime.utcnow() - checked).total_seconds()
+        
+        now = datetime.now(timezone.utc)
+        if getattr(checked, 'tzinfo', None) is None:
+            now = now.replace(tzinfo=None)
+        age = (now - checked).total_seconds()
         if age <= max_age_seconds:
-            return access
+            return normalize_access_payload(access)
     except Exception:
         return None
     return None
 
 
-def review_paid_access():
-    return {
-        'allowed': True,
-        'paid': True,
-        'is_paid': True,
-        'plan': 'paid',
-        'tier': 'paid',
-        'features': {
-            'sync_window_days': PAID_SYNC_WINDOW_DAYS,
-            'automatic_sync': True,
-            'scheduled_sync': True,
-            'calendar_sync': True,
-            'calendar': True,
-            'certificate_manage': True,
-            'certificate_management': True,
-        },
-    }
-
-
 def check_access(timeout_seconds=ACTION_ACCESS_TIMEOUT_SECONDS, prefer_cached=False):
-    if reviewer_demo_enabled():
-        access = review_paid_access()
-        try:
-            save_cached_access(access)
-        except Exception:
-            pass
-        return access
     identity = get_identity()
-    if not identity['ndors'].strip():
+    ndors = identity['ndors'].strip()
+    if not ndors:
         return None
+    local_cached = cached_access_for_identity(ndors)
     if prefer_cached:
         fresh = get_cached_access_if_fresh()
-        if fresh:
+        # Paid/admin cache is safe to trust only briefly. Free cache is
+        # deliberately not trusted because admin may have just upgraded the
+        # trainer, and old paid cache must not mask a deliberate downgrade.
+        if fresh and account_is_paid(fresh):
             return fresh
-    payload = {'ndors_trainer_id': identity['ndors'].strip(), 'email': identity['email'].strip() or None, 'device_id': get_device_id(), 'device_name': 'desktop', 'app_version': APP_VERSION}
+    payload = {'ndors_trainer_id': ndors, 'email': identity['email'].strip() or None, 'device_id': get_device_id(), 'device_name': 'desktop', 'app_version': APP_VERSION}
     try:
         r = requests.post(f'{API_URL}/check-access', json=payload, timeout=timeout_seconds)
         r.raise_for_status()
-        data = r.json()
+        data = normalize_access_payload(r.json())
+        if should_keep_paid_cache(data, local_cached):
+            save_cached_access(local_cached)
+            return local_cached
         save_cached_access(data)
         return data
     except Exception:
-        cached = load_cached_access().get('access')
-        return cached if isinstance(cached, dict) else None
-
+        return local_cached if isinstance(local_cached, dict) else None
 
 def force_refresh_licence_from_admin(reason='admin_update'):
     """Bypass cached access after an admin licence change and record a gentle activity item."""
@@ -1879,6 +1807,9 @@ def force_refresh_licence_from_admin(reason='admin_update'):
     before = cached.get('access') if isinstance(cached, dict) and isinstance(cached.get('access'), dict) else {}
     before_plan = (before.get('plan') if isinstance(before, dict) else '') or ''
     access = check_access(timeout_seconds=ACTION_ACCESS_TIMEOUT_SECONDS, prefer_cached=False) or {}
+    cached_paid = cached_access_for_identity(get_identity().get('ndors'))
+    if should_keep_paid_cache(access or {}, cached_paid):
+        access = cached_paid
     save_cached_access(access)
     after_plan = (access.get('plan') or 'free') if isinstance(access, dict) else 'free'
     features = access.get('features') if isinstance(access, dict) and isinstance(access.get('features'), dict) else {}
@@ -2015,7 +1946,7 @@ def set_certificate_scan_status(provider_id, status, message, detail=''):
             'status': status,
             'message': message,
             'detail': detail,
-            'updated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'updated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f'),
         }
 
 
@@ -2033,18 +1964,15 @@ def get_certificate_scan_status(provider_id='all'):
 def certificate_scan_snapshot():
     with CERTIFICATE_SCAN_STATUS_LOCK:
         items = {pid: dict(state) for pid, state in CERTIFICATE_SCAN_STATUS.items()}
-    running = any((state.get('status') or '').lower() == 'running' for state in items.values())
     latest_all = items.get('all') if isinstance(items.get('all'), dict) else {}
-    if (latest_all.get('status') or '').lower() in {'complete', 'idle', 'error'}:
-        all_updated = latest_all.get('updated_at') or ''
-        # Once the aggregate job has finished, ignore older per-provider
-        # running states that were only progress messages from that job.
-        running = any(
-            (state.get('status') or '').lower() == 'running'
-            and (state.get('updated_at') or '') > all_updated
-            for pid, state in items.items()
-            if pid != 'all'
-        )
+    aggregate_status = (latest_all.get('status') or '').lower()
+    # The aggregate all-provider certificate scan is the source of truth for the
+    # certificate page. Older per-provider progress rows can otherwise leave the
+    # page stuck on "checking" even after the all-provider pass has completed.
+    if aggregate_status in {'complete', 'idle', 'error', 'cancelled', 'skipped'}:
+        running = False
+    else:
+        running = any((state.get('status') or '').lower() == 'running' for state in items.values())
     latest = None
     for pid, state in items.items():
         candidate = dict(state)
@@ -2058,6 +1986,22 @@ def certificate_scan_snapshot():
         'detail': 'Refresh FOBS certificates to check provider certificates.',
         'updated_at': '',
     }
+    # A completed aggregate certificate job can leave an older per-provider
+    # progress row marked as running when the status updates happen in the
+    # same second. Prefer the aggregate completed state in that case so the UI
+    # clears per-row spinners instead of leaving a certificate stuck on
+    # "Removing..." after FOBS has already removed it.
+    if not running and (latest.get('status') or '').lower() == 'running':
+        aggregate_status = (latest_all.get('status') or '').lower()
+        if aggregate_status in {'complete', 'idle', 'error', 'cancelled'}:
+            latest = dict(latest_all)
+            latest['provider_id'] = 'all'
+    if not running and (latest_all.get('status') or '').lower() in {'complete', 'idle', 'error', 'cancelled'}:
+        latest = dict(latest_all)
+        latest['provider_id'] = 'all'
+    elif running and (latest_all.get('status') or '').lower() == 'running':
+        latest = dict(latest_all)
+        latest['provider_id'] = 'all'
     rows = []
     for pid, state in sorted(items.items(), key=lambda item: item[1].get('updated_at') or '', reverse=True)[:8]:
         rows.append({
@@ -2148,6 +2092,8 @@ def detect_certificate_type(text):
         ('teaching', 'Teaching and learning certificate'),
         ('learning', 'Teaching and learning certificate'),
         ('right to work', 'Right to work'),
+        ('information assurance', 'Information assurance'),
+        ('cyber security', 'Cyber security'),
     )
     for needle, label in checks:
         if needle in lower:
@@ -2160,14 +2106,14 @@ CERTIFICATE_ADAPTERS = {
     'fobs_fastform': {
         'label': 'FOBS / FastForm',
         'row_parser': 'fobs_certificates_section',
-        'download_strategy': ('download_document_id', 'row_click', 'direct_url'),
+        'download_strategy': ('download_document_id', 'direct_url'),
         'supports_upload': True,
         'supports_delete': True,
     },
     'generic_html': {
         'label': 'Generic provider portal',
         'row_parser': 'fobs_certificates_section',
-        'download_strategy': ('direct_url', 'row_click'),
+        'download_strategy': ('direct_url',),
         'supports_upload': False,
         'supports_delete': False,
     },
@@ -2214,6 +2160,24 @@ def provider_certificate_reference(provider, joined_text, download_document_id='
         return f'{provider_id}-document-{doc_id}'
     ref_seed = joined_text or str(uuid.uuid4())
     return hashlib.sha256(ref_seed.encode('utf-8', errors='ignore')).hexdigest()[:24]
+
+
+def provider_certificate_document_id_from_ref(provider_ref):
+    """Extract the exact FOBS DownloadDocument id from a provider_reference.
+
+    When this returns a value, that id is the only safe cache key for the
+    certificate file. We must never satisfy it with a fuzzy title/expiry match.
+    """
+    text = str(provider_ref or '').strip()
+    match = re.search(r'(?:^|-)document-(\d+)$', text)
+    return match.group(1) if match else ''
+
+
+def provider_certificate_has_exact_document_id(cert):
+    cert = cert if isinstance(cert, dict) else {}
+    if re.sub(r'\D+', '', str(cert.get('download_document_id') or '')):
+        return True
+    return bool(provider_certificate_document_id_from_ref(cert.get('provider_reference') or ''))
 
 
 def certificate_rows_from_fobs_page(page):
@@ -2376,28 +2340,337 @@ def load_provider_certificates():
         """).fetchall()]
     finally:
         conn.close()
-    grouped = {}
+    hash_names = {}
     for row in rows:
+        file_hash = (row.get('file_hash') or '').strip()
+        if not file_hash:
+            continue
+        hash_names.setdefault((row.get('provider_id') or '', file_hash), set()).add(
+            normalize_certificate_match_text(row.get('certificate_name') or '')
+        )
+    grouped = {}
+    seen_visible = {}
+    for row in rows:
+        provider_id = row.get('provider_id') or 'provider'
+        visible_key = (
+            provider_id,
+            normalize_certificate_match_text(row.get('certificate_name') or ''),
+            normalize_certificate_match_text(row.get('expiry_date') or ''),
+        )
+        previous = seen_visible.get(visible_key)
+        if previous:
+            previous_seen = str(previous.get('last_seen_at') or previous.get('updated_at') or '')
+            row_seen = str(row.get('last_seen_at') or row.get('updated_at') or '')
+            if row_seen <= previous_seen:
+                continue
+            try:
+                grouped.get(provider_id, []).remove(previous)
+            except ValueError:
+                pass
+        seen_visible[visible_key] = row
         row['cached_file_available'] = provider_cached_file_available(row)
-        grouped.setdefault(row.get('provider_id') or 'provider', []).append(row)
+        grouped.setdefault(provider_id, []).append(row)
     return grouped
 
 
 def provider_cached_file_available(cert):
-    cached = ((cert or {}).get('cached_filename') or '').strip()
-    if not cached:
-        return False
-    if ((cert or {}).get('download_status') or '') != PROVIDER_CACHE_VERSION:
+    return provider_certificate_cached_file_is_servable(cert) and provider_certificate_cached_content_matches_row(cert)
+
+
+
+def provider_certificate_cached_file_is_servable(cert):
+    """True when the cached provider file exists and can be opened safely.
+
+    Older builds saved some cache rows with a legacy cached_* status. Treat the
+    actual local file as the source of truth, but still reject known title/hash
+    mismatches.
+    """
+    if not cert or not (cert.get('cached_filename') or '').strip():
         return False
     try:
-        path = safe_provider_cache_path(cached)
+        path = safe_provider_cache_path(cert.get('cached_filename'))
+        return path.exists() and path.is_file()
     except Exception:
         return False
-    try:
-        return path.exists() and path.is_file()
-    except OSError:
-        return False
 
+
+def find_best_provider_certificate_cache(cert):
+    """Find a usable saved file for a provider certificate even if the row id/ref changed.
+
+    FOBS can change row ids/download ids between refreshes, especially after a
+    re-upload or provider-side edit. The dashboard should not strand the user on
+    an old row id when an equivalent current certificate with a saved file exists.
+    """
+    cert = cert if isinstance(cert, dict) else {}
+    provider_id = (cert.get('provider_id') or '').strip()
+    if not provider_id:
+        return None
+    name_key = normalize_certificate_match_text(cert.get('certificate_name') or '')
+    expiry_key = normalize_certificate_match_text(cert.get('expiry_date') or '')
+    ref = (cert.get('provider_reference') or '').strip()
+    candidates = []
+    conn = documents_conn()
+    try:
+        if ref:
+            candidates.extend([dict(r) for r in conn.execute("""
+                SELECT * FROM provider_certificates
+                WHERE provider_id = ? AND provider_reference = ?
+                ORDER BY CASE WHEN COALESCE(status, 'seen') = 'seen' THEN 0 ELSE 1 END,
+                         COALESCE(downloaded_at, '') DESC, COALESCE(last_seen_at, '') DESC, COALESCE(updated_at, '') DESC
+            """, (provider_id, ref)).fetchall()])
+        rows = [dict(r) for r in conn.execute("""
+            SELECT * FROM provider_certificates
+            WHERE provider_id = ?
+            ORDER BY CASE WHEN COALESCE(status, 'seen') = 'seen' THEN 0 ELSE 1 END,
+                     COALESCE(downloaded_at, '') DESC, COALESCE(last_seen_at, '') DESC, COALESCE(updated_at, '') DESC
+        """, (provider_id,)).fetchall()]
+    finally:
+        conn.close()
+    for row in rows:
+        row_name = normalize_certificate_match_text(row.get('certificate_name') or '')
+        row_expiry = normalize_certificate_match_text(row.get('expiry_date') or '')
+        if name_key and row_name == name_key and (not expiry_key or row_expiry == expiry_key):
+            candidates.append(row)
+    seen = set()
+    for candidate in candidates:
+        cid = candidate.get('id') or candidate.get('provider_reference') or ''
+        if cid in seen:
+            continue
+        seen.add(cid)
+        if provider_certificate_cached_file_is_servable(candidate) and provider_certificate_cached_content_matches_row(candidate):
+            return candidate
+    return None
+
+def provider_certificate_cache_hash_conflict(cert):
+    """Return True when the same cached file is attached to clearly different certificates.
+
+    This protects against stale cache rows such as a First Aid row opening a
+    Prevent certificate. Identical hashes are allowed only when the visible
+    certificate names are not clearly different categories.
+    """
+    cert = cert if isinstance(cert, dict) else {}
+    provider_id = (cert.get('provider_id') or '').strip()
+    file_hash = (cert.get('file_hash') or '').strip()
+    cert_id = str(cert.get('id') or '').strip()
+    if not provider_id or not file_hash:
+        return False
+    expected_categories = provider_certificate_content_category(cert.get('certificate_name') or '')
+    if not expected_categories:
+        return False
+    conn = documents_conn()
+    try:
+        rows = [dict(r) for r in conn.execute("""
+            SELECT id, certificate_name, provider_reference, status
+            FROM provider_certificates
+            WHERE provider_id = ? AND file_hash = ? AND COALESCE(status, 'seen') = 'seen'
+        """, (provider_id, file_hash)).fetchall()]
+    finally:
+        conn.close()
+    for row in rows:
+        if cert_id and str(row.get('id') or '') == cert_id:
+            continue
+        other_categories = provider_certificate_content_category(row.get('certificate_name') or '')
+        if other_categories and expected_categories.isdisjoint(other_categories):
+            return True
+    return False
+
+
+
+def provider_certificate_cache_key(provider_id, document_id):
+    provider_id = provider_slug(provider_id or 'provider')
+    document_id = re.sub(r'\D+', '', str(document_id or ''))
+    return f'{provider_id}:{document_id}' if document_id else ''
+
+
+def load_provider_certificate_manifest():
+    data = load_json(PROVIDER_CERTIFICATE_MANIFEST_PATH, {'items': {}})
+    items = data.get('items') if isinstance(data, dict) else {}
+    return items if isinstance(items, dict) else {}
+
+
+def save_provider_certificate_manifest(items):
+    clean = {}
+    for key, value in (items or {}).items():
+        if isinstance(value, dict):
+            clean[str(key)] = value
+    save_json(PROVIDER_CERTIFICATE_MANIFEST_PATH, {'items': clean, 'updated_at': utc_now_text()})
+
+
+def provider_certificate_referenced_cache_filenames():
+    keep = set()
+    for item in load_provider_certificate_manifest().values():
+        if isinstance(item, dict) and item.get('cached_filename'):
+            keep.add(safe_document_filename(item.get('cached_filename')))
+    try:
+        conn = documents_conn()
+        rows = conn.execute("""
+            SELECT cached_filename FROM provider_certificates
+            WHERE COALESCE(cached_filename, '') <> '' AND COALESCE(status, 'seen') = 'seen'
+        """).fetchall()
+        keep.update(safe_document_filename(dict(row).get('cached_filename') or '') for row in rows)
+    except Exception:
+        pass
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return {name for name in keep if name}
+
+
+def cleanup_provider_certificate_cache():
+    """Keep the FOBS certificate cache bounded without touching user uploads."""
+    try:
+        root = (DOCUMENTS_DIR / 'provider_cache').resolve()
+        if not root.exists():
+            return
+        keep = provider_certificate_referenced_cache_filenames()
+        files = [p for p in root.iterdir() if p.is_file()]
+        now = time.time()
+        max_bytes = int(PROVIDER_CERT_CACHE_MAX_MB) * 1024 * 1024
+        # First remove orphaned temporary/old cache files after a grace period.
+        for path in files:
+            if path.name.startswith('tmp-'):
+                try:
+                    path.unlink()
+                except Exception:
+                    pass
+                continue
+            if path.name not in keep:
+                age_days = (now - path.stat().st_mtime) / 86400
+                if age_days >= 1:
+                    try:
+                        path.unlink()
+                    except Exception:
+                        pass
+        files = [p for p in root.iterdir() if p.is_file() and p.name not in keep]
+        total = sum(p.stat().st_size for p in root.iterdir() if p.is_file())
+        if total <= max_bytes:
+            return
+        # If still over cap, delete oldest unreferenced files first.
+        for path in sorted(files, key=lambda item: item.stat().st_mtime):
+            if total <= max_bytes:
+                break
+            try:
+                size = path.stat().st_size
+                path.unlink()
+                total -= size
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def remember_provider_document_cache(provider, provider_ref, cache_info):
+    """Persist a stable provider/document-id -> local file mapping.
+
+    This is the permanent cache index. Certificate titles/expiry dates are only
+    display fields; they must not be used to decide which file a FOBS row opens.
+    """
+    document_id = provider_certificate_document_id_from_ref(provider_ref)
+    if not document_id:
+        return
+    provider_id = provider_slug((provider or {}).get('id') or (provider or {}).get('name') or 'provider')
+    key = provider_certificate_cache_key(provider_id, document_id)
+    if not key:
+        return
+    filename = (cache_info or {}).get('cached_filename') or ''
+    if not filename:
+        return
+    try:
+        path = safe_provider_cache_path(filename)
+        if not path.exists() or not path.is_file() or path.stat().st_size <= 0:
+            return
+    except Exception:
+        return
+    items = load_provider_certificate_manifest()
+    items[key] = {
+        'provider_id': provider_id,
+        'document_id': document_id,
+        'provider_reference': provider_ref,
+        'cached_filename': filename,
+        'file_hash': (cache_info or {}).get('file_hash') or '',
+        'file_size': int((cache_info or {}).get('file_size') or 0),
+        'content_type': (cache_info or {}).get('content_type') or '',
+        'downloaded_at': (cache_info or {}).get('downloaded_at') or utc_now_text(),
+        'download_status': (cache_info or {}).get('download_status') or PROVIDER_CACHE_VERSION,
+        'encryption': (cache_info or {}).get('encryption') or '',
+        'updated_at': utc_now_text(),
+    }
+    save_provider_certificate_manifest(items)
+    cleanup_provider_certificate_cache()
+
+
+def exact_provider_document_cache(provider_id, document_id, cert=None):
+    """Return a reusable cached provider file for this exact FOBS document id.
+
+    The cache is accepted only for the same provider + exact DownloadDocument id.
+    If a strong title/content contradiction is detected, the cache is rejected so
+    the scanner can re-download the document.
+    """
+    provider_id = provider_slug(provider_id or 'provider')
+    document_id = re.sub(r'\D+', '', str(document_id or ''))
+    if not provider_id or not document_id:
+        return {}
+    provider_ref = f'{provider_id}-document-{document_id}'
+    candidates = []
+    manifest = load_provider_certificate_manifest()
+    item = manifest.get(provider_certificate_cache_key(provider_id, document_id)) or {}
+    if isinstance(item, dict) and item.get('cached_filename'):
+        candidates.append(dict(item, provider_reference=provider_ref, download_url=f'DownloadDocument({document_id})'))
+    conn = documents_conn()
+    try:
+        rows = [dict(r) for r in conn.execute("""
+            SELECT provider_reference, download_url, cached_filename, file_hash, file_size,
+                   content_type, downloaded_at, download_status, encryption
+            FROM provider_certificates
+            WHERE provider_id = ? AND provider_reference = ? AND COALESCE(cached_filename, '') <> ''
+            ORDER BY COALESCE(downloaded_at, '') DESC, COALESCE(updated_at, '') DESC
+        """, (provider_id, provider_ref)).fetchall()]
+        candidates.extend(rows)
+    finally:
+        conn.close()
+    seen = set()
+    expected = dict(cert or {})
+    expected['provider_id'] = provider_id
+    expected['provider_reference'] = provider_ref
+    expected['download_document_id'] = document_id
+    expected['download_url'] = f'DownloadDocument({document_id})'
+    for candidate in candidates:
+        filename = (candidate.get('cached_filename') or '').strip()
+        if not filename or filename in seen:
+            continue
+        seen.add(filename)
+        try:
+            path = safe_provider_cache_path(filename)
+            if not path.exists() or not path.is_file() or path.stat().st_size <= 0:
+                continue
+        except Exception:
+            continue
+        merged = dict(expected)
+        merged.update(candidate)
+        merged['provider_id'] = provider_id
+        merged['provider_reference'] = provider_ref
+        merged['download_document_id'] = document_id
+        merged['download_url'] = candidate.get('download_url') or f'DownloadDocument({document_id})'
+
+        # Important: once FOBS gives us an exact DownloadDocument id, that id is
+        # the source-of-truth file key. Do not run fuzzy title/content checks here:
+        # scanned PDFs and provider-generated files can fail text extraction, which
+        # made TrainerMate redownload the same exact document on every scan. The
+        # wrong-certificate problem is prevented by provider_id + exact document_id,
+        # not by guessing from titles.
+        return {
+            'download_url': merged.get('download_url') or f'DownloadDocument({document_id})',
+            'cached_filename': filename,
+            'file_hash': merged.get('file_hash') or '',
+            'file_size': merged.get('file_size') or path.stat().st_size,
+            'content_type': merged.get('content_type') or '',
+            'downloaded_at': merged.get('downloaded_at') or '',
+            'download_status': merged.get('download_status') or PROVIDER_CACHE_VERSION,
+            'encryption': merged.get('encryption') or '',
+        }
+    return {}
 
 def existing_provider_certificate_cache(provider_id):
     conn = documents_conn()
@@ -2738,15 +3011,152 @@ def unprotect_provider_cache_bytes(content):
         ctypes.windll.kernel32.LocalFree(out_blob.pbData)
 
 
-def cache_provider_certificate_bytes(provider, provider_ref, content, content_type='', download_url='', suggested_filename='', cache_status='cached'):
+def provider_certificate_pdf_text(content):
+    try:
+        from io import BytesIO
+        from pypdf import PdfReader
+        reader = PdfReader(BytesIO(bytes(content or b'')))
+        parts = []
+        for page in reader.pages[:3]:
+            try:
+                parts.append(page.extract_text() or '')
+            except Exception:
+                pass
+        return ' '.join(parts)
+    except Exception:
+        return ''
+
+
+def provider_certificate_title_tokens(title):
+    aliases = {
+        'safeguarding': {'safeguard', 'safeguarding'},
+        'safeguard': {'safeguard', 'safeguarding'},
+        'gdpr': {'gdpr', 'data', 'protection'},
+        'information': {'information', 'assurance'},
+        'assurance': {'information', 'assurance'},
+        'cyber': {'cyber', 'security'},
+        'security': {'cyber', 'security'},
+        'dbs': {'dbs', 'disclosure', 'barring'},
+        'aet': {'aet', 'teaching', 'education', 'training'},
+        'teaching': {'aet', 'teaching', 'education', 'training'},
+        'diversity': {'diversity', 'inclusion'},
+        'inclusion': {'diversity', 'inclusion'},
+        'slavery': {'slavery', 'modern'},
+        'indemnity': {'indemnity', 'insurance', 'liability'},
+        'liability': {'indemnity', 'insurance', 'liability'},
+        'insurance': {'indemnity', 'insurance', 'liability'},
+    }
+    words = re.findall(r'[a-z0-9]{3,}', (title or '').lower())
+    ignored = {'cert', 'certificate', 'qualification', 'membership', 'course', 'year'}
+    tokens = set()
+    for word in words:
+        if word in ignored or word.isdigit():
+            continue
+        tokens.update(aliases.get(word, {word}))
+    return {token for token in tokens if len(token) >= 3}
+
+
+def provider_certificate_content_category(value):
+    text = normalize_certificate_match_text(value or '')
+    compact = text.replace(' ', '')
+    checks = [
+        ('first_aid', ('firstaid', 'first aid')),
+        ('prevent', ('prevent',)),
+        ('safeguarding', ('safeguard', 'safeguarding')),
+        ('dbs', ('dbs', 'disclosure', 'barring')),
+        ('gdpr', ('gdpr', 'data protection', 'dataprotection')),
+        ('information_assurance', ('information assurance', 'informationassurance', 'assurance')),
+        ('cyber_security', ('cyber security', 'cybersecurity', 'information security', 'infosec')),
+        ('diversity', ('diversity', 'inclusion')),
+        ('modern_slavery', ('modern slavery', 'modernslavery', 'slavery')),
+        ('conflict_awareness', ('conflict',)),
+        ('insurance', ('insurance', 'indemnity', 'liability')),
+        ('aet', ('aet', 'teaching qualification', 'teaching', 'education training')),
+    ]
+    found = set()
+    for key, needles in checks:
+        for needle in needles:
+            n = normalize_certificate_match_text(needle)
+            if n and (n in text or n.replace(' ', '') in compact):
+                found.add(key)
+                break
+    return found
+
+
+def provider_certificate_content_matches_title(content, content_type='', filename='', expected_title=''):
+    """Best-effort guard against saving the wrong FOBS row file.
+
+    FOBS remains the source of truth, but the app must not attach a Prevent PDF
+    to a First Aid row (or similar). We only reject when there is a strong,
+    obvious category contradiction. If text cannot be extracted, we allow the
+    download so scanned PDFs do not get stuck.
+    """
+    expected_categories = provider_certificate_content_category(expected_title)
+    if not expected_categories:
+        return True, ''
+
+    filename_categories = provider_certificate_content_category(filename)
+    if filename_categories and expected_categories.isdisjoint(filename_categories):
+        return False, 'downloaded_file_title_mismatch'
+
+    content_text = ''
+    guessed = (content_type or mimetypes.guess_type(filename or '')[0] or '').lower()
+    if 'pdf' in guessed or (filename or '').lower().endswith('.pdf'):
+        content_text = provider_certificate_pdf_text(content)
+    else:
+        try:
+            content_text = bytes(content or b'')[:12000].decode('utf-8', errors='ignore')
+        except Exception:
+            content_text = ''
+
+    if not content_text.strip():
+        return True, ''
+
+    content_categories = provider_certificate_content_category(content_text)
+    if content_categories and expected_categories.isdisjoint(content_categories):
+        return False, 'downloaded_file_title_mismatch'
+    return True, ''
+
+
+def provider_certificate_cached_content_matches_row(cert):
+    try:
+        if not provider_certificate_cached_file_is_servable(cert):
+            return False
+        content = provider_cached_certificate_bytes(cert)
+        if not content:
+            return False
+        ok, _status = provider_certificate_content_matches_title(
+            content,
+            cert.get('content_type') or '',
+            cert.get('cached_filename') or cert.get('download_url') or '',
+            cert.get('certificate_name') or '',
+        )
+        return bool(ok)
+    except Exception:
+        return False
+
+
+def cache_provider_certificate_bytes(provider, provider_ref, content, content_type='', download_url='', suggested_filename='', cache_status='cached', expected_title=''):
     content = bytes(content or b'')
     if not content:
         return {'download_url': download_url, 'download_status': 'empty'}
+    title_ok, title_status = provider_certificate_content_matches_title(content, content_type, suggested_filename or download_url, expected_title)
+    if not title_ok:
+        return {'download_url': download_url, 'download_status': title_status}
     file_hash = hashlib.sha256(content).hexdigest()
     fallback = suggested_filename or download_url
     guessed_type = (content_type or mimetypes.guess_type(fallback or '')[0] or '').strip()
     ext = extension_from_content_type(guessed_type, fallback)
-    filename_base = f"{provider_slug(provider.get('id') or provider.get('name') or 'provider')}-{provider_ref}-{file_hash[:12]}{ext}"
+    provider_id = provider_slug(provider.get('id') or provider.get('name') or 'provider')
+    document_id = provider_certificate_document_id_from_ref(provider_ref)
+    # One file per exact provider document. This prevents runaway duplicate
+    # downloads such as title-hash-title-hash copies while keeping FOBS as the
+    # source of truth. If no exact document id exists, fall back to the older
+    # hash-based name so we never guess across providers.
+    if document_id:
+        filename_base = f"{provider_id}-document-{document_id}{ext}"
+    else:
+        filename_base = f"{provider_id}-{safe_document_filename(provider_ref)}-{file_hash[:12]}{ext}"
     if os.name == 'nt':
         stored_filename = f"{filename_base}.dpapi"
         target = safe_provider_cache_path(stored_filename)
@@ -2772,7 +3182,7 @@ def cache_provider_certificate_bytes(provider, provider_ref, content, content_ty
             cache_status = 'cached_unencrypted_dev_by_download_document_id'
     if cache_status == 'cached_by_download_document_id':
         cache_status = PROVIDER_CACHE_VERSION
-    return {
+    result = {
         'download_url': download_url,
         'cached_filename': stored_filename,
         'file_hash': file_hash,
@@ -2782,6 +3192,8 @@ def cache_provider_certificate_bytes(provider, provider_ref, content, content_ty
         'download_status': cache_status,
         'encryption': encryption,
     }
+    remember_provider_document_cache(provider, provider_ref, result)
+    return result
 
 
 
@@ -2850,7 +3262,8 @@ def cache_provider_certificate_file_by_download_document_id(page, provider, prov
         return cache_provider_certificate_bytes(
             provider, provider_ref, content, content_type=content_type,
             download_url=f'DownloadDocument({document_id})', suggested_filename=suggested,
-            cache_status='cached_by_download_document_id'
+            cache_status='cached_by_download_document_id',
+            expected_title=cert_name,
         )
     except Exception as exc:
         return {'download_url': f'DownloadDocument({document_id})', 'download_status': f'download_document_failed: {str(exc)[:140]}'}
@@ -2917,7 +3330,8 @@ def cache_provider_certificate_file_by_row_click(page, provider, provider_ref, c
         return cache_provider_certificate_bytes(
             provider, provider_ref, content, content_type=content_type,
             download_url=(cert.get('download_url') or ''), suggested_filename=suggested,
-            cache_status='cached_by_row_click'
+            cache_status='cached_by_row_click',
+            expected_title=cert_name,
         )
     except Exception as exc:
         return {'download_url': (cert.get('download_url') or ''), 'download_status': f'row_click_download_failed: {str(exc)[:140]}'}
@@ -2967,6 +3381,10 @@ def cache_provider_certificate_file(page, provider, provider_ref, cert):
 
     The existing FOBS portals use DownloadDocument(id). Future providers can use
     the same core flow with a different adapter/download strategy.
+
+    Safety rule: never guess by clicking a fuzzy row/title. If a provider does
+    not expose an exact document id or direct URL, the file is marked as needing
+    refresh instead of risking the wrong certificate being shown.
     """
     adapter = provider_certificate_adapter(provider)
     download_url = (cert.get('download_url') or '').strip()
@@ -2988,11 +3406,46 @@ def cache_provider_certificate_file(page, provider, provider_ref, cert):
         if result.get('cached_filename'):
             result.setdefault('certificate_adapter', adapter.get('id'))
             return result
-        if result.get('download_status') not in {'no_link', 'click_link_not_found'}:
+        status = result.get('download_status') or ''
+        if status not in {'no_link', 'click_link_not_found'}:
             last_result = result
+        # If the exact-id download produced an obvious wrong file, do not fall
+        # back to fuzzy row clicking. Only direct URL providers get another
+        # exact strategy. Wrong/mismatched files must not be surfaced.
+        if status in {'downloaded_file_title_mismatch', 'download_document_failed'} or status.startswith('download_document_failed'):
+            continue
 
     return last_result
 
+
+
+def cache_provider_certificate_from_local_document(provider, provider_ref, cert, doc):
+    """Use the TrainerMate local certificate file when FOBS confirms the same certificate exists
+    but the portal does not expose a reliable downloadable file link. This stops
+    the FOBS list showing a fake pending/save-later state after an app-load scan
+    has already run.
+    """
+    try:
+        stored = (doc or {}).get('stored_filename') or ''
+        if not stored:
+            return {}
+        path = safe_document_path(stored)
+        if not path.exists() or not path.is_file():
+            return {}
+        content = path.read_bytes()
+        content_type = mimetypes.guess_type((doc or {}).get('original_filename') or stored)[0] or ''
+        return cache_provider_certificate_bytes(
+            provider,
+            provider_ref,
+            content,
+            content_type=content_type,
+            download_url=(cert or {}).get('download_url') or '',
+            suggested_filename=(doc or {}).get('original_filename') or stored,
+            cache_status='matched_local_document',
+            expected_title=(cert or {}).get('certificate_name') or (doc or {}).get('title') or '',
+        )
+    except Exception as exc:
+        return {'download_status': f'local_match_copy_failed: {str(exc)[:120]}'}
 
 def cache_provider_certificate_file_from_direct_url(page, provider, provider_ref, download_url):
     try:
@@ -3089,6 +3542,17 @@ def save_provider_certificate_scan(provider, certificates, source_url):
                 now,
                 now,
             )
+            invalid_cached_file = bool(
+                existing
+                and not (cert.get('cached_filename') or '').strip()
+                and (cert.get('download_status') or '').strip()
+                and (
+                    (cert.get('download_status') or '').startswith('downloaded_file_title_mismatch')
+                    or (cert.get('download_status') or '').startswith('download_document_failed')
+                    or (cert.get('download_status') or '').startswith('row_click_download_failed')
+                    or (cert.get('download_status') or '').startswith('failed')
+                )
+            )
             if existing:
                 conn.execute("""
                     UPDATE provider_certificates
@@ -3113,6 +3577,18 @@ def save_provider_certificate_scan(provider, certificates, source_url):
                         updated_at = ?
                     WHERE id = ?
                 """, values + (existing['id'],))
+                if invalid_cached_file:
+                    conn.execute("""
+                        UPDATE provider_certificates
+                        SET cached_filename = '',
+                            file_hash = '',
+                            file_size = 0,
+                            content_type = '',
+                            downloaded_at = '',
+                            encryption = '',
+                            download_status = ?
+                        WHERE id = ?
+                    """, (cert.get('download_status') or 'downloaded_file_title_mismatch', existing['id']))
             else:
                 conn.execute("""
                     INSERT INTO provider_certificates (
@@ -3155,7 +3631,11 @@ def update_document_provider_presence(provider, certificates):
     conn = documents_conn()
     try:
         docs = [dict(row) for row in conn.execute("""
-            SELECT d.*, l.id AS link_id
+            SELECT d.*,
+                   l.id AS link_id,
+                   l.pending_action AS link_pending_action,
+                   l.provider_status AS link_provider_status,
+                   l.notes AS link_notes
             FROM trainer_documents d
             JOIN document_provider_links l ON l.document_id = d.id
             WHERE d.status = 'active'
@@ -3178,7 +3658,11 @@ def update_document_provider_presence(provider, certificates):
                     WHERE id = ?
                 """, (match.get('certificate_name') or '', now, now, doc['link_id']))
             else:
-                pending_action = (doc.get('pending_action') or '').strip()
+                pending_action = (doc.get('link_pending_action') or '').strip()
+                provider_status = (doc.get('link_provider_status') or '').strip()
+                link_notes = (doc.get('link_notes') or '').strip()
+                if certificate_link_is_quiet_after_user_removal({'pending_action': pending_action, 'provider_status': provider_status, 'notes': link_notes}):
+                    continue
                 if pending_action == 'upload':
                     conn.execute("""
                         UPDATE document_provider_links
@@ -3253,8 +3737,11 @@ def provider_upload_pending_links():
 def mark_provider_delete_link(link_id, status, message=''):
     now = utc_now_text()
     if status == 'removed':
+        # A user-requested FOBS removal has succeeded or the file was already
+        # gone. Keep the local link quiet so it does not create a new reminder.
         provider_status = 'missing'
-        pending_action = ''
+        pending_action = 'dismissed_missing'
+        message = ''
     else:
         provider_status = 'needs_review'
         pending_action = 'delete_provider_copy'
@@ -4182,7 +4669,12 @@ def delete_certificate_from_provider(provider, link_doc):
             documents_url,
         )
         if not removed:
-            raise RuntimeError(f'TrainerMate could not confirm the certificate has gone from {provider_name}. Please refresh FOBS and try again.')
+            # FOBS sometimes completes the delete but the portal list does not refresh quickly enough
+            # for TrainerMate to confirm it in the same browser pass. The delete click already
+            # succeeded, so do not leave the trainer with a scary error or a stuck removing state.
+            mark_provider_delete_link(link_doc['link_id'], 'removed', f'Removal sent to {provider_name}.')
+            set_certificate_scan_status(provider_id, 'complete', f'{provider_name} certificate removal sent', 'TrainerMate has asked FOBS to remove the certificate and is refreshing the list.')
+            return True, f'Removal sent to {provider_name}.'
         mark_provider_delete_link(link_doc['link_id'], 'removed', f'Removed from {provider_name}.')
         return True, f'Removed from {provider_name}.'
     finally:
@@ -4223,6 +4715,156 @@ def remove_provider_certificate_cache_row(certificate_id):
         conn.close()
 
 
+def remove_matching_provider_certificate_cache_rows(provider, provider_cert):
+    """Clear cached FOBS rows for a certificate once FOBS confirms removal.
+
+    Deleting by id alone is not enough if a refresh or optimistic upload row
+    has produced another local cache row for the same provider certificate.
+    This only touches the same provider and the same provider reference or
+    normalized certificate name, so unrelated provider certificates remain
+    untouched.
+    """
+    provider_id = provider_slug((provider or {}).get('id') or (provider_cert or {}).get('provider_id') or '')
+    cert_id = str((provider_cert or {}).get('id') or '').strip()
+    expected_ref = ((provider_cert or {}).get('provider_reference') or '').strip()
+    expected_name = normalize_certificate_match_text((provider_cert or {}).get('certificate_name') or '')
+    if not provider_id and not cert_id:
+        return 0
+    conn = documents_conn()
+    removed = 0
+    try:
+        if cert_id:
+            cur = conn.execute('DELETE FROM provider_certificates WHERE id = ?', (cert_id,))
+            removed += cur.rowcount or 0
+        rows = [dict(row) for row in conn.execute('''
+            SELECT id, provider_reference, certificate_name
+            FROM provider_certificates
+            WHERE provider_id = ?
+        ''', (provider_id,)).fetchall()]
+        for row in rows:
+            row_ref = (row.get('provider_reference') or '').strip()
+            row_name = normalize_certificate_match_text(row.get('certificate_name') or '')
+            if (expected_ref and row_ref == expected_ref) or (expected_name and row_name == expected_name):
+                cur = conn.execute('DELETE FROM provider_certificates WHERE id = ?', (row.get('id') or '',))
+                removed += cur.rowcount or 0
+        conn.commit()
+    finally:
+        conn.close()
+    return removed
+
+
+def find_matching_provider_certificates_for_delete(provider_cert):
+    """Find provider certificate rows with the same visible certificate name.
+
+    Used before removing a FOBS-only certificate so the user can decide whether
+    same-named copies held by other providers should be removed too.
+    """
+    if not provider_cert:
+        return []
+    current_id = str(provider_cert.get('id') or '').strip()
+    current_provider = provider_slug(provider_cert.get('provider_id') or '')
+    current_name = normalize_certificate_match_text(provider_cert.get('certificate_name') or '')
+    if not current_name:
+        return []
+    matches_by_visible_copy = {}
+    conn = documents_conn()
+    try:
+        rows = conn.execute("""
+            SELECT *
+            FROM provider_certificates
+            WHERE COALESCE(certificate_name, '') <> ''
+              AND COALESCE(status, 'seen') = 'seen'
+              AND COALESCE(download_status, '') <> 'uploaded_by_trainermate'
+              AND COALESCE(provider_reference, '') NOT LIKE '%trainermate-upload%'
+            ORDER BY provider_name ASC, certificate_name ASC
+        """).fetchall()
+        for row in rows:
+            item = dict(row)
+            item_id = str(item.get('id') or '').strip()
+            if item_id == current_id:
+                continue
+            item_provider = provider_slug(item.get('provider_id') or '')
+            # The prompt is intended for matching copies on other providers.
+            if current_provider and item_provider == current_provider:
+                continue
+            item_name = normalize_certificate_match_text(item.get('certificate_name') or '')
+            if item_name and item_name == current_name:
+                expiry_key = normalize_certificate_match_text(item.get('expiry_date') or '')
+                visible_key = (item_provider, item_name, expiry_key)
+                previous = matches_by_visible_copy.get(visible_key)
+                if not previous:
+                    matches_by_visible_copy[visible_key] = item
+                    continue
+                previous_seen = str(previous.get('last_seen_at') or previous.get('updated_at') or '')
+                item_seen = str(item.get('last_seen_at') or item.get('updated_at') or '')
+                if item_seen > previous_seen:
+                    matches_by_visible_copy[visible_key] = item
+    finally:
+        conn.close()
+    return sorted(
+        matches_by_visible_copy.values(),
+        key=lambda item: (
+            (item.get('provider_name') or item.get('provider_id') or '').lower(),
+            (item.get('certificate_name') or '').lower(),
+            item.get('expiry_date') or '',
+        ),
+    )
+
+
+def provider_certificate_delete_confirmation_page(provider_cert, matches):
+    provider_name = provider_cert.get('provider_name') or provider_cert.get('provider_id') or 'this provider'
+    cert_name = provider_cert.get('certificate_name') or 'this certificate'
+    cert_expiry = provider_cert.get('expiry_date') or 'No expiry date shown'
+    return render_template_string("""
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Remove matching certificates?</title>
+  <style>
+    body{font-family:Inter,Segoe UI,Arial,sans-serif;margin:0;background:#e8f2fb;color:#0f172a;padding:28px}
+    .card{max-width:720px;background:#fff;border:1px solid #bfdbfe;border-radius:20px;padding:24px;box-shadow:0 20px 70px rgba(15,23,42,.12)}
+    h1{margin:0 0 12px;font-size:26px}.muted{color:#475569;line-height:1.5}.list{margin:18px 0;padding:14px;border-radius:14px;background:#f8fafc;border:1px solid #e2e8f0}.item{padding:10px 0;border-bottom:1px solid #e2e8f0}.item:last-child{border-bottom:0}.meta{display:flex;gap:12px;flex-wrap:wrap;margin-top:4px;color:#475569}.expiry{font-weight:900;color:#9a3412}.selected{background:#eff6ff;border:1px solid #bfdbfe;border-radius:14px;padding:14px;margin:16px 0}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:20px}.btn{border:0;border-radius:12px;padding:11px 15px;font-weight:900;cursor:pointer;text-decoration:none;display:inline-flex}.primary{background:#2563eb;color:#fff}.danger{background:#fff7ed;color:#9a3412;border:1px solid #fdba74}.soft{background:#e2e8f0;color:#0f172a}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Remove matching certificates?</h1>
+    <p class="muted"><strong>{{ cert_name }}</strong> is being removed from <strong>{{ provider_name }}</strong>. TrainerMate also found same-named certificates currently listed in FOBS for other providers.</p>
+    <div class="selected">
+      <strong>Selected certificate</strong><br>
+      {{ cert_name }}
+      <div class="meta"><span>{{ provider_name }}</span><span class="expiry">Expires: {{ cert_expiry }}</span></div>
+    </div>
+    <div class="list">
+      {% for item in matches %}
+        <div class="item">
+          <strong>{{ item.certificate_name }}</strong>
+          <div class="meta"><span>{{ item.provider_name or item.provider_id }}</span><span class="expiry">Expires: {{ item.expiry_date or 'No expiry date shown' }}</span></div>
+        </div>
+      {% endfor %}
+    </div>
+    <div class="actions">
+      <form method="post" action="{{ url_for('delete_provider_certificate_route', certificate_id=provider_cert.id) }}">
+        {{ csrf_hidden_field()|safe }}
+        <input type="hidden" name="selected_only" value="1">
+        <button class="btn primary" type="submit">Remove selected only</button>
+      </form>
+      <form method="post" action="{{ url_for('delete_provider_certificate_route', certificate_id=provider_cert.id) }}">
+        {{ csrf_hidden_field()|safe }}
+        <input type="hidden" name="delete_matching" value="1">
+        {% for item in matches %}<input type="hidden" name="matching_certificate_ids" value="{{ item.id }}">{% endfor %}
+        <button class="btn danger" type="submit">Remove all matching provider copies</button>
+      </form>
+      <a class="btn soft" href="{{ url_for('home', section='files') }}">Cancel</a>
+    </div>
+  </div>
+</body>
+</html>
+    """, provider_cert=provider_cert, matches=matches, provider_name=provider_name, cert_name=cert_name, cert_expiry=cert_expiry, csrf_hidden_field=csrf_hidden_field)
+
+
 def mark_matching_local_links_missing_after_provider_delete(provider, provider_cert):
     provider_id = provider_slug((provider or {}).get('id') or (provider or {}).get('name') or '')
     provider_name = (provider or {}).get('name') or provider_id
@@ -4243,14 +4885,11 @@ def mark_matching_local_links_missing_after_provider_delete(provider, provider_c
                 UPDATE document_provider_links
                 SET provider_status = 'missing',
                     provider_checked_at = ?,
-                    pending_action = CASE
-                        WHEN pending_action = '' THEN 'review_missing'
-                        ELSE pending_action
-                    END,
-                    notes = ?,
+                    pending_action = 'dismissed_missing',
+                    notes = '',
                     updated_at = ?
                 WHERE id = ?
-            """, (now, f'This certificate was removed from {provider_name}.', now, doc['link_id']))
+            """, (now, now, doc['link_id']))
         conn.commit()
     finally:
         conn.close()
@@ -4309,7 +4948,7 @@ def delete_provider_certificate_from_provider(provider, provider_cert, cancel_ke
             raise RuntimeError('Removal cancelled before FOBS was changed.')
         matches = live_certificate_matches_provider_cert(certificate_rows_from_provider_page(page, provider), provider, provider_cert)
         if not matches:
-            remove_provider_certificate_cache_row(provider_cert.get('id'))
+            remove_matching_provider_certificate_cache_rows(provider, provider_cert)
             mark_matching_local_links_missing_after_provider_delete(provider, provider_cert)
             set_certificate_scan_status(provider_id, 'complete', f'{provider_name} certificate removed', f'{provider_cert.get("certificate_name") or "Certificate"} is no longer in FOBS.')
             return True, f'{provider_name} no longer shows this certificate.'
@@ -4329,8 +4968,14 @@ def delete_provider_certificate_from_provider(provider, provider_cert, cancel_ke
             documents_url,
         )
         if not removed:
-            raise RuntimeError(f'TrainerMate could not confirm the certificate has gone from {provider_name}. Please refresh FOBS and try again.')
-        remove_provider_certificate_cache_row(provider_cert.get('id'))
+            # FOBS can remove the row successfully while its page/table remains stale for a moment.
+            # Treat a successful delete click as accepted, clear TrainerMate's local copy, and let
+            # the next certificate refresh mirror FOBS again instead of showing a false error.
+            remove_matching_provider_certificate_cache_rows(provider, provider_cert)
+            mark_matching_local_links_missing_after_provider_delete(provider, provider_cert)
+            set_certificate_scan_status(provider_id, 'complete', f'{provider_name} certificate removal sent', 'TrainerMate has asked FOBS to remove the certificate and is refreshing the list.')
+            return True, f'Removal sent to {provider_name}.'
+        remove_matching_provider_certificate_cache_rows(provider, provider_cert)
         mark_matching_local_links_missing_after_provider_delete(provider, provider_cert)
         set_certificate_scan_status(provider_id, 'complete', f'{provider_name} certificate removed', f'{provider_cert.get("certificate_name") or "Certificate"} removed from FOBS.')
         return True, f'Removed from {provider_name}.'
@@ -4351,34 +4996,67 @@ def delete_provider_certificate_from_provider(provider, provider_cert, cancel_ke
             pass
 
 
-def start_provider_certificate_delete_async(certificate_id):
+def start_provider_certificate_delete_many_async(certificate_ids):
     if certificate_job_running():
         return False, 'TrainerMate is already checking certificates. This will only take a moment.'
-    cert = provider_certificate_row(certificate_id)
-    if not cert:
+    clean_ids = []
+    seen = set()
+    for value in certificate_ids or []:
+        value = str(value or '').strip()
+        if value and value not in seen:
+            clean_ids.append(value)
+            seen.add(value)
+    if not clean_ids:
         return False, 'Certificate not found in the provider list.'
-    providers = {p['id']: p for p in load_providers()}
-    provider = providers.get(provider_slug(cert.get('provider_id') or ''))
-    if not provider:
-        return False, 'Provider is no longer configured.'
+
+    certs = []
+    for cert_id in clean_ids:
+        cert = provider_certificate_row(cert_id)
+        if cert:
+            certs.append(cert)
+    if not certs:
+        return False, 'Certificate not found in the provider list.'
+
+    providers = {provider_slug(p.get('id') or p.get('name') or ''): p for p in load_providers()}
+    for cert in certs:
+        provider = providers.get(provider_slug(cert.get('provider_id') or ''))
+        if not provider:
+            return False, f'{cert.get("provider_name") or "A provider"} is no longer configured.'
 
     def runner():
-        provider_id = provider_slug(provider.get('id') or provider.get('name') or '')
-        try:
-            delete_provider_certificate_from_provider(provider, cert, certificate_id)
-        except Exception as exc:
-            message = str(exc)
-            if message.startswith('Removal cancelled'):
-                set_certificate_scan_status(provider_id, 'cancelled', 'Removal cancelled', 'FOBS was not changed if deletion had not already started.')
-            else:
-                set_certificate_scan_status(provider_id, 'error', f'Could not confirm removal from {provider.get("name") or provider_id}', message)
-        finally:
-            clear_provider_delete_cancel(certificate_id)
+        total = 0
+        errors = 0
+        set_certificate_scan_status('all', 'running', 'Removing certificate' if len(certs) == 1 else 'Removing certificates', 'TrainerMate is asking FOBS to remove the selected certificate' + ('' if len(certs) == 1 else 's') + '.')
+        for cert in certs:
+            cert_id = str(cert.get('id') or '')
+            provider = providers.get(provider_slug(cert.get('provider_id') or ''))
+            provider_id = provider_slug(provider.get('id') or provider.get('name') or '')
+            try:
+                delete_provider_certificate_from_provider(provider, cert, cert_id)
+                total += 1
+            except Exception as exc:
+                errors += 1
+                message = str(exc)
+                if message.startswith('Removal cancelled'):
+                    set_certificate_scan_status(provider_id, 'cancelled', 'Removal cancelled', 'FOBS was not changed if deletion had not already started.')
+                else:
+                    set_certificate_scan_status(provider_id, 'error', f'Could not confirm removal from {provider.get("name") or provider_id}', message)
+            finally:
+                clear_provider_delete_cancel(cert_id)
+        if errors:
+            set_certificate_scan_status('all', 'error', 'Certificate removal needs checking', f'{total} removed. {errors} item' + ('' if errors == 1 else 's') + ' could not be confirmed.')
+        else:
+            set_certificate_scan_status('all', 'complete', 'Certificate removal complete', f'{total} certificate' + ('' if total == 1 else 's') + ' removed from FOBS.')
 
-    clear_provider_delete_cancel(certificate_id)
-    set_certificate_scan_status(cert.get('provider_id') or provider.get('id'), 'running', f'Removing from {cert.get("provider_name") or provider.get("name")}', 'TrainerMate is asking FOBS to remove the certificate.')
+    first = certs[0]
+    clear_provider_delete_cancel(str(first.get('id') or ''))
+    set_certificate_scan_status(first.get('provider_id') or 'all', 'running', f'Removing from {first.get("provider_name") or first.get("provider_id")}', 'TrainerMate is asking FOBS to remove the certificate.')
     threading.Thread(target=runner, daemon=True).start()
-    return True, 'Removing certificate from provider.'
+    return True, 'Removing certificate from FOBS.' if len(certs) == 1 else f'Removing {len(certs)} certificates from FOBS.'
+
+
+def start_provider_certificate_delete_async(certificate_id):
+    return start_provider_certificate_delete_many_async([certificate_id])
 
 
 def start_provider_delete_async():
@@ -4388,12 +5066,12 @@ def start_provider_delete_async():
     if not pending:
         set_certificate_scan_status('all', 'idle', 'No provider removals pending.', '')
         return False
-    providers = {p['id']: p for p in load_providers()}
+    providers = {provider_slug(p.get('id') or p.get('name') or ''): p for p in load_providers()}
 
     def runner():
         total = 0
         errors = 0
-        set_certificate_scan_status('all', 'running', 'Removing selected provider copies', 'TrainerMate is asking FOBS to remove the selected certificates.')
+        set_certificate_scan_status('all', 'running', 'Removing selected certificates', 'TrainerMate is asking FOBS to remove the selected certificates.')
         for link_doc in pending:
             provider = providers.get(provider_slug(link_doc.get('provider_id') or ''))
             if not provider:
@@ -4409,9 +5087,9 @@ def start_provider_delete_async():
                 mark_provider_delete_link(link_doc.get('link_id'), 'review', str(exc))
                 set_certificate_scan_status(provider.get('id') or provider.get('name'), 'error', f'Could not remove from {provider.get("name")}', str(exc))
         if errors:
-            set_certificate_scan_status('all', 'error', 'Provider removal paused for checking', f'{total} removed. {errors} need a quick look.')
+            set_certificate_scan_status('all', 'error', 'Certificate removal needs checking', f'{total} removed. {errors} item' + ('' if errors == 1 else 's') + ' could not be confirmed.')
         else:
-            set_certificate_scan_status('all', 'complete', 'Provider removals complete', f'{total} provider copy/copies removed.')
+            set_certificate_scan_status('all', 'complete', 'Certificate removal complete', f'{total} certificate' + ('' if total == 1 else 's') + ' removed.')
 
     set_certificate_scan_status('all', 'running', 'Starting provider removal', 'Please wait, certificate update in progress.')
     threading.Thread(target=runner, daemon=True).start()
@@ -4425,12 +5103,14 @@ def start_provider_upload_async():
     if not pending:
         set_certificate_scan_status('all', 'idle', 'No provider uploads pending.', '')
         return False
-    providers = {p['id']: p for p in load_providers()}
+    providers = {provider_slug(p.get('id') or p.get('name') or ''): p for p in load_providers()}
 
     def runner():
         global PROVIDER_UPLOAD_QUEUE_ACTIVE
         total = 0
         errors = 0
+        confirm_total = 0
+        confirmed_provider_ids = set()
         try:
             set_certificate_scan_status('all', 'running', 'Sending certificates to providers', 'TrainerMate is adding the certificates to FOBS.')
             for link_doc in pending:
@@ -4443,6 +5123,7 @@ def start_provider_upload_async():
                     ok, _ = upload_certificate_to_provider(provider, link_doc)
                     if ok:
                         total += 1
+                        confirmed_provider_ids.add(provider_slug(provider.get('id') or provider.get('name') or ''))
                 except Exception as exc:
                     errors += 1
                     clear_unverified_provider_upload_cache(provider, link_doc)
@@ -4453,10 +5134,24 @@ def start_provider_upload_async():
                         str(exc),
                         link_doc.get('provider_file_name') or ''
                     )
+            confirmed_providers = [providers[pid] for pid in confirmed_provider_ids if pid in providers]
+            if confirmed_providers:
+                set_certificate_scan_status('all', 'running', 'Confirming provider certificates', 'TrainerMate is doing a quick read-only check that FOBS still matches.')
+                for index, provider in enumerate(confirmed_providers, start=1):
+                    pid = provider_slug(provider.get('id') or provider.get('name') or '')
+                    provider_name = provider.get('name') or pid
+                    set_certificate_scan_status('all', 'running', f'Confirming {provider_name}', f'Provider {index} of {len(confirmed_providers)}. Checking FOBS after upload.')
+                    try:
+                        confirm_total += scan_provider_certificates(provider, batch_progress={'id': 'all', 'index': index, 'total': len(confirmed_providers)})
+                        set_certificate_scan_status('all', 'running', f'Confirmed {provider_name}', f'Provider {index} of {len(confirmed_providers)} complete. {confirm_total} certificate(s) found so far.')
+                    except Exception as exc:
+                        errors += 1
+                        set_certificate_scan_status(pid, 'error', f'Could not confirm {provider.get("name") or pid} certificates', str(exc))
+                        set_certificate_scan_status('all', 'running', f'{provider_name} needs checking', f'Provider {index} of {len(confirmed_providers)} had a problem. Continuing with the remaining providers.')
             if errors:
                 set_certificate_scan_status('all', 'error', 'Certificate send paused for checking', f'{total} sent. {errors} need a quick look.')
             else:
-                set_certificate_scan_status('all', 'complete', 'Certificates sent', f'{total} provider copy/copies sent.')
+                set_certificate_scan_status('all', 'complete', 'Certificates checked', f'{total} provider copy/copies sent. Quick scan found {confirm_total} certificate(s).')
         finally:
             with PROVIDER_UPLOAD_QUEUE_LOCK:
                 PROVIDER_UPLOAD_QUEUE_ACTIVE = False
@@ -4493,7 +5188,7 @@ def ensure_provider_upload_runs_soon():
     return 'queued'
 
 
-def scan_provider_certificates(provider):
+def scan_provider_certificates(provider, cache_files=True, batch_progress=None):
     """Read-only scan of certificates currently shown in a provider FOBS portal."""
     provider_id = provider_slug(provider.get('id') or provider.get('name') or '')
     provider_name = provider.get('name') or provider_id
@@ -4509,7 +5204,20 @@ def scan_provider_certificates(provider):
     if not username or not password:
         raise RuntimeError('No saved FOBS username/password for this provider.')
 
-    set_certificate_scan_status(provider_id, 'running', f'Checking {provider_name}', 'Reading the FOBS certificate list.')
+    batch_progress = batch_progress if isinstance(batch_progress, dict) else {}
+    batch_id = batch_progress.get('id') or ''
+    batch_index = batch_progress.get('index')
+    batch_total = batch_progress.get('total')
+
+    def progress(status, message, detail=''):
+        set_certificate_scan_status(provider_id, status, message, detail)
+        if batch_id and status == 'running':
+            prefix = ''
+            if batch_index and batch_total:
+                prefix = f'Provider {batch_index} of {batch_total}. '
+            set_certificate_scan_status(batch_id, 'running', message, prefix + (detail or ''))
+
+    progress('running', f'Checking {provider_name}', 'Reading the FOBS certificate list.')
     p = sync_playwright().start()
     browser = None
     try:
@@ -4525,36 +5233,55 @@ def scan_provider_certificates(provider):
         page.wait_for_timeout(800)
         try:
             if page.locator('#UserName').count() and page.locator('#Password').count():
-                set_certificate_scan_status(provider_id, 'running', f'Signing into {provider_name}', 'Entering saved FOBS credentials.')
+                progress('running', f'Signing into {provider_name}', 'Entering saved FOBS credentials.')
                 page.fill('#UserName', username)
                 page.fill('#Password', password)
                 page.click("button[type='submit'], input[type='submit']")
                 page.wait_for_timeout(2000)
+                if provider_login_screen_visible(page) or '/account/login' in (page.url or '').lower():
+                    message = provider_login_problem_text(page)
+                    pause_provider_after_failed_auto_login(provider_id, provider_name, message)
+                    raise RuntimeError(f'Login failed for {provider_name}. Automatic checks have been paused to avoid account lockout. Open Manage providers, reconfirm the login, then use Test login.')
+        except RuntimeError:
+            raise
         except Exception:
             pass
 
-        set_certificate_scan_status(provider_id, 'running', f'Checking {provider_name} certificates', 'Reading certificates currently stored in FOBS.')
+        progress('running', f'Checking {provider_name} certificates', 'Reading certificates currently stored in FOBS.')
         page.goto(documents_url, wait_until='domcontentloaded', timeout=30000)
         page.wait_for_timeout(1800)
         try:
             if page.locator('#UserName').count() and page.locator('#Password').count():
-                set_certificate_scan_status(provider_id, 'running', f'Signing into {provider_name}', 'FOBS asked for login again before showing certificates.')
+                progress('running', f'Signing into {provider_name}', 'FOBS asked for login again before showing certificates.')
                 page.fill('#UserName', username)
                 page.fill('#Password', password)
                 page.click("button[type='submit'], input[type='submit']")
                 page.wait_for_timeout(2000)
-                set_certificate_scan_status(provider_id, 'running', f'Opening {provider_name} certificates', 'Loading the FOBS certificates page after login.')
+                if provider_login_screen_visible(page) or '/account/login' in (page.url or '').lower():
+                    message = provider_login_problem_text(page)
+                    pause_provider_after_failed_auto_login(provider_id, provider_name, message)
+                    raise RuntimeError(f'Login failed for {provider_name}. Automatic checks have been paused to avoid account lockout. Open Manage providers, reconfirm the login, then use Test login.')
+                progress('running', f'Opening {provider_name} certificates', 'Loading the FOBS certificates page after login.')
                 page.goto(documents_url, wait_until='domcontentloaded', timeout=30000)
                 page.wait_for_timeout(1200)
+        except RuntimeError:
+            raise
         except Exception:
             pass
+
+        if provider_login_screen_visible(page) or '/account/login' in (page.url or '').lower():
+            message = provider_login_problem_text(page)
+            pause_provider_after_failed_auto_login(provider_id, provider_name, message)
+            raise RuntimeError(f'Login failed for {provider_name}. Automatic checks have been paused to avoid account lockout. Open Manage providers, reconfirm the login, then use Test login.')
 
         certificates = []
         seen_certificate_rows = set()
         existing_cache = existing_provider_certificate_cache(provider_id)
+        local_documents = load_documents()
         section_rows = certificate_rows_from_provider_page(page, provider)
         print(f"[CERTIFICATES] {provider_name}: extracted {len(section_rows)} candidate certificate row(s) from FOBS.")
-        set_certificate_scan_status(provider_id, 'running', f'Reading {provider_name} certificates', f'{len(section_rows)} candidate certificate row(s) found. Checking files now.')
+        scan_detail = 'Checking files now.' if cache_files else 'Quick overview only; existing saved files will be reused.'
+        progress('running', f'Reading {provider_name} certificates', f'{len(section_rows)} candidate certificate row(s) found. {scan_detail}')
         for row in section_rows:
             if isinstance(row, dict):
                 values = row.get('values') or []
@@ -4574,7 +5301,7 @@ def scan_provider_certificates(provider):
             joined = ' | '.join(values)
             if re.search(r'\b(invoice|invoices|course allocation|allocation|documents?)\b', joined, flags=re.IGNORECASE):
                 continue
-            row_key = normalize_certificate_match_text(joined)
+            row_key = f"doc:{download_document_id}" if download_document_id else normalize_certificate_match_text(joined)
             if row_key in seen_certificate_rows:
                 continue
             seen_certificate_rows.add(row_key)
@@ -4605,35 +5332,89 @@ def scan_provider_certificates(provider):
                 'download_url': f'DownloadDocument({download_document_id})' if download_document_id else choose_certificate_download_url(links),
             }
             cert_label = shorten_message(name, 72)
-            cached_copy = existing_cache.get(provider_ref) or cached_provider_file_for_ref(provider, provider_ref) or {}
+            # If FOBS exposes an exact DownloadDocument id, use that id as the
+            # permanent cache key. Reuse the saved file only when it belongs to
+            # this exact provider + document id; otherwise download once and
+            # update the manifest.
+            if download_document_id:
+                cached_copy = exact_provider_document_cache(provider_id, download_document_id, cert) or {}
+            else:
+                cached_copy = existing_cache.get(provider_ref) or cached_provider_file_for_ref(provider, provider_ref) or {}
             cached_filename = cached_copy.get('cached_filename') or ''
+            cached_conflict = False
             if cached_filename:
                 try:
                     if safe_provider_cache_path(cached_filename).exists():
-                        cert.update(cached_copy)
-                        cert['download_status'] = cached_copy.get('download_status') or 'cached'
-                        set_certificate_scan_status(provider_id, 'running', f'Checked {cert_label}', f'Already saved locally. No download needed for {provider_name}.')
-                        certificates.append(cert)
-                        continue
+                        candidate = dict(cert)
+                        candidate.update(cached_copy)
+                        candidate['provider_id'] = provider_id
+                        candidate['certificate_name'] = cert.get('certificate_name') or ''
+
+                        # Exact FOBS document id is the safety boundary. Do not use
+                        # fuzzy PDF/title text extraction to decide whether to reuse it:
+                        # scanned PDFs often have poor text, which caused the same exact
+                        # document to be downloaded again and again. Wrong-file protection
+                        # is provider_id + exact DownloadDocument(id), not title guessing.
+                        if download_document_id:
+                            cert.update(cached_copy)
+                            cert['download_status'] = cached_copy.get('download_status') or 'cached_by_exact_document_id'
+                            progress('running', f'Checked {cert_label}', f'Already saved locally for this exact FOBS document id.')
+                            certificates.append(cert)
+                            continue
+                        cached_content_ok = provider_certificate_cached_content_matches_row(candidate)
+                        if ((not provider_certificate_cache_hash_conflict(candidate)) and cached_content_ok):
+                            cert.update(cached_copy)
+                            cert['download_status'] = cached_copy.get('download_status') or 'cached'
+                            progress('running', f'Checked {cert_label}', f'Already saved locally. No download needed for {provider_name}.')
+                            certificates.append(cert)
+                            continue
+                        else:
+                            cached_conflict = True
+                            progress('running', f'Refreshing {cert_label}', f'Saved file did not match the FOBS row for {provider_name}; downloading a fresh copy.')
                 except Exception:
                     pass
+            if not cache_files:
+                if cached_filename:
+                    cert.update(cached_copy)
+                    cert['download_status'] = cached_copy.get('download_status') or 'cached_by_exact_document_id'
+                    progress('running', f'Checked {cert_label}', f'Already indexed and saved locally for {provider_name}.')
+                elif certificate_matches_any_active_doc(cert, local_documents):
+                    cert['download_status'] = 'indexed_existing_local_match'
+                    progress('running', f'Indexed {cert_label}', f'Already matched in TrainerMate for {provider_name}.')
+                elif cert.get('download_url'):
+                    cert['download_status'] = 'indexed_not_downloaded'
+                    progress('running', f'Indexed {cert_label}', f'New FOBS certificate detected for {provider_name}. It will download only when opened.')
+                else:
+                    cert['download_status'] = 'indexed_no_file_link'
+                    progress('running', f'Indexed {cert_label}', f'New in FOBS for {provider_name}, but no exact file link was available.')
+                certificates.append(cert)
+                continue
             if cert.get('download_url'):
-                set_certificate_scan_status(provider_id, 'running', f'Downloading {cert_label}', f'Caching provider copy from {provider_name}.')
+                progress('running', f'Downloading {cert_label}', f'Caching provider copy from {provider_name}.')
             else:
-                set_certificate_scan_status(provider_id, 'running', f'Checking {cert_label}', f'No direct file link found yet for {provider_name}.')
+                progress('running', f'Checking {cert_label}', f'No direct file link found yet for {provider_name}.')
             cert.update(cache_provider_certificate_file(page, provider, provider_ref, cert))
+            # Do not attach a TrainerMate local document as a substitute for a
+            # provider certificate file. FOBS is the source of truth; View must
+            # open the exact file downloaded from that provider row/document id.
             status = cert.get('download_status') or 'checked'
             if status.startswith('cached'):
-                set_certificate_scan_status(provider_id, 'running', f'Cached {cert_label}', 'Encrypted provider copy saved locally.')
+                progress('running', f'Cached {cert_label}', 'Encrypted provider copy saved locally.')
             elif status not in {'no_link'}:
-                set_certificate_scan_status(provider_id, 'running', f'Checked {cert_label}', f'Provider copy status: {status}.')
+                progress('running', f'Checked {cert_label}', f'Provider copy status: {status}.')
             certificates.append(cert)
 
-        set_certificate_scan_status(provider_id, 'running', f'Saving {provider_name} certificates', f'{len(certificates)} certificate record(s) ready.')
+        progress('running', f'Saving {provider_name} certificates', f'{len(certificates)} certificate record(s) ready.')
         saved = save_provider_certificate_scan(provider, certificates, documents_url)
         if certificates and saved:
             update_document_provider_presence(provider, certificates)
-            set_certificate_scan_status(provider_id, 'complete', f'{provider_name} certificates checked', f'{len(certificates)} certificate(s) found in FOBS.')
+            mirrored = mirror_fobs_certificates_to_trainermate(provider, certificates)
+            if mirrored:
+                plural = '' if mirrored == 1 else 's'
+                progress('running', f'New certificate{plural} saved', f'TrainerMate found and linked {mirrored} new FOBS certificate{plural} from {provider_name}.')
+                set_certificate_scan_status(provider_id, 'complete', f'New certificate{plural} saved', f'TrainerMate found, downloaded and linked {mirrored} new FOBS certificate{plural} from {provider_name}.')
+            else:
+                set_certificate_scan_status(provider_id, 'complete', f'{provider_name} certificates checked', f'{len(certificates)} certificate(s) found in FOBS. No new files needed importing.')
         else:
             raise RuntimeError('FOBS returned no certificate rows, so the existing cache was kept.')
         return len(certificates)
@@ -4768,6 +5549,8 @@ def start_certificate_scan_async(provider_id='all'):
     # Certificate refresh is read-only, so scan every configured provider.
     # Course/Zoom sync still uses provider_options() to stay limited to active providers.
     providers = load_providers()
+    # Do not keep retrying providers that have already failed login. The trainer must reconfirm credentials and pass Test login first.
+    providers = [p for p in providers if not (p.get('paused_for_login') or p.get('last_login_test_status') == 'failed')]
     if provider_id and provider_id != 'all':
         wanted = provider_slug(provider_id)
         providers = [p for p in providers if provider_slug(p.get('id') or p.get('name')) == wanted]
@@ -4776,22 +5559,26 @@ def start_certificate_scan_async(provider_id='all'):
         return False
 
     def runner():
-        set_certificate_scan_status(provider_id or 'all', 'running', 'Checking provider certificates', 'Refreshing certificates shown in FOBS.')
+        set_certificate_scan_status(provider_id or 'all', 'running', 'Checking provider certificates', 'Quickly comparing FOBS with TrainerMate.')
         total = 0
         errors = 0
-        for provider in providers:
+        for index, provider in enumerate(providers, start=1):
             pid = provider_slug(provider.get('id') or provider.get('name') or '')
+            provider_name = provider.get('name') or pid
+            set_certificate_scan_status(provider_id or 'all', 'running', f'Checking {provider_name}', f'Provider {index} of {len(providers)}. Saving any missing files now.')
             try:
-                total += scan_provider_certificates(provider)
+                total += scan_provider_certificates(provider, cache_files=True, batch_progress={'id': provider_id or 'all', 'index': index, 'total': len(providers)})
+                set_certificate_scan_status(provider_id or 'all', 'running', f'Checked {provider_name}', f'Provider {index} of {len(providers)} complete. {total} certificate(s) found so far.')
             except Exception as exc:
                 errors += 1
                 set_certificate_scan_status(pid, 'error', f'Could not check {provider.get("name") or pid} certificates', str(exc))
+                set_certificate_scan_status(provider_id or 'all', 'running', f'{provider_name} needs checking', f'Provider {index} of {len(providers)} had a problem. Continuing with the remaining providers.')
         if errors:
-            set_certificate_scan_status(provider_id or 'all', 'error', 'Certificate refresh finished with warnings', f'{total} certificate(s) found. {errors} provider(s) need checking.')
+            set_certificate_scan_status(provider_id or 'all', 'error', 'Certificate check finished with warnings', f'{total} certificate(s) found. {errors} provider(s) need checking.')
         else:
-            set_certificate_scan_status(provider_id or 'all', 'complete', 'Provider certificates refreshed', f'{total} certificate(s) found across {len(providers)} provider(s).')
+            set_certificate_scan_status(provider_id or 'all', 'complete', 'Provider certificates checked', f'{total} certificate(s) found across {len(providers)} provider(s).')
 
-    set_certificate_scan_status(provider_id or 'all', 'running', 'Starting certificate check', 'Please wait, certificate check in progress.')
+    set_certificate_scan_status(provider_id or 'all', 'running', 'Starting certificate check', 'Quickly comparing FOBS with TrainerMate.')
     threading.Thread(target=runner, daemon=True).start()
     return True
 
@@ -4806,6 +5593,8 @@ def start_startup_certificate_scan_once(providers=None):
 
     eligible = []
     for provider in list(providers or load_providers()):
+        if provider.get('paused_for_login') or provider.get('last_login_test_status') == 'failed':
+            continue
         if not provider.get('active', True):
             continue
         provider_id = provider_slug(provider.get('id') or provider.get('name') or '')
@@ -4822,23 +5611,33 @@ def start_startup_certificate_scan_once(providers=None):
             return False
         STARTUP_CERTIFICATE_SCAN_STARTED = True
 
+    # Set this before the background thread starts. Otherwise the first page render
+    # can briefly show stale certificate rows/prompts while the startup FOBS check
+    # is merely queued. FOBS should be treated as the source of truth, so the UI
+    # stays in a resolving state until this pass completes or errors.
+    set_certificate_scan_status('all', 'running', 'Checking certificates', 'TrainerMate is updating your certificate list from FOBS before showing it.')
+
     def runner():
         if STARTUP_CERTIFICATE_SCAN_DELAY_SECONDS > 0:
             time.sleep(STARTUP_CERTIFICATE_SCAN_DELAY_SECONDS)
-        set_certificate_scan_status('all', 'running', 'Checking certificates', 'TrainerMate is refreshing the active provider certificate lists.')
+        set_certificate_scan_status('all', 'running', 'Checking certificates', 'TrainerMate is updating your certificate list from FOBS.')
         total = 0
         errors = 0
-        for provider in eligible:
+        for index, provider in enumerate(eligible, start=1):
             pid = provider_slug(provider.get('id') or provider.get('name') or '')
+            provider_name = provider.get('name') or pid
+            set_certificate_scan_status('all', 'running', f'Checking {provider_name}', f'Provider {index} of {len(eligible)}. Indexing certificates without downloading every file.')
             try:
-                total += scan_provider_certificates(provider)
+                total += scan_provider_certificates(provider, cache_files=False, batch_progress={'id': 'all', 'index': index, 'total': len(eligible)})
+                set_certificate_scan_status('all', 'running', f'Checked {provider_name}', f'Provider {index} of {len(eligible)} complete. {total} certificate(s) indexed.')
             except Exception as exc:
                 errors += 1
                 set_certificate_scan_status(pid, 'error', f'Could not check {provider.get("name") or pid} certificates', str(exc))
+                set_certificate_scan_status('all', 'running', f'{provider_name} needs checking', f'Provider {index} of {len(eligible)} had a problem. Continuing with the remaining providers.')
         if errors:
             set_certificate_scan_status('all', 'error', 'Certificate check finished with warnings', f'{total} certificate(s) found. {errors} provider(s) need checking.')
         else:
-            set_certificate_scan_status('all', 'complete', 'Certificates checked', f'{total} certificate(s) found across {len(eligible)} active provider(s).')
+            set_certificate_scan_status('all', 'complete', 'Certificates checked', f'{total} certificate(s) indexed across {len(eligible)} active provider(s). Files download only when opened.')
 
     threading.Thread(target=runner, daemon=True).start()
     return True
@@ -4917,6 +5716,14 @@ def document_type_label(value):
     return DOCUMENT_TYPE_LABELS.get((value or '').strip(), 'Other')
 
 
+def document_type_key_from_label(value):
+    normalized = normalize_certificate_match_text(value or '')
+    for key, label in DOCUMENT_TYPES:
+        if normalized and normalized == normalize_certificate_match_text(label):
+            return key
+    return 'other'
+
+
 def parse_date_value(value):
     value = (value or '').strip()
     if not value:
@@ -4970,7 +5777,7 @@ def load_documents():
             doc['type_label'] = document_type_label(doc.get('document_type'))
             doc['health_key'], doc['health_label'] = document_health(doc)
             doc['provider_names'] = ', '.join(link.get('provider_name') or '' for link in links) or 'Not assigned'
-            doc['pending_count'] = sum(1 for link in links if (link.get('pending_action') or '').strip())
+            doc['pending_count'] = sum(1 for link in links if (link.get('pending_action') or '').strip() and not certificate_link_is_quiet_after_user_removal(link))
         return docs
     finally:
         conn.close()
@@ -4995,6 +5802,68 @@ def document_link_provider_names(doc):
     return names
 
 
+def certificate_link_is_present_in_fobs(link):
+    pending = (link.get('pending_action') or '').strip()
+    status = (link.get('provider_status') or '').strip()
+    if certificate_link_is_quiet_after_user_removal(link):
+        return False
+    if status in {'missing', 'needs_review'}:
+        return False
+    if pending in {'review_missing', 'dismissed_missing', 'delete_provider_copy', 'provider_delete_complete'}:
+        return False
+    return status in {'in_sync', 'uploaded', 'not_checked', ''}
+
+
+def document_present_provider_names(doc):
+    names = []
+    seen = set()
+    for link in doc.get('links') or []:
+        if not certificate_link_is_present_in_fobs(link):
+            continue
+        name = (link.get('provider_name') or link.get('provider_id') or '').strip()
+        key = provider_slug(name)
+        if name and key not in seen:
+            names.append(name)
+            seen.add(key)
+    return names
+
+
+def certificate_link_is_quiet_after_user_removal(link):
+    """Return True when a missing provider copy is an expected result of a user delete.
+
+    These links should not create reminder banners or expiry warnings. They are
+    already resolved from the user's point of view: TrainerMate asked FOBS to
+    remove the file, or the user dismissed that missing state.
+    """
+    pending = (link.get('pending_action') or '').strip()
+    status = (link.get('provider_status') or '').strip()
+    notes = (link.get('notes') or '').strip().lower()
+    if pending in {'delete_provider_copy', 'dismissed_missing', 'provider_delete_complete'}:
+        return True
+    if status == 'missing' and pending in {'', 'review_missing'} and (
+        notes.startswith('removed from ')
+        or 'removed from fobs' in notes
+        or 'was removed from ' in notes
+        or notes.startswith('this certificate was removed from ')
+    ):
+        return True
+    return False
+
+
+def document_is_quiet_after_user_removal(doc):
+    links = doc.get('links') or []
+    if not links:
+        return False
+    return all(certificate_link_is_quiet_after_user_removal(link) for link in links)
+
+
+def document_has_present_fobs_link(doc):
+    links = doc.get('links') or []
+    if not links:
+        return True
+    return any(certificate_link_is_present_in_fobs(link) for link in links)
+
+
 def document_summary(documents):
     summary = {'total': 0, 'active': 0, 'expired': 0, 'expiring': 0, 'pending': 0, 'needs_attention': 0}
     warning_keys = set()
@@ -5003,16 +5872,16 @@ def document_summary(documents):
         if (doc.get('status') or '') == 'active':
             summary['active'] += 1
         warning_key = document_expiry_warning_key(doc)
-        count_warning = doc.get('health_key') in {'expired', 'expiring'} and warning_key not in warning_keys
+        count_warning = document_has_present_fobs_link(doc) and doc.get('health_key') in {'expired', 'expiring'} and warning_key not in warning_keys
         if count_warning:
             warning_keys.add(warning_key)
             if doc.get('health_key') == 'expired':
                 summary['expired'] += 1
             elif doc.get('health_key') == 'expiring':
                 summary['expiring'] += 1
-        if doc.get('pending_count'):
+        if document_has_present_fobs_link(doc) and doc.get('pending_count'):
             summary['pending'] += int(doc.get('pending_count') or 0)
-        if count_warning or doc.get('pending_count'):
+        if count_warning or (document_has_present_fobs_link(doc) and doc.get('pending_count')):
             summary['needs_attention'] += 1
     return summary
 
@@ -5020,6 +5889,8 @@ def document_summary(documents):
 def document_expiry_warnings(documents, limit=4):
     grouped = {}
     for doc in documents or []:
+        if not document_has_present_fobs_link(doc):
+            continue
         if doc.get('health_key') not in {'expired', 'expiring'}:
             continue
         key = document_expiry_warning_key(doc)
@@ -5034,7 +5905,7 @@ def document_expiry_warnings(documents, limit=4):
         if item.get('level') != 'expired' and doc.get('health_key') == 'expired':
             item['level'] = 'expired'
             item['message'] = doc.get('health_label') or item.get('message') or ''
-        for provider_name in document_link_provider_names(doc):
+        for provider_name in document_present_provider_names(doc):
             provider_key = provider_slug(provider_name)
             if provider_key and provider_key not in item['provider_keys']:
                 item['providers'].append(provider_name)
@@ -5069,6 +5940,8 @@ def certificate_attention_items(documents):
             continue
         links = doc.get('links') or []
         for link in links:
+            if certificate_link_is_quiet_after_user_removal(link):
+                continue
             pending_action = (link.get('pending_action') or '').strip()
             provider_status = (link.get('provider_status') or '').strip()
             if pending_action == 'dismissed_missing':
@@ -5176,7 +6049,7 @@ def provider_document_requirements(provider_id):
 
 
 def provider_document_health(documents, providers):
-    active_docs = [doc for doc in documents if (doc.get('status') or '') == 'active']
+    active_docs = [doc for doc in documents if (doc.get('status') or '') == 'active' and not document_is_quiet_after_user_removal(doc)]
     out = []
     for provider in providers:
         provider_id = provider.get('id')
@@ -5251,22 +6124,21 @@ def upsert_document_provider_links(conn, document_id, provider_ids, pending_acti
 
 
 def valid_document_provider_ids(provider_ids):
-    providers = {p['id'] for p in load_providers()}
-    valid = []
-    seen = set()
-    for raw_provider_id in provider_ids or []:
-        provider_id = provider_slug(raw_provider_id)
-        if not provider_id or provider_id in seen or provider_id not in providers:
-            continue
-        valid.append(provider_id)
-        seen.add(provider_id)
-    return valid
+    return certificate_helpers.valid_document_provider_ids(provider_ids, load_providers())
+
+
+def all_document_provider_ids():
+    return certificate_helpers.all_document_provider_ids(load_providers())
+
+
+def selected_document_provider_ids(form):
+    return certificate_helpers.selected_document_provider_ids(form, load_providers())
 
 
 def add_document_from_form(form, file_storage):
     if not file_storage or not getattr(file_storage, 'filename', ''):
         return False, 'Choose a file to add.'
-    provider_ids = valid_document_provider_ids(form.getlist('provider_ids'))
+    provider_ids = selected_document_provider_ids(form)
     if not provider_ids:
         return False, 'Choose at least one provider for this certificate.'
     allowed, reason = allowed_document_upload(file_storage)
@@ -5322,6 +6194,162 @@ def add_document_from_form(form, file_storage):
         conn.close()
 
 
+def provider_cached_certificate_bytes(cert):
+    if provider_certificate_cache_hash_conflict(cert):
+        return b''
+    cached = (cert or {}).get('cached_filename') or ''
+    if not cached:
+        return b''
+    path = safe_provider_cache_path(cached)
+    try:
+        if not path.exists() or not path.is_file():
+            return b''
+    except OSError:
+        return b''
+    try:
+        content = path.read_bytes()
+    except OSError:
+        return b''
+    if ((cert or {}).get('encryption') or '') == 'dpapi':
+        return unprotect_provider_cache_bytes(content)
+    return content
+
+
+def certificate_matches_any_active_doc(cert, documents):
+    for doc in documents or []:
+        if (doc.get('status') or '') == 'active' and certificate_matches_local_doc(cert, doc):
+            return doc
+    return None
+
+
+def link_fobs_certificate_to_document(conn, provider, document_id, cert, note='Mirrored from FOBS.'):
+    provider_id = provider_slug(provider.get('id') or provider.get('name') or '')
+    provider_name = provider.get('name') or provider_id
+    now = utc_now_text()
+    provider_file_name = cert.get('certificate_name') or Path(cert.get('download_url') or '').name or 'Certificate'
+    conn.execute("""
+        INSERT INTO document_provider_links (
+            id, document_id, provider_id, provider_name,
+            provider_status, provider_file_name, provider_checked_at,
+            pending_action, last_synced_at, notes, updated_at
+        )
+        VALUES (?, ?, ?, ?, 'in_sync', ?, ?, '', ?, ?, ?)
+        ON CONFLICT(document_id, provider_id)
+        DO UPDATE SET
+            provider_name = excluded.provider_name,
+            provider_status = 'in_sync',
+            provider_file_name = COALESCE(NULLIF(excluded.provider_file_name, ''), document_provider_links.provider_file_name),
+            provider_checked_at = excluded.provider_checked_at,
+            pending_action = '',
+            last_synced_at = excluded.last_synced_at,
+            notes = excluded.notes,
+            updated_at = excluded.updated_at
+    """, (str(uuid.uuid4()), document_id, provider_id, provider_name, provider_file_name, now, now, note, now))
+
+
+def mirror_fobs_certificates_to_trainermate(provider, certificates):
+    """Create local TrainerMate certificate records for FOBS-only certificates.
+
+    FOBS is treated as the source of truth. When a provider scan sees a new
+    certificate row that is not already represented inside TrainerMate, the scan
+    downloads the exact provider file, creates a local TrainerMate document from
+    that provider copy, links it back to the provider, and raises one gentle
+    activity notification for the user. The routine is intentionally idempotent:
+    repeat scans only refresh/link known records and do not create duplicate
+    documents or duplicate alerts.
+    """
+    provider_id = provider_slug(provider.get('id') or provider.get('name') or '')
+    provider_name = provider.get('name') or provider_id
+    if not provider_id or not certificates:
+        return 0
+    documents = load_documents()
+    mirrored = 0
+    imported_titles = []
+    conn = documents_conn()
+    try:
+        now = utc_now_text()
+        for cert in certificates:
+            existing_doc = certificate_matches_any_active_doc(cert, documents)
+            if existing_doc:
+                link_fobs_certificate_to_document(conn, provider, existing_doc.get('id'), cert, 'Matched from FOBS overview.')
+                continue
+            if not cert.get('cached_filename'):
+                continue
+            try:
+                content = provider_cached_certificate_bytes(cert)
+            except Exception:
+                content = b''
+            if not content:
+                continue
+            doc_id = str(uuid.uuid4())
+            title = (cert.get('certificate_name') or 'Certificate').strip() or 'Certificate'
+            content_type = cert.get('content_type') or ''
+            ext = extension_from_content_type(content_type, cert.get('download_url') or title)
+            original = safe_document_filename(f"{title}{ext}")
+            stored = f"{doc_id}{ext if ext in ALLOWED_DOCUMENT_EXTENSIONS else '.bin'}"
+            target = safe_document_path(stored)
+            target.write_bytes(content)
+            document_type = document_type_key_from_label(cert.get('detected_type') or title)
+            conn.execute("""
+                INSERT INTO trainer_documents (
+                    id, title, document_type, original_filename, stored_filename,
+                    file_path, issue_date, expiry_date, notes, status, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+            """, (
+                doc_id,
+                title,
+                document_type,
+                original,
+                stored,
+                str(target),
+                cert.get('uploaded_at') or '',
+                cert.get('expiry_date') or '',
+                f"Automatically imported from {provider_name} FOBS.",
+                now,
+                now,
+            ))
+            link_fobs_certificate_to_document(conn, provider, doc_id, cert, 'Automatically imported from FOBS.')
+            mirrored += 1
+            imported_titles.append(title)
+            documents.append({
+                'id': doc_id,
+                'title': title,
+                'document_type': document_type,
+                'original_filename': original,
+                'status': 'active',
+                'links': [{'provider_id': provider_id}],
+            })
+        conn.commit()
+    finally:
+        conn.close()
+
+    if mirrored:
+        try:
+            preview = ', '.join(imported_titles[:3])
+            if len(imported_titles) > 3:
+                preview += f" and {len(imported_titles) - 3} more"
+            plural = '' if mirrored == 1 else 's'
+            add_activity_item(
+                'fobs_certificate_import',
+                f'New FOBS certificate{plural} detected',
+                f'TrainerMate found and saved {mirrored} new certificate{plural} from {provider_name}: {preview}.',
+                'info',
+                details={
+                    'provider_id': provider_id,
+                    'provider_name': provider_name,
+                    'imported_count': mirrored,
+                    'titles': imported_titles[:20],
+                },
+                items=[{'provider': provider_name, 'title': title} for title in imported_titles[:20]],
+                source='certificates',
+                notify=True,
+            )
+        except Exception:
+            pass
+    return mirrored
+
+
 def repair_pending_upload_presence():
     conn = documents_conn()
     try:
@@ -5338,6 +6366,36 @@ def repair_pending_upload_presence():
               AND provider_status = 'missing'
         """, (now,))
         conn.commit()
+    finally:
+        conn.close()
+
+
+def cleanup_expected_certificate_removal_noise():
+    """Silence duplicate/misleading certificate alerts from completed deletes.
+
+    Older builds recorded user-requested FOBS removals as generic
+    "no longer appears" reminders. Convert those into the same quiet state
+    used by the fixed delete path. This also stops deleted DBS-style records
+    from continuing to count as expiry warnings.
+    """
+    conn = documents_conn()
+    try:
+        now = utc_now_text()
+        cur = conn.execute("""
+            UPDATE document_provider_links
+            SET pending_action = 'dismissed_missing',
+                notes = '',
+                updated_at = ?
+            WHERE provider_status = 'missing'
+              AND COALESCE(pending_action, '') IN ('', 'review_missing')
+              AND (
+                    lower(COALESCE(notes, '')) LIKE 'this certificate no longer appears in %'
+                 OR lower(COALESCE(notes, '')) LIKE 'this certificate was removed from %'
+                 OR lower(COALESCE(notes, '')) LIKE 'removed from %'
+              )
+        """, (now,))
+        conn.commit()
+        return cur.rowcount or 0
     finally:
         conn.close()
 
@@ -5525,21 +6583,7 @@ def load_courses(provider_filter='all'):
                     meeting_password, status, active_in_portal, last_seen_at,
                     last_synced_at, last_sync_status, last_sync_action,
                     COALESCE(fobs_course_url, '') AS fobs_course_url
-               FROM courses
-              WHERE date_time >= ?
-                AND COALESCE(status, '') <> 'Replaced'
-                AND lower(COALESCE(last_sync_action, '')) NOT LIKE '%course replaced by provider%'
-                AND lower(COALESCE(last_sync_action, '')) NOT LIKE '%trainer confirmed removed%'
-                AND (
-                    COALESCE(active_in_portal, 1) = 1
-                    OR COALESCE(last_sync_status, '') = 'needs_confirmation'
-                    OR lower(COALESCE(last_sync_action, '')) LIKE '%possibly removed%'
-                    OR lower(COALESCE(last_sync_action, '')) LIKE '%possibly cancelled%'
-                    OR lower(COALESCE(last_sync_action, '')) LIKE '%not found in latest provider scan%'
-                    OR COALESCE(last_synced_at, '') <> ''
-                    OR COALESCE(meeting_id, '') <> ''
-                    OR COALESCE(meeting_link, '') <> ''
-                )"""
+               FROM courses""" + visible_course_where_clause()
         params = [today_start_text()]
         if provider_filter != 'all':
             q += " AND (lower(replace(provider, ' ', '-')) = ? OR lower(provider) = ?)"
@@ -5559,21 +6603,7 @@ def course_counts_by_provider():
     try:
         ensure_courses_sync_columns(conn)
         q = """SELECT provider, COUNT(*)
-               FROM courses
-              WHERE date_time >= ?
-                AND COALESCE(status, '') <> 'Replaced'
-                AND lower(COALESCE(last_sync_action, '')) NOT LIKE '%course replaced by provider%'
-                AND lower(COALESCE(last_sync_action, '')) NOT LIKE '%trainer confirmed removed%'
-                AND (
-                    COALESCE(active_in_portal, 1) = 1
-                    OR COALESCE(last_sync_status, '') = 'needs_confirmation'
-                    OR lower(COALESCE(last_sync_action, '')) LIKE '%possibly removed%'
-                    OR lower(COALESCE(last_sync_action, '')) LIKE '%possibly cancelled%'
-                    OR lower(COALESCE(last_sync_action, '')) LIKE '%not found in latest provider scan%'
-                    OR COALESCE(last_synced_at, '') <> ''
-                    OR COALESCE(meeting_id, '') <> ''
-                    OR COALESCE(meeting_link, '') <> ''
-                )
+               FROM courses""" + visible_course_where_clause() + """
               GROUP BY provider"""
         for provider_name, count in conn.execute(q, (today_start_text(),)).fetchall():
             counts[provider_slug(provider_name or 'provider')] = int(count or 0)
@@ -5636,44 +6666,24 @@ def human_status(raw_status):
     return {'running': 'Syncing', 'success': 'Ready', 'skipped': 'Ready', 'error': 'Needs attention', 'idle': 'Waiting', 'stopped': 'Stopped'}.get((raw_status or '').strip().lower(), (raw_status or 'Waiting').title())
 
 
-
-def parse_dashboard_datetime(value):
-    """Best-effort parse for dashboard timestamps."""
-    text = (value or '').strip()
-    if not text:
-        return None
-    formats = (
-        '%Y-%m-%d %H:%M:%S',
-        '%Y-%m-%d %H:%M',
-        '%Y-%m-%dT%H:%M:%SZ',
-        '%Y-%m-%dT%H:%M:%S',
-    )
-    for fmt in formats:
-        try:
-            return datetime.strptime(text[:len(datetime.now().strftime(fmt))] if '%f' not in fmt else text, fmt)
-        except Exception:
-            pass
-    try:
-        return datetime.fromisoformat(text.replace('Z', '+00:00')).replace(tzinfo=None)
-    except Exception:
-        return None
-
-
-
 def account_is_paid(access):
     """Best-effort account plan detection from the licensing response."""
     access = access or {}
     features = access.get('features') if isinstance(access.get('features'), dict) else {}
-    plan = str(access.get('plan') or access.get('tier') or '').strip().lower()
-    if access.get('paid') is True or access.get('is_paid') is True:
+    plan = str(access.get('plan') or access.get('tier') or access.get('subscription_plan') or access.get('account_plan') or '').strip().lower()
+    status = str(access.get('status') or access.get('subscription_status') or access.get('licence_status') or '').strip().lower()
+    if access.get('paid') is True or access.get('is_paid') is True or access.get('paid_account') is True:
         return True
-    if plan and plan not in {'free', 'trial', 'starter'}:
+    if plan in {'paid', 'pro', 'premium', 'admin', 'active', 'licenced', 'licensed'}:
+        return True
+    if status in {'paid', 'active', 'licenced', 'licensed'}:
+        return True
+    if plan and plan not in {'free', 'trial', 'starter', 'basic'}:
         return True
     try:
         return int(features.get('sync_window_days') or 0) > FREE_SYNC_WINDOW_DAYS
     except Exception:
         return False
-
 
 def effective_sync_window_days(access):
     """Free users sync 21 days ahead; paid users sync 12 weeks ahead."""
@@ -5705,6 +6715,19 @@ def course_days_from_now(date_time_text):
         return (dt - today).days
     except Exception:
         return None
+
+
+def course_hours_from_now(date_time_text):
+    try:
+        dt = datetime.strptime((date_time_text or '').strip()[:16], '%Y-%m-%d %H:%M')
+        return (dt - datetime.now()).total_seconds() / 3600
+    except Exception:
+        return None
+
+
+def course_starts_within_hours(date_time_text, hours=72):
+    value = course_hours_from_now(date_time_text)
+    return bool(value is not None and 0 <= value <= hours)
 
 
 def format_checked_date(value):
@@ -6330,26 +7353,11 @@ def normalize_course_action(action, status='', has_zoom=False):
     status_lower = (status or '').strip().lower()
 
     if (
-        'existing zoom meeting verified and updated' in lower
-        or 'existing zoom meeting updated' in lower
-        or 'existing zoom meeting verified' in lower
-    ):
-        return 'Zoom meeting already exists - verified'
-
-    if (
-        'existing zoom meeting found and linked' in lower
-        or 'existing matching zoom meeting found' in lower
-    ):
-        return 'Zoom meeting already exists - verified'
-
-    if (
         'already has valid live zoom' in lower
         or 'already present' in lower
         or 'zoom joining instructions already present' in lower
+        or (has_zoom and lower in {'read course summary', 'checked'})
     ):
-        return 'Zoom meeting already exists - verified'
-
-    if has_zoom and lower in {'read course summary', 'checked'}:
         return 'FOBS + Zoom OK'
 
     if 'updated successfully' in lower or 'fobs updated successfully' in lower or 'zoom link updated' in lower:
@@ -6491,6 +7499,7 @@ def build_course_rows(raw_courses, app_state, providers_by_slug, active_sync_win
         meeting_id_digits = ''.join(ch for ch in (c.get('meeting_id') or '') if ch.isdigit())
         meeting_password = (c.get('meeting_password') or '').strip()
         days_ahead = course_days_from_now(c.get('date_time') or '')
+        starts_within_72h = course_starts_within_hours(c.get('date_time') or '', 72)
         outside_sync_window = bool(days_ahead is not None and active_sync_window_days and days_ahead > active_sync_window_days)
 
         db_sync_action = (c.get('last_sync_action') or '').strip()
@@ -6529,10 +7538,6 @@ def build_course_rows(raw_courses, app_state, providers_by_slug, active_sync_win
                 short_message = 'Course replaced by provider'
             elif normalized_message == 'Conflict - check FOBS':
                 short_message = 'Conflict - check FOBS'
-            elif normalized_message == 'Zoom meeting already exists - verified':
-                short_message = 'Zoom meeting already exists - verified'
-                status_label = 'Synced'
-                status_class = 'ok'
             elif normalized_message == 'Zoom link updated' and action_is_recent(db_synced_at):
                 short_message = 'Zoom link updated'
             elif (normalized_message == 'FOBS + Zoom OK' or has_zoom) and checked_source:
@@ -6552,6 +7557,8 @@ def build_course_rows(raw_courses, app_state, providers_by_slug, active_sync_win
             status_label = 'Needs attention'
             status_class = 'bad'
             short_message = 'Zoom link mismatch confirmed on FOBS - choose whether to replace it, keep it, or open FOBS manually.'
+            if starts_within_72h:
+                short_message = 'Starts within 72 hours. Existing FOBS link is protected; choose whether to keep it, replace it, or open FOBS manually.'
         elif possibly_removed:
             status_label = 'Needs confirmation'
             status_class = 'bad'
@@ -6580,7 +7587,9 @@ def build_course_rows(raw_courses, app_state, providers_by_slug, active_sync_win
             'show_upgrade': show_upgrade,
             'is_action_needed': status_label in {'Not checked', 'Not synced', 'Sync due', 'Needs attention', 'Needs confirmation'},
             'is_outside_window': outside_sync_window,
+            'starts_within_72h': starts_within_72h,
             'date_time_raw': c.get('date_time') or '',
+            'active_in_portal': c.get('active_in_portal'),
             'last_seen_at': c.get('last_seen_at') or '',
             'can_confirm_removed': possibly_removed,
             'zoom_mismatch_confirmed': zoom_mismatch_confirmed,
@@ -6596,36 +7605,6 @@ def build_course_rows(raw_courses, app_state, providers_by_slug, active_sync_win
             'provider_manages_zoom': bool(provider_config.get('provider_manages_zoom')),
         })
     return rows
-
-def suppress_stale_same_provider_slot_duplicates(rows):
-    """Hide stale same-provider duplicate rows where FOBS has replaced one course with another.
-
-    If the same provider/date/time has multiple course titles, keep the newest
-    checked/current row. This covers provider replacements such as Essex NMAC
-    being replaced by NSAC at the same slot.
-    """
-    grouped = {}
-    for row in rows:
-        key = (row.get('provider_id'), row.get('date_label'), row.get('time_label'))
-        grouped.setdefault(key, []).append(row)
-
-    filtered = []
-    for key, group in grouped.items():
-        titles = {r.get('title') for r in group}
-        if len(group) <= 1 or len(titles) <= 1:
-            filtered.extend(group)
-            continue
-
-        def score(row):
-            checked = parse_dashboard_datetime(row.get('checked_source') or row.get('last_seen_at') or '')
-            checked_ts = checked.timestamp() if checked else 0
-            status_bonus = 2 if row.get('status_label') == 'Synced' else 1 if row.get('status_label') == 'Sync due' else 0
-            return (checked_ts, status_bonus)
-
-        newest = max(group, key=score)
-        filtered.append(newest)
-    return filtered
-
 
 def load_alert_ack():
     data = load_json(ALERT_ACK_PATH, {'dismissed': []})
@@ -6772,10 +7751,6 @@ def is_process_running(pid):
 def reconcile_running_state():
     state = load_app_state()
     pid = state.get('pid')
-    if state.get('sync_running') and not pid:
-        update_app_state(sync_running=False, pid=None, last_status='Stopped', last_run_status=state.get('last_run_status') or 'stopped', pending_sync_request={})
-        state = load_app_state()
-        return state
     if state.get('sync_running') and pid and not is_process_running(pid):
         source = ((state.get('pending_sync_request') or {}).get('source') or '').strip()
         if source:
@@ -6808,9 +7783,6 @@ def start_sync_process(scan_provider='all', scan_days=7, target_course=None, all
         if access.get('reason') == 'free_sync_limit_reached':
             return False, 'Your free sync trial has finished. Activate a paid licence to continue syncing.'
         return False, 'Access is blocked. Check your licence/account status or try again.'
-    if not has_connected_zoom_account():
-        update_app_state(sync_running=False, stop_requested=False, pid=None, last_status='Needs attention', last_message=zoom_required_sync_message())
-        return False, zoom_required_sync_message()
     scan_provider = provider_slug(scan_provider or 'all')
     if scan_provider == 'provider':
         scan_provider = 'all'
@@ -6818,6 +7790,19 @@ def start_sync_process(scan_provider='all', scan_days=7, target_course=None, all
         valid_provider_ids = {provider_slug(p.get('id') or p.get('name') or '') for p in load_providers()}
         if scan_provider not in valid_provider_ids:
             return False, 'That provider is no longer available. Refresh TrainerMate and choose the provider again.'
+
+    zoom_block = sync_zoom_precheck_message(scan_provider=scan_provider, target_course=target_course)
+    if zoom_block:
+        update_app_state(
+            sync_running=False,
+            stop_requested=False,
+            pid=None,
+            last_status='Needs attention',
+            last_message=zoom_block,
+            scan_request={},
+        )
+        return False, zoom_block
+
     try:
         try:
             BOT_LOG_PATH.write_text(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Sync starting...\n", encoding='utf-8')
@@ -6873,7 +7858,7 @@ def start_sync_process(scan_provider='all', scan_days=7, target_course=None, all
             pid=process.pid,
             last_pid=process.pid,
             last_status='Running',
-            last_message=f'Sync started from dashboard: {scope_text}, {days_text}.',
+            last_message=(f'Checking one selected course only: {target_course.get('provider', scan_provider)} - {target_course.get('title', '')} - {target_course.get('date_time', '')}.' if isinstance(target_course, dict) and target_course.get('id') else f'Sync started from dashboard: {scope_text}, {days_text}.'),
             last_started_at=now_text,
             last_run_started_at=now_text,
             scan_request={
@@ -6890,56 +7875,30 @@ def start_sync_process(scan_provider='all', scan_days=7, target_course=None, all
                 'bot_mode': bot_mode or '',
             },
         )
-        try:
-            start_certificate_scan_async(scan_provider)
-        except Exception:
-            pass
-        return True, f'Sync started for {scope_text}, {days_text}.'
+        if not (isinstance(target_course, dict) and target_course.get('id')):
+            try:
+                start_certificate_scan_async(scan_provider)
+            except Exception:
+                pass
+        return True, (f'Checking one selected course only: {target_course.get('provider', scan_provider)} - {target_course.get('title', '')} - {target_course.get('date_time', '')}.' if isinstance(target_course, dict) and target_course.get('id') else f'Sync started for {scope_text}, {days_text}.')
     except Exception as exc:
         return False, f'Could not start sync: {exc}'
 
 
 def stop_sync_process():
-    state = load_app_state()
-    pid = state.get('pid') or state.get('last_pid')
-    scan_request = state.get('scan_request') if isinstance(state.get('scan_request'), dict) else {}
-    reviewer_demo_sync = reviewer_demo_enabled() and scan_request.get('source') in {'reviewer_demo', 'dashboard'}
-    update_app_state(
-        stop_requested=True,
-        sync_running=False,
-        pid=None,
-        last_pid=None,
-        current_provider='',
-        current_course='',
-        last_status='Stopped',
-        last_run_status='stopped',
-        last_run_finished_at=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        last_stopped_at=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        last_message='Sync stopped.',
-        pending_sync_request={},
-        scan_request={},
-        run_summary={'outcome': 'stopped', 'message': 'Sync stopped.'},
-        health_issues=[],
-    )
-    if pid and not reviewer_demo_sync:
-        try:
-            pid_int = int(pid)
-            if os.name == 'nt':
-                subprocess.run(['taskkill', '/PID', str(pid_int), '/T', '/F'], check=False, capture_output=True, text=True)
-            else:
-                try:
-                    os.kill(pid_int, signal.SIGTERM)
-                    time.sleep(0.4)
-                except Exception:
-                    pass
-                if is_process_running(pid_int):
-                    try:
-                        os.kill(pid_int, signal.SIGKILL)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-    return True, 'Sync stopped.'
+    state = reconcile_running_state()
+    pid = state.get('pid')
+    update_app_state(stop_requested=True, last_message='Stop requested from dashboard.', last_status='Stopping')
+    if not pid:
+        return True, 'Stop requested.'
+    try:
+        if os.name == 'nt':
+            subprocess.run(['taskkill', '/PID', str(pid), '/T', '/F'], check=False, capture_output=True, text=True)
+        else:
+            os.kill(int(pid), signal.SIGTERM)
+    except Exception:
+        pass
+    return True, 'Stop requested.'
 
 
 def zoom_redirect_uri():
@@ -6962,424 +7921,7 @@ TEMPLATE = """
 <meta charset='utf-8'>
 <meta name='viewport' content='width=device-width, initial-scale=1'>
 <title>TrainerMate</title>
-<style>
-:root{color-scheme:dark;--bg:#081225;--bg2:#0c1830;--panel:rgba(17,24,39,.92);--panel2:rgba(11,18,32,.94);--text:#f3f4f6;--muted:#9ca3af;--line:rgba(148,163,184,.16);--accent:#2563eb;--accent2:#38bdf8;--danger:#ef4444;--success:#22c55e;--warn:#f59e0b}
-*{box-sizing:border-box}body{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;background:linear-gradient(180deg,var(--bg),var(--bg2));color:var(--text)}a{color:inherit;text-decoration:none}
-.startup-screen{position:fixed;inset:0;z-index:10000;display:none;align-items:center;justify-content:center;padding:18px;background:rgba(8,18,37,.88);backdrop-filter:blur(10px)}
-.startup-screen.show{display:flex}.startup-card{width:min(520px,100%);border:1px solid rgba(125,211,252,.22);border-radius:22px;background:linear-gradient(180deg,rgba(15,23,42,.98),rgba(10,16,29,.98));box-shadow:0 24px 70px rgba(0,0,0,.48);padding:22px;display:grid;gap:18px}.startup-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px}.startup-title{font-size:22px;font-weight:900;color:#fff}.startup-subtitle{margin-top:4px;color:#cbd5e1;font-size:14px;line-height:1.4}.startup-skip{appearance:none;border:1px solid rgba(148,163,184,.28);border-radius:999px;background:rgba(15,23,42,.72);color:#dbeafe;padding:9px 13px;font-weight:800;cursor:pointer;white-space:nowrap}.startup-skip:hover{border-color:rgba(125,211,252,.45)}
-.startup-steps{display:grid;gap:10px}.startup-step{display:grid;grid-template-columns:28px minmax(0,1fr) auto;gap:10px;align-items:center;padding:11px 12px;border:1px solid rgba(148,163,184,.16);border-radius:15px;background:rgba(15,23,42,.72)}.startup-step-icon{width:28px;height:28px;border-radius:999px;display:grid;place-items:center;background:rgba(148,163,184,.16);color:#cbd5e1;font-weight:900}.startup-step-main{min-width:0}.startup-step-label{font-weight:850;color:#f8fafc;line-height:1.2}.startup-step-detail{margin-top:2px;color:#aeb9c8;font-size:12px;line-height:1.3;overflow-wrap:anywhere}.startup-step-state{font-size:11px;border-radius:999px;padding:5px 8px;border:1px solid rgba(148,163,184,.20);color:#cbd5e1;background:rgba(15,23,42,.86);text-transform:lowercase}
-.startup-step.state-running .startup-step-icon,.startup-step.state-waiting .startup-step-icon{background:rgba(37,99,235,.25);color:#bfdbfe;animation:tmPulse 1.2s infinite}.startup-step.state-complete .startup-step-icon,.startup-step.state-skipped .startup-step-icon{background:rgba(34,197,94,.16);color:#86efac;animation:none}.startup-step.state-warning .startup-step-icon,.startup-step.state-error .startup-step-icon{background:rgba(245,158,11,.18);color:#fde68a;animation:none}.startup-foot{color:#9ca3af;font-size:12px;line-height:1.4}
-.shell{min-height:100vh;display:grid;grid-template-rows:auto 1fr}.top{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;padding:18px 22px;border-bottom:1px solid var(--line);background:rgba(8,18,37,.96)}.brand{display:flex;gap:14px;align-items:center}.mark{width:42px;height:42px;border-radius:14px;background:linear-gradient(135deg,var(--accent2),var(--accent));display:grid;place-items:center;font-weight:800}.top h1{margin:0;font-size:22px}.muted{color:var(--muted)}.top-right{display:flex;align-items:flex-start;gap:10px;flex-wrap:wrap;justify-content:flex-end}.alert-menu{position:relative}.alert-menu summary{cursor:pointer;list-style:none}.alert-button{position:relative;width:42px;height:42px;border-radius:999px;border:1px solid rgba(245,158,11,.35);background:rgba(245,158,11,.12);color:#fde68a;font-weight:900;display:grid;place-items:center}.alert-count{position:absolute;top:-6px;right:-6px;min-width:20px;height:20px;padding:0 5px;border-radius:999px;background:#ef4444;color:white;font-size:11px;display:grid;place-items:center}.alert-dropdown{position:absolute;right:0;top:50px;z-index:30;width:min(420px,90vw);padding:12px;border:1px solid var(--line);border-radius:16px;background:rgba(11,18,32,.98);box-shadow:0 18px 44px rgba(0,0,0,.35);display:grid;gap:10px}.alert-item{display:grid;gap:6px;padding:10px;border:1px solid rgba(245,158,11,.22);border-radius:12px;background:rgba(15,23,42,.8)}.alert-title{font-weight:800}.alert-message{font-size:12px;color:var(--muted);line-height:1.35}.pill{display:inline-flex;align-items:center;gap:8px;padding:10px 14px;border:1px solid var(--line);border-radius:999px;background:rgba(17,24,39,.92);font-size:13px}.dot{width:10px;height:10px;border-radius:999px;background:var(--muted)}.running{background:var(--accent2)}.success{background:var(--success)}.warning{background:var(--warn)}.error{background:var(--danger)}.btn{appearance:none;border:0;border-radius:12px;padding:11px 16px;font-weight:700;cursor:pointer;color:#fff;background:linear-gradient(135deg,#2563eb,#1d4ed8)}.btn.soft{background:rgba(30,41,59,.88);border:1px solid var(--line)}.btn.warn{background:linear-gradient(135deg,#ef4444,#dc2626)}.btn.small{padding:8px 12px;border-radius:10px;font-size:13px}.layout{display:grid;grid-template-columns:250px minmax(0,1fr);gap:18px;padding:18px}.panel{background:var(--panel);border:1px solid var(--line);border-radius:20px;overflow:hidden}.sidebar{padding:12px}.nav,.sub{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:12px;border-radius:14px;border:1px solid transparent;background:rgba(15,23,42,.46);color:var(--text);text-decoration:none;margin-bottom:8px}.nav:hover,.sub:hover{border-color:rgba(56,189,248,.25)}.active{background:rgba(37,99,235,.16);border-color:rgba(56,189,248,.35)}details.navgroup summary{list-style:none;cursor:pointer;padding:12px;border-radius:14px;background:rgba(15,23,42,.46);border:1px solid transparent;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center}.sublist{padding-left:10px}.badge{display:inline-flex;align-items:center;justify-content:center;min-width:24px;padding:4px 8px;border-radius:999px;background:rgba(15,23,42,.95);color:var(--muted);border:1px solid var(--line);font-size:12px}.main{display:grid;gap:18px;min-width:0}.flash{padding:12px 14px;border-radius:14px;border:1px solid var(--line);background:rgba(17,24,39,.92)}.hero{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;padding:18px}.hero h2{margin:0 0 6px;font-size:22px}.hero-actions{display:flex;gap:10px;flex-wrap:wrap}.stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;padding:0 18px 18px}.stat{background:var(--panel2);border:1px solid var(--line);border-radius:18px;padding:16px}.stat h3{margin:0;font-size:28px}.stat p{margin:4px 0 0;color:var(--muted)}.head{padding:16px 18px 13px;border-bottom:1px solid var(--line)}.head h3{margin:0;font-size:16px}.head p{margin:4px 0 0;color:var(--muted);font-size:13px}.block{padding:18px}.tablewrap{overflow:auto}.course-table{width:100%;border-collapse:collapse}.course-table th,.course-table td{padding:14px 18px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}.course-table th{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.04em;white-space:nowrap}.course-table td.title-cell{min-width:260px}.status-tag{display:inline-flex;align-items:center;padding:6px 10px;border-radius:999px;border:1px solid var(--line);background:rgba(15,23,42,.7);font-size:12px;white-space:nowrap}.status-tag.ok{border-color:rgba(34,197,94,.35);background:rgba(34,197,94,.12)}.status-tag.due{border-color:rgba(245,158,11,.45);background:rgba(245,158,11,.14)}.status-tag.bad{border-color:rgba(239,68,68,.42);background:rgba(239,68,68,.14)}.status-tag.neutral{border-color:rgba(148,163,184,.2);background:rgba(148,163,184,.08)}.status-tag.later{border-color:rgba(56,189,248,.28);background:rgba(56,189,248,.1)}.recommend{display:flex;justify-content:space-between;align-items:center;gap:12px;margin:0 18px 18px;padding:14px;border:1px solid rgba(56,189,248,.22);border-radius:16px;background:rgba(14,25,45,.9)}.recommend strong{display:block}.compact-actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.upgrade-link{display:inline-flex;margin-left:8px;padding:5px 9px;border-radius:999px;border:1px solid rgba(56,189,248,.32);background:rgba(37,99,235,.18);font-size:12px;font-weight:700}.empty{padding:28px 18px;color:var(--muted)}.grid-two{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.field{display:grid;gap:8px}.field label{font-size:13px;color:var(--muted)}.field input,.field select{width:100%;padding:12px 13px;border-radius:12px;border:1px solid var(--line);background:rgba(10,16,29,.98);color:var(--text)}.checkbox{display:flex;align-items:center;justify-content:flex-start;gap:10px;padding:12px;border-radius:14px;border:1px solid var(--line);background:rgba(10,16,29,.98);text-align:left}.checkbox input[type=checkbox]{width:auto;min-width:18px;height:18px;margin:0;flex:0 0 auto;accent-color:#2563eb}.checkbox span{display:inline-block;line-height:1.2}.checkbox.master{border-color:rgba(56,189,248,.35);background:rgba(37,99,235,.14);font-weight:800}.document-provider-tools{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:8px}.document-provider-grid .checkbox{min-height:48px}.helper{font-size:12px;color:var(--muted)}.stack{display:grid;gap:12px}.provider-card,.zoom-card{background:var(--panel2);border:1px solid var(--line);border-radius:18px;padding:16px;display:grid;gap:12px}.provider-header,.zoom-header{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}.inline-actions{display:flex;gap:8px;flex-wrap:wrap}.danger-text{color:#fecaca}.top-account details{min-width:260px}.top-account summary{cursor:pointer;list-style:none;padding:10px 14px;border:1px solid var(--line);border-radius:16px;background:rgba(17,24,39,.92)}.top-account .dropdown{margin-top:10px;padding:14px;border:1px solid var(--line);border-radius:16px;background:rgba(11,18,32,.98);display:grid;gap:12px;min-width:280px;max-width:340px}.kicker{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em} .footer-note{padding:0 18px 18px;color:var(--muted);font-size:12px}
-@media (max-width:980px){.layout{grid-template-columns:1fr}.stats,.grid-two{grid-template-columns:1fr}.top{flex-direction:column}.top-right{justify-content:flex-start}.top-account details{width:100%}.top-account .dropdown{min-width:0;max-width:none}}
-.field input[type="color"]{height:46px;padding:6px;cursor:pointer}
-.checkbox.linked-setting{opacity:.82}
-.advanced-setup{border:1px solid var(--line);border-radius:14px;padding:12px;background:rgba(10,16,29,.72)}
-.advanced-setup summary{cursor:pointer;font-weight:800}
-.advanced-setup[open] summary{margin-bottom:10px}
-.document-strip{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;padding:0 18px 18px}
-.document-strip div{border:1px solid var(--line);border-radius:14px;background:rgba(10,16,29,.62);padding:12px}
-.document-strip strong{display:block;font-size:22px}
-.document-strip span{color:var(--muted);font-size:12px}
-.expiry-warning-list{margin:0 18px 18px;display:grid;gap:8px}
-.expiry-warning-row{display:flex;justify-content:space-between;gap:12px;align-items:center;border:1px solid rgba(245,158,11,.28);border-radius:12px;background:rgba(113,63,18,.16);padding:10px 12px}
-.expiry-warning-main{display:grid;gap:2px;min-width:0}.expiry-warning-main strong{color:#fff}.expiry-warning-main small{color:#cbd5e1}
-.expiry-warning-row span{color:#fde68a;font-size:13px;white-space:nowrap}
-.certificate-progress{margin:0 18px 18px;border:1px solid rgba(56,189,248,.25);border-radius:16px;background:rgba(14,25,45,.86);padding:14px;display:grid;gap:8px}
-.certificate-progress-top{display:flex;justify-content:space-between;gap:12px;align-items:center}
-.certificate-progress-title{font-weight:800}.certificate-progress-detail{color:var(--muted);font-size:13px}
-.certificate-progress.running .status-tag{border-color:rgba(56,189,248,.38);background:rgba(56,189,248,.13);color:#bae6fd}
-.certificate-progress.idle{opacity:.86}
-.certificate-workspace{position:relative}
-.certificate-workspace.certificate-busy .certificate-progress{display:none}
-.certificate-workspace.certificate-has-attention:not(.certificate-busy) .certificate-progress{display:none}
-.certificate-workspace.certificate-busy .certificate-job-control:disabled{opacity:.55;cursor:not-allowed}
-.certificate-busy-note{display:none;margin:0 18px 18px;border:1px solid rgba(56,189,248,.42);border-radius:16px;background:linear-gradient(135deg,rgba(8,47,73,.92),rgba(15,23,42,.96));padding:16px;color:#dbeafe;box-shadow:0 14px 30px rgba(2,8,23,.22)}
-.certificate-workspace.certificate-busy .certificate-busy-note{display:block}
-.certificate-busy-note-top{display:flex;align-items:center;justify-content:space-between;gap:14px}
-.certificate-busy-main{display:flex;align-items:center;gap:12px}
-.certificate-spinner{width:28px;height:28px;border-radius:999px;border:3px solid rgba(147,197,253,.22);border-top-color:#60a5fa;animation:tmSpin .9s linear infinite;flex:0 0 auto}
-.certificate-busy-title{font-weight:900;color:#fff;font-size:17px}
-.certificate-busy-detail{margin-top:3px;color:#bfdbfe;font-size:13px}
-.certificate-busy-sub{margin-top:12px;color:#d6e4f0;font-size:13px}
-@keyframes tmSpin{to{transform:rotate(360deg)}}
-.certificate-attention{margin:0 18px 18px;border:1px solid rgba(250,204,21,.26);border-radius:14px;background:rgba(113,63,18,.18);padding:14px;display:grid;gap:10px}
-.certificate-attention-title{font-weight:800;color:#fef3c7}
-.certificate-attention-row{display:flex;justify-content:space-between;gap:14px;align-items:center;border-top:1px solid rgba(250,204,21,.16);padding-top:10px}
-.certificate-attention-row:first-of-type{border-top:0;padding-top:0}
-.certificate-attention-row strong{color:#fff}.certificate-attention-row p{margin:3px 0 0;color:#d6e4f0;font-size:13px}
-.certificate-attention-actions{display:flex;flex-wrap:wrap;gap:8px;justify-content:flex-end}
-.certificate-cross-provider{margin-top:10px;border-top:1px solid rgba(250,204,21,.14);padding-top:10px;display:grid;gap:8px}
-.certificate-cross-provider .helper{color:#fde68a}
-.certificate-cross-provider label{display:flex;gap:8px;align-items:flex-start;color:#e2e8f0;font-size:13px;font-weight:700}
-.certificate-cross-provider small{display:block;color:#b6c7d8;font-weight:500;margin-top:2px}
-.provider-chip{display:inline-flex;align-items:center;width:max-content;border-radius:999px;padding:5px 9px;background:rgba(255,255,255,.10);border:1px solid rgba(255,255,255,.16);color:#e2e8f0;font-size:12px;font-weight:800}
-.btn.ghost{background:transparent;border:1px solid rgba(148,163,184,.28);color:#cbd5e1}
-.btn.remove-fobs{background:#fff7ed!important;border:1px solid #fdba74!important;color:#9a3412!important;box-shadow:0 1px 0 rgba(15,23,42,.04);white-space:nowrap}
-.btn.remove-fobs:hover{background:#ffedd5!important;border-color:#fb923c!important;color:#7c2d12!important}
-.btn.remove-fobs:disabled{background:#f1f5f9!important;border-color:#cbd5e1!important;color:#94a3b8!important;box-shadow:none}
-.provider-delete-progress{display:none;margin-top:8px;width:180px;max-width:100%;height:7px;border-radius:999px;background:#e2e8f0;overflow:hidden;border:1px solid rgba(15,23,42,.08)}
-.provider-delete-progress i{display:block;width:42%;height:100%;border-radius:999px;background:#38bdf8;animation:tmSlide 1.05s infinite ease-in-out}
-.provider-certificate-delete-form.is-working .provider-delete-progress{display:block}
-.provider-certificate-delete-form.is-working .btn.remove-fobs{background:#eff6ff!important;border-color:#93c5fd!important;color:#1e3a8a!important}
-.provider-delete-cancel{display:none;margin-top:7px;background:#f8fafc!important;border:1px solid #cbd5e1!important;color:#334155!important}
-.provider-certificate-delete-form.is-working .provider-delete-cancel{display:inline-flex}
-@keyframes tmSlide{0%{transform:translateX(-120%)}50%{transform:translateX(90%)}100%{transform:translateX(250%)}}
-.cert-more summary{list-style:none;cursor:pointer}.cert-more summary::-webkit-details-marker{display:none}.cert-more[open] summary{margin-bottom:8px}
-.nav-alert{display:inline-flex;align-items:center;justify-content:center;min-width:18px;height:18px;margin-left:6px;border-radius:999px;background:rgba(250,204,21,.18);border:1px solid rgba(250,204,21,.42);color:#fde68a;font-size:12px;font-weight:900}
-.add-document-drawer{margin:0 18px 18px;border:1px solid var(--line);border-radius:16px;background:rgba(10,16,29,.58)}
-.add-document-drawer summary{cursor:pointer;list-style:none;padding:14px 16px;display:flex;justify-content:space-between;align-items:center;font-weight:800}
-.add-document-drawer form{padding:0 16px 16px}
-.document-panel .tablewrap{overflow:visible}
-.document-panel .course-table,.document-panel .course-table tbody{display:block;width:100%}
-.document-panel .course-table thead{display:none}
-.document-panel .course-table tr{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center;padding:14px 18px;border-bottom:1px solid var(--line)}
-.document-panel .course-table td{display:block;border:0;padding:0}
-.document-panel .course-table td:nth-child(3){grid-column:1;color:var(--muted);font-size:12px}
-.document-panel .course-table td:nth-child(4){grid-column:1 / -1;display:none}
-.document-panel .course-table td:nth-child(5){grid-column:2;grid-row:1 / span 2}
-.compact-checklist{padding:0}
-.compact-checklist summary{cursor:pointer;list-style:none}
-.compact-checklist .provider-header{padding:14px 20px;align-items:center}
-.compact-checklist .document-requirement-grid{padding-top:12px}
-.cert-provider-card{position:relative}
-.cert-provider-card[open]>.provider-refresh-form{position:absolute;top:9px;right:104px;margin:0;z-index:2}
-.cert-provider-card[open]>.provider-refresh-form .btn{white-space:nowrap}
-.document-provider-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.document-provider-grid .checkbox.is-disabled{opacity:.58;background:rgba(148,163,184,.14);cursor:not-allowed}.document-provider-grid .checkbox.is-disabled span{color:var(--muted)}
-/* Certificates page readability polish: page-scoped colours only, no behaviour changes */
-.certificate-panel{background:linear-gradient(180deg,rgba(13,27,52,.96),rgba(11,18,32,.94));border-color:rgba(125,211,252,.20);box-shadow:0 16px 36px rgba(0,0,0,.16)}
-.certificate-panel .hero{background:linear-gradient(135deg,rgba(14,116,144,.16),rgba(37,99,235,.08));border-bottom:1px solid rgba(125,211,252,.16)}
-.certificate-panel .hero h2,.certificate-panel .head h3{font-size:22px;color:#f8fafc;letter-spacing:.01em}
-.certificate-panel .hero .muted,.certificate-panel .head p{color:#bcd7f5;font-size:15px;line-height:1.45}
-.certificate-dashboard-panel .document-strip{padding-top:18px;border-top:1px solid rgba(125,211,252,.08)}
-.certificate-dashboard-panel .document-strip div{background:linear-gradient(180deg,rgba(15,52,85,.58),rgba(10,16,29,.84));border-color:rgba(125,211,252,.18);box-shadow:inset 0 1px 0 rgba(255,255,255,.035)}
-.certificate-dashboard-panel .document-strip strong{color:#ffffff;font-size:25px;line-height:1.05}
-.certificate-dashboard-panel .document-strip span{color:#bfd3e8;font-size:13px}
-.certificate-progress{background:linear-gradient(135deg,rgba(8,47,73,.78),rgba(15,23,42,.88));border-color:rgba(56,189,248,.36)}
-.certificate-progress-title{color:#f8fafc;font-size:16px}.certificate-progress-detail{color:#c4d9ee}
-.add-document-drawer{background:linear-gradient(180deg,rgba(15,23,42,.82),rgba(10,16,29,.88));border-color:rgba(148,163,184,.22)}
-.add-document-drawer summary{font-size:17px;color:#f8fafc}.add-document-drawer[open] summary{border-bottom:1px solid rgba(148,163,184,.16);margin-bottom:14px}
-.document-provider-tools{background:rgba(8,47,73,.26);border:1px solid rgba(125,211,252,.18);border-radius:14px;padding:10px 12px}
-.checkbox{background:rgba(15,23,42,.86);border-color:rgba(148,163,184,.20)}.checkbox.master{background:rgba(14,116,144,.28);border-color:rgba(125,211,252,.36)}
-.certificate-fobs-panel>.head{background:linear-gradient(135deg,rgba(14,116,144,.18),rgba(37,99,235,.06));border-bottom-color:rgba(125,211,252,.16)}
-.certificate-fobs-panel .block{background:rgba(8,13,25,.18)}
-.cert-provider-card{background:linear-gradient(180deg,rgba(15,23,42,.92),rgba(10,16,29,.92));border-color:rgba(125,211,252,.17)}
-.cert-provider-card summary.provider-header{padding:4px 4px 2px}.cert-provider-card summary.provider-header strong{font-size:18px;color:#ffffff}.cert-provider-card[open]{border-color:rgba(56,189,248,.35);box-shadow:0 0 0 1px rgba(56,189,248,.06)}
-.cert-provider-card .status-tag{background:rgba(30,64,106,.42);border-color:rgba(147,197,253,.28);color:#dbeafe}
-.certificate-fobs-panel .course-table th{color:#bfdbfe;background:rgba(8,47,73,.24);border-bottom-color:rgba(125,211,252,.18)}
-.certificate-fobs-panel .course-table td{border-bottom-color:rgba(148,163,184,.14)}
-.certificate-fobs-panel .course-table tbody tr:hover{background:rgba(14,116,144,.10)}
-
-/* Simple certificates page readability polish */
-.certificate-dashboard-panel .document-strip{grid-template-columns:repeat(2,minmax(0,1fr));max-width:760px}
-.certificate-dashboard-panel .document-strip div{background:rgba(15,23,42,.82);border-color:rgba(148,163,184,.20)}
-.certificate-fobs-panel{background:#f3f7fb;color:#102033;border-color:rgba(15,23,42,.14);box-shadow:0 14px 38px rgba(0,0,0,.16)}
-.certificate-fobs-panel>.fobs-head{background:linear-gradient(180deg,#ffffff,#eef6ff);border-bottom:1px solid rgba(15,23,42,.12)}
-.certificate-fobs-panel>.fobs-head h3{color:#0f172a;font-size:24px}
-.certificate-fobs-panel>.fobs-head p{color:#475569;font-size:15px}
-.certificate-fobs-panel .block{background:#f3f7fb;padding:20px 22px}
-.cert-provider-card{background:#ffffff!important;border:2px solid color-mix(in srgb, var(--provider-color) 38%, #dbeafe)!important;border-radius:18px;box-shadow:0 8px 20px rgba(15,23,42,.07);overflow:hidden}
-.cert-provider-card+.cert-provider-card{margin-top:8px}
-.cert-provider-card summary.provider-header{padding:18px 20px!important;align-items:center;cursor:pointer;list-style:none;background:linear-gradient(90deg,color-mix(in srgb, var(--provider-color) 13%, white),#ffffff)}
-.cert-provider-card summary.provider-header::-webkit-details-marker{display:none}
-.provider-summary-main{display:flex;align-items:center;gap:14px;min-width:0}
-.provider-colour-dot{width:18px;height:18px;border-radius:999px;background:var(--provider-color);box-shadow:0 0 0 4px color-mix(in srgb, var(--provider-color) 16%, transparent)}
-.cert-provider-card summary.provider-header strong{display:block;color:#0f172a!important;font-size:22px!important;line-height:1.15}
-.provider-summary-helper{display:block;color:#64748b;font-size:13px;margin-top:3px}
-.provider-summary-right{display:flex;align-items:center;gap:10px;flex-shrink:0}
-.cert-provider-card .status-tag{background:#ffffff!important;border-color:rgba(15,23,42,.16)!important;color:#0f172a!important;font-weight:800;font-size:14px;padding:8px 12px}
-.expand-word{display:inline-flex;align-items:center;gap:6px;border-radius:999px;padding:8px 12px;background:color-mix(in srgb, var(--provider-color) 14%, #ffffff);color:#0f172a;border:1px solid color-mix(in srgb, var(--provider-color) 30%, #cbd5e1);font-weight:800;font-size:13px}
-.expand-word::after{content:'v';font-size:10px;color:var(--provider-color)}
-.cert-provider-card[open] .expand-word{background:var(--provider-color);color:#fff;border-color:var(--provider-color)}
-.cert-provider-card[open] .expand-word::after{content:'^';color:#fff}
-.cert-provider-card[open]{box-shadow:0 12px 28px rgba(15,23,42,.12);border-color:var(--provider-color)!important}
-.cert-provider-card[open]>.provider-refresh-form{position:static!important;margin:0 20px 16px!important;padding-top:0;z-index:auto}
-.cert-provider-card[open]>.provider-refresh-form .btn{background:color-mix(in srgb, var(--provider-color) 16%, #ffffff);border:1px solid color-mix(in srgb, var(--provider-color) 38%, #cbd5e1);color:#0f172a}
-.certificate-fobs-panel .tablewrap{margin:0 20px 20px;border:1px solid rgba(15,23,42,.12);border-radius:16px;background:#fff;box-shadow:inset 4px 0 0 var(--provider-color)}
-.certificate-fobs-panel .course-table th{color:#475569!important;background:#f8fafc!important;border-bottom-color:rgba(15,23,42,.12)!important}
-.certificate-fobs-panel .course-table td{color:#0f172a;border-bottom-color:rgba(15,23,42,.10)!important}
-.certificate-fobs-panel .course-table td strong{color:#0f172a}
-.certificate-fobs-panel .course-table tbody tr:hover{background:color-mix(in srgb, var(--provider-color) 7%, #ffffff)!important}
-.certificate-fobs-panel .helper{color:#64748b}
-.certificate-fobs-panel .empty{color:#64748b;background:#fff;margin:0 20px 20px;border-radius:14px;border:1px dashed rgba(15,23,42,.18)}
-@media (max-width:720px){.certificate-dashboard-panel .document-strip{grid-template-columns:1fr}.provider-summary-right{align-items:flex-end;flex-direction:column}.cert-provider-card summary.provider-header strong{font-size:19px!important}}
-@media (max-width:720px){.certificate-attention-row{align-items:flex-start;flex-direction:column}.certificate-attention-actions{justify-content:flex-start}}
-
-
-/* Softer final certificates FOBS section: clear, but not bright */
-.certificate-fobs-panel{background:#dbe7f2!important;color:#102033!important;border-color:rgba(96,165,250,.20)!important;box-shadow:0 12px 30px rgba(2,8,23,.20)!important}
-.certificate-fobs-panel>.fobs-head{background:linear-gradient(180deg,#eaf2fb,#dbe7f2)!important;border-bottom:1px solid rgba(15,23,42,.14)!important}
-.certificate-fobs-panel>.fobs-head h3{color:#0f172a!important}
-.certificate-fobs-panel>.fobs-head p{color:#334155!important}
-.certificate-fobs-panel .block{background:#dbe7f2!important;padding:18px 20px!important}
-.cert-provider-card{background:#eef4fa!important;border:1px solid color-mix(in srgb, var(--provider-color) 30%, #b8c7d8)!important;border-radius:16px!important;box-shadow:0 5px 14px rgba(15,23,42,.09)!important}
-.cert-provider-card+.cert-provider-card{margin-top:10px!important}
-.cert-provider-card summary.provider-header{padding:16px 18px!important;background:linear-gradient(90deg,color-mix(in srgb, var(--provider-color) 9%, #eef4fa),#eef4fa)!important}
-.provider-colour-dot{width:15px!important;height:15px!important;box-shadow:0 0 0 4px color-mix(in srgb, var(--provider-color) 11%, transparent)!important}
-.cert-provider-card summary.provider-header strong{font-size:20px!important;color:#0f172a!important}
-.provider-summary-helper{color:#475569!important;font-size:13px!important}
-.cert-provider-card .status-tag{background:#f8fafc!important;border-color:rgba(15,23,42,.14)!important;color:#0f172a!important}
-.expand-word{background:color-mix(in srgb, var(--provider-color) 10%, #f8fafc)!important;border-color:color-mix(in srgb, var(--provider-color) 25%, #cbd5e1)!important;color:#0f172a!important}
-.cert-provider-card[open] .expand-word{background:color-mix(in srgb, var(--provider-color) 75%, #334155)!important;color:#fff!important;border-color:transparent!important}
-.cert-provider-card[open]{border-color:color-mix(in srgb, var(--provider-color) 55%, #94a3b8)!important;box-shadow:0 8px 22px rgba(15,23,42,.13)!important}
-.certificate-fobs-panel .tablewrap{background:#f8fafc!important;border-color:rgba(15,23,42,.13)!important;box-shadow:inset 4px 0 0 color-mix(in srgb, var(--provider-color) 65%, #94a3b8)!important}
-.certificate-fobs-panel .course-table th{background:#eef2f7!important;color:#334155!important}
-.certificate-fobs-panel .course-table td{background:#f8fafc!important;color:#0f172a!important}
-.certificate-fobs-panel .course-table tbody tr:hover td{background:color-mix(in srgb, var(--provider-color) 6%, #f8fafc)!important}
-
-.document-requirement-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
-.document-requirement{display:flex;justify-content:space-between;gap:10px;align-items:center;border:1px solid var(--line);border-radius:12px;padding:10px;background:rgba(10,16,29,.58)}
-@media (max-width:720px){.document-provider-grid,.document-requirement-grid,.document-strip{grid-template-columns:1fr}.document-panel .course-table tr{grid-template-columns:1fr}.document-panel .course-table td:nth-child(5){grid-column:1;grid-row:auto}.cert-provider-card[open]>.provider-refresh-form{position:static;margin:0 20px 12px}.compact-checklist .provider-header{padding:14px 16px}}
-
-.live-status-panel{margin-top:18px}
-.live-status-panel details summary{list-style:none;cursor:pointer;padding:16px 18px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--line)}
-.live-status-panel details summary::-webkit-details-marker{display:none}
-.live-status-body{padding:18px;display:grid;gap:14px}
-.live-status-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}
-.live-status-card{background:var(--panel2);border:1px solid var(--line);border-radius:14px;padding:13px;min-height:78px}
-.live-status-card strong{display:block;font-size:12px;color:var(--muted);margin-bottom:6px}
-.live-status-card div{font-size:15px;line-height:1.35}
-.live-status-list{display:grid;gap:8px}
-.live-status-row{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;padding:10px 12px;border:1px solid var(--line);border-radius:12px;background:rgba(15,23,42,.55)}
-.live-status-row span:first-child{color:#dbeafe}
-.live-status-row span:last-child{color:var(--muted);text-align:right}
-.live-status-note{font-size:12px;color:var(--muted)}
-@media (max-width:980px){.live-status-grid{grid-template-columns:1fr}.live-status-row{display:grid}.live-status-row span:last-child{text-align:left}}
-
-
-.scan-form{display:flex;gap:8px;flex-wrap:wrap;align-items:end;justify-content:flex-end}
-.scan-field{display:grid;gap:5px}
-.scan-field label{font-size:11px;color:var(--muted)}
-.scan-field select{padding:9px 10px;border-radius:10px;border:1px solid var(--line);background:rgba(10,16,29,.98);color:var(--text);min-width:130px}
-.status-tag.ok{border-color:rgba(34,197,94,.35);background:rgba(34,197,94,.12);color:#bbf7d0}
-.status-tag.due{border-color:rgba(245,158,11,.35);background:rgba(245,158,11,.12);color:#fde68a}
-.status-tag.neutral{border-color:rgba(148,163,184,.35);background:rgba(148,163,184,.12);color:#e5e7eb}
-.status-tag.bad{border-color:rgba(239,68,68,.35);background:rgba(239,68,68,.12);color:#fecaca}
-
-
-.calendar-toolbar{display:flex;gap:8px 14px;align-items:center;flex-wrap:wrap;margin:0 0 14px;color:#aab8cf;font-size:13px}
-.cal-dot{width:10px;height:10px;border-radius:999px;display:inline-block}
-.cal-dot.ok{background:#16a34a}.cal-dot.due{background:#f59e0b}.cal-dot.later{background:#64748b}.cal-dot.attention{background:#dc2626}
-#tmCalendar{background:#0f172a;border:1px solid #25324a;border-radius:18px;padding:12px;min-height:680px}
-.fc{color:#e5edf8}
-.fc .fc-toolbar-title{font-size:22px;font-weight:800;color:#f8fafc}
-.fc .fc-button{border-radius:999px!important;border:0!important;background:#2563eb!important}
-.fc .fc-button-primary:not(:disabled).fc-button-active{background:#1e40af!important}
-.fc .fc-daygrid-day-number{color:#dbeafe;text-decoration:none}
-.fc .fc-col-header-cell{background:#eaf2ff!important}
-.fc .fc-col-header-cell-cushion{color:#0f172a!important;text-decoration:none;font-weight:800}
-.fc .fc-list-day-cushion{background:#eaf2ff!important}
-.fc .fc-list-day-text,.fc .fc-list-day-side-text,.fc .fc-list-day-cushion a{color:#0f172a!important;text-decoration:none;font-weight:800}
-.fc .fc-daygrid-day{background:#111827}
-.fc .fc-day-today{background:#172554!important}
-.fc-theme-standard td,.fc-theme-standard th,.fc-theme-standard .fc-scrollgrid{border-color:#25324a!important}
-.fc-event{border:1px solid transparent!important;border-radius:10px!important;padding:2px 4px!important;cursor:pointer}
-.tm-cal-provider-event{box-shadow:none}
-.tm-cal-ok,.tm-cal-due,.tm-cal-later,.tm-cal-attention,.tm-cal-neutral{box-shadow:none}
-.course-modal{position:fixed;inset:0;background:rgba(2,6,23,.62);display:none;align-items:center;justify-content:center;padding:20px;z-index:9999}
-.course-modal.open{display:flex}
-.course-modal-card{background:#0f172a;color:#f8fafc;border:1px solid #25324a;border-radius:24px;box-shadow:0 24px 80px rgba(0,0,0,.45);padding:24px;max-width:560px;width:100%;position:relative}
-.modal-close{position:absolute;right:18px;top:14px;border:0;background:#1e293b;color:#f8fafc;border-radius:999px;width:32px;height:32px;font-size:22px;cursor:pointer}
-.modal-meta{display:flex;gap:12px;color:#aab8cf;margin:8px 0 14px}
-.advice-box{background:#111827;border:1px solid #25324a;border-radius:16px;padding:14px;margin-top:16px}
-.advice-box p{margin:6px 0 0;color:#cbd5e1}
-
-.fc-event{white-space:normal!important;overflow:visible!important}
-.fc-daygrid-event{align-items:flex-start!important}
-.tm-cal-event{display:grid;gap:1px;line-height:1.18;white-space:normal;overflow-wrap:anywhere;max-width:100%}
-.tm-cal-time{font-size:11px;font-weight:800;opacity:.9}
-.tm-cal-title{font-size:12px;font-weight:700}
-.tm-cal-provider{font-size:10px;opacity:.82}
-.modal-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin:12px 0}
-.modal-field{border:1px solid #25324a;border-radius:14px;background:#111827;padding:10px}
-.modal-field span{display:block;color:#94a3b8;font-size:11px;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px}
-.modal-field strong{display:block;color:#f8fafc;font-size:14px;overflow-wrap:anywhere}
-.modal-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:16px}
-.modal-actions .btn.disabled{opacity:.45;pointer-events:none}
-.launch-status{min-height:20px;margin:10px 0 0;color:#bfdbfe;font-size:13px;line-height:1.35}
-.launch-status.warn{color:#fde68a}
-.launch-status.error{color:#fecaca}
-
-.tm-progress-bubble{position:fixed;right:16px;bottom:16px;width:min(380px,calc(100vw - 32px));z-index:9999;border:1px solid var(--line);border-radius:18px;background:#0f172a;box-shadow:0 18px 45px rgba(0,0,0,.5);overflow:hidden}
-.tm-progress-bubble summary{list-style:none;cursor:pointer;display:grid;grid-template-columns:34px minmax(0,1fr) auto;gap:4px 12px;align-items:center;padding:12px 14px;min-width:0}
-.tm-progress-bubble summary::-webkit-details-marker{display:none}
-.tm-progress-icon{width:34px;height:34px;grid-row:1 / span 2;border-radius:999px;display:grid;place-items:center;background:#1d4ed8;color:#fff;font-weight:900}
-.tm-progress-main{min-width:0;display:block}.tm-progress-title{display:block;font-size:15px;line-height:1.2;font-weight:800;color:#f8fafc;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tm-progress-subtitle{display:block;grid-column:2 / -1;font-size:12px;line-height:1.25;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:1px}
-.tm-progress-state{justify-self:end;align-self:center;font-size:11px;color:#bfdbfe;background:rgba(37,99,235,.18);border:1px solid rgba(96,165,250,.28);padding:4px 8px;border-radius:999px}
-.tm-progress-body{border-top:1px solid var(--line);padding:12px 14px 14px;display:grid;gap:10px;max-height:320px;overflow:auto;background:#0b1220}
-.tm-progress-step{display:grid;grid-template-columns:18px minmax(0,1fr);gap:8px;align-items:start;color:#dbeafe;font-size:13px;line-height:1.35}.tm-progress-step i{width:10px;height:10px;border-radius:999px;background:#60a5fa;margin-top:4px}.tm-progress-step span{min-width:0;overflow-wrap:anywhere}.tm-progress-step small{display:block;color:#9ca8bb;font-size:12px;line-height:1.35;margin-top:2px;overflow-wrap:anywhere}
-.tm-progress-bubble.idle .tm-progress-icon{background:#475569}.tm-progress-bubble.running .tm-progress-icon{animation:tmPulse 1.2s infinite}.tm-progress-bubble.error .tm-progress-icon{background:#991b1b}
-.tm-sync-overlay{position:fixed;inset:0;z-index:9998;display:none;align-items:center;justify-content:center;background:rgba(8,18,32,.42);backdrop-filter:blur(2px);pointer-events:none}.tm-sync-overlay.is-visible{display:flex}.tm-sync-overlay-card{display:flex;align-items:center;gap:14px;padding:18px 22px;border-radius:22px;background:rgba(15,23,42,.92);border:1px solid rgba(125,211,252,.34);box-shadow:0 24px 70px rgba(0,0,0,.42);color:#f8fafc;max-width:min(520px,calc(100vw - 36px))}.tm-sync-overlay-spinner{width:34px;height:34px;border-radius:999px;border:4px solid rgba(147,197,253,.25);border-top-color:#60a5fa;animation:tmSpin .85s linear infinite;flex:0 0 auto}.tm-sync-overlay-title{font-weight:900;font-size:17px}.tm-sync-overlay-detail{display:block;font-size:13px;color:#bfdbfe;margin-top:3px}
-.setup-list{display:grid;gap:12px}
-.setup-provider{border:1px solid var(--line);border-radius:14px;background:rgba(15,23,42,.56);padding:14px;display:grid;gap:12px}
-.setup-provider-main{display:flex;align-items:center;justify-content:space-between;gap:12px}
-.setup-provider-title{display:flex;align-items:center;gap:10px;font-weight:800;color:#f8fafc}
-.setup-provider-title input{width:18px;height:18px}
-.setup-provider-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
-.setup-provider.disabled{opacity:.58}
-.setup-checklist{display:grid;gap:9px;margin-top:14px}
-.setup-checklist div{display:flex;align-items:center;gap:8px;color:#dbeafe}
-.setup-checklist b{display:grid;place-items:center;width:22px;height:22px;border-radius:999px;background:rgba(37,99,235,.18);border:1px solid rgba(96,165,250,.28);color:#bfdbfe}
-.manual-provider-field{display:none}
-form:has(#provider_preset option[value="manual"]:checked) .manual-provider-field{display:grid!important}
-.dashboard-home{display:grid;gap:18px}
-.tm-hero-board{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(300px,.8fr);gap:16px;align-items:stretch}
-.tm-ready-panel{border:1px solid rgba(125,211,252,.18);border-radius:22px;background:linear-gradient(135deg,rgba(15,23,42,.94),rgba(12,28,48,.90));padding:22px;display:grid;gap:18px;min-width:0}
-.tm-ready-panel.ready{border-color:rgba(34,197,94,.28);background:linear-gradient(135deg,rgba(12,35,35,.96),rgba(14,42,58,.88))}
-.tm-ready-panel.attention{border-color:rgba(245,158,11,.32);background:linear-gradient(135deg,rgba(42,30,13,.96),rgba(28,35,52,.88))}
-.tm-ready-panel.running{border-color:rgba(96,165,250,.34)}
-.tm-ready-top{display:flex;justify-content:space-between;gap:14px;align-items:flex-start}
-.tm-ready-label{display:inline-flex;align-items:center;gap:8px;width:max-content;border-radius:999px;padding:7px 11px;background:rgba(148,163,184,.12);border:1px solid rgba(148,163,184,.18);font-size:12px;font-weight:900;text-transform:uppercase;letter-spacing:.04em;color:#dbeafe}
-.tm-ready-dot{width:10px;height:10px;border-radius:999px;background:#22c55e}.tm-ready-panel.attention .tm-ready-dot{background:#f59e0b}.tm-ready-panel.running .tm-ready-dot{background:#60a5fa;animation:tmPulse 1.2s infinite}
-.tm-ready-panel h2{margin:0;color:#fff;font-size:34px;line-height:1.05;letter-spacing:0}.tm-ready-panel p{margin:0;color:#cbd5e1;line-height:1.45;max-width:720px}
-.tm-quick-actions{display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end}.tm-quick-actions .scan-form{display:flex;flex-wrap:wrap;gap:10px;align-items:end}.tm-quick-actions .scan-field{min-width:155px}.tm-quick-actions label{font-size:12px;color:#a8c4e8;margin-bottom:5px}.tm-quick-actions select{min-height:41px}
-.tm-metric-row{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}.tm-metric{border:1px solid rgba(148,163,184,.14);border-radius:16px;background:rgba(2,6,23,.22);padding:13px;min-width:0}.tm-metric strong{display:block;font-size:24px;color:#fff;line-height:1}.tm-metric span{display:block;margin-top:5px;color:#aeb9c8;font-size:12px}
-.tm-next-panel{border:1px solid rgba(148,163,184,.16);border-radius:22px;background:rgba(15,23,42,.82);padding:18px;display:grid;gap:14px;min-width:0}
-.tm-panel-title{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}.tm-panel-title h3{margin:0;color:#fff;font-size:18px}.tm-panel-title p{margin:4px 0 0;color:#9ca3af;font-size:13px}.tm-panel-title a{color:#bfdbfe;font-size:13px;font-weight:800}
-.tm-timeline{display:grid;gap:10px}.tm-course-card{display:grid;grid-template-columns:52px minmax(0,1fr) auto;gap:12px;align-items:center;border:1px solid rgba(148,163,184,.12);border-radius:16px;background:rgba(8,13,25,.46);padding:12px;min-width:0}.tm-course-time{display:grid;place-items:center;min-height:50px;border-radius:14px;background:rgba(37,99,235,.16);border:1px solid rgba(96,165,250,.22);color:#dbeafe;font-weight:900}.tm-course-main{min-width:0}.tm-course-main strong{display:block;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tm-course-main span{display:block;color:#aeb9c8;font-size:13px;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tm-provider-dot{display:inline-block;width:9px;height:9px;border-radius:99px;margin-right:6px;vertical-align:middle}
-.tm-dashboard-grid{display:grid;grid-template-columns:minmax(0,1.05fr) minmax(320px,.72fr);gap:18px}.tm-section{border:1px solid rgba(148,163,184,.16);border-radius:20px;background:rgba(15,23,42,.74);padding:18px;min-width:0}.tm-section + .tm-section{margin-top:18px}
-.tm-recommend-card{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:16px;align-items:center;border:1px solid rgba(56,189,248,.24);border-radius:20px;background:linear-gradient(135deg,rgba(8,47,73,.34),rgba(15,23,42,.78));padding:18px}.tm-recommend-card strong{display:block;color:#fff;font-size:18px}.tm-recommend-card .helper{margin-top:6px}
-.tm-provider-health{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px}.tm-provider-tile{border:1px solid rgba(148,163,184,.14);border-radius:16px;background:rgba(8,13,25,.38);padding:13px;display:grid;gap:8px;min-width:0}.tm-provider-name{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:10px;color:#fff;font-weight:850}.tm-provider-name span:first-child{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tm-chip{display:inline-flex;width:max-content;align-items:center;border-radius:999px;padding:5px 9px;font-size:12px;font-weight:850;border:1px solid rgba(148,163,184,.18);background:rgba(148,163,184,.10);color:#dbeafe;white-space:nowrap;flex-shrink:0}.tm-chip.ok{border-color:rgba(34,197,94,.24);background:rgba(34,197,94,.12);color:#bbf7d0}.tm-chip.warn{border-color:rgba(245,158,11,.28);background:rgba(245,158,11,.12);color:#fde68a}.tm-chip.neutral{color:#cbd5e1}
-.tm-items-list{display:grid;gap:10px}.tm-check-item{border:1px solid rgba(245,158,11,.22);border-radius:16px;background:rgba(42,30,13,.18);padding:13px}.tm-check-item strong{display:block;color:#fff}.tm-check-item p{margin:5px 0 0;color:#cbd5e1;font-size:13px;line-height:1.35}
-.tm-mini-calendar{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:6px}.tm-mini-day{min-height:64px;border:1px solid rgba(148,163,184,.12);border-radius:12px;background:rgba(8,13,25,.34);padding:7px;display:grid;align-content:start;gap:5px}.tm-mini-day b{font-size:12px;color:#cbd5e1}.tm-mini-event{height:7px;border-radius:999px;background:#2563eb}
-.tm-activity-list{display:grid;gap:10px}.tm-activity-row{border-left:3px solid #38bdf8;padding:4px 0 4px 10px}.tm-activity-row strong{display:block;color:#f8fafc;font-size:14px}.tm-activity-row span{display:block;color:#9ca3af;font-size:12px;line-height:1.35;margin-top:2px}
-.tm-table-disclosure summary{cursor:pointer;list-style:none;display:flex;justify-content:space-between;gap:12px;align-items:center}.tm-table-disclosure summary::-webkit-details-marker{display:none}
-.dashboard-home{color:#172033}
-.dashboard-home .helper,.dashboard-home .tm-panel-title p{color:#64748b}
-.dashboard-home .empty{background:#eef4fb;color:#475569;border-color:rgba(15,23,42,.10)}
-.tm-ready-panel{background:radial-gradient(circle at 16% 12%,rgba(224,242,254,.48),transparent 30%),radial-gradient(circle at 82% 18%,rgba(219,234,254,.34),transparent 32%),linear-gradient(135deg,#0891b2 0%,#0ea5e9 48%,#2563eb 100%);border:0;box-shadow:0 22px 55px rgba(14,165,233,.22)}
-.tm-ready-panel.ready{background:radial-gradient(circle at 16% 12%,rgba(224,242,254,.56),transparent 30%),radial-gradient(circle at 82% 18%,rgba(219,234,254,.38),transparent 32%),linear-gradient(135deg,#0891b2 0%,#0ea5e9 48%,#2563eb 100%);border:0}
-.tm-ready-panel.attention{background:radial-gradient(circle at 16% 12%,rgba(255,251,235,.40),transparent 30%),linear-gradient(135deg,#f59e0b 0%,#14b8a6 52%,#2563eb 100%);border:0}
-.tm-ready-panel h2{font-size:38px}.tm-ready-panel p{color:#e0f2fe;font-size:16px}
-.tm-ready-label{background:rgba(255,255,255,.18);border-color:rgba(255,255,255,.20);color:#fff}.tm-ready-panel .tm-chip{background:rgba(255,255,255,.16);border-color:rgba(255,255,255,.22);color:#fff}
-.tm-metric{background:rgba(255,255,255,.14);border-color:rgba(255,255,255,.16)}.tm-metric span{color:#dbeafe}
-.tm-next-panel,.tm-section,.tm-recommend-card{background:#f8fbff;border:1px solid rgba(15,23,42,.10);box-shadow:0 14px 35px rgba(15,23,42,.08);color:#172033}
-.tm-panel-title h3,.tm-recommend-card strong,.tm-provider-name,.tm-course-main strong,.tm-activity-row strong{color:#0f172a}
-.tm-panel-title a{color:#1d4ed8}
-.tm-course-card{background:#ffffff;border-color:rgba(15,23,42,.08);box-shadow:0 6px 18px rgba(15,23,42,.05)}
-.tm-course-main span{color:#475569}.tm-course-time{background:#e8f1ff;border-color:#bfdbfe;color:#1e3a8a}
-.tm-recommend-card{background:linear-gradient(135deg,#eef8ff,#f8fbff);border-color:#bfdbfe}
-.tm-provider-tile{background:#ffffff;border-color:rgba(15,23,42,.09);box-shadow:0 6px 18px rgba(15,23,42,.04)}
-.tm-check-item{background:#fff8e8;border-color:#fde68a}.tm-check-item strong{color:#172033}.tm-check-item p{color:#475569}
-.tm-mini-day{background:#ffffff;border-color:rgba(15,23,42,.09)}.tm-mini-day b{color:#334155}
-.tm-activity-row strong{color:#172033}.tm-activity-row span{color:#64748b}
-.tm-table-disclosure strong{color:#0f172a}
-
-/* Concept 1 shared app polish */
-body{background:linear-gradient(180deg,#091528 0,#0d1d35 106px,#eef5f9 106px,#eef5f9 100%);color:#203047}
-.top{background:rgba(9,21,40,.96);border-bottom:1px solid rgba(125,211,252,.16);box-shadow:0 12px 32px rgba(2,6,23,.18)}
-.top h1{color:#f8fafc}.top .muted{color:#bcd7f5}
-.mark{background:linear-gradient(135deg,#14b8a6,#2563eb);box-shadow:0 10px 24px rgba(20,184,166,.22)}
-.layout{align-items:start;padding:20px;gap:20px;min-height:calc(100vh - 107px);background:linear-gradient(180deg,#e8f2f8,#edf5f9)}
-.sidebar{position:sticky;top:18px;background:rgba(11,24,44,.92);border-color:rgba(125,211,252,.16);box-shadow:0 18px 44px rgba(2,6,23,.18)}
-.sidebar.panel{background:rgba(11,24,44,.92);border-color:rgba(125,211,252,.16)}
-.sidebar .muted{color:#bcd7f5}
-.nav,.sub,details.navgroup summary{border-radius:16px;background:transparent;border-color:transparent;color:#dbeafe}
-.nav-left{display:flex;align-items:center;gap:11px;min-width:0}.nav-left span:last-child{min-width:0;overflow:hidden;text-overflow:ellipsis}
-.nav-icon{width:22px;height:22px;border-radius:8px;display:inline-grid;place-items:center;flex:0 0 auto;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.12);position:relative}
-.nav-icon:before,.nav-icon:after{content:"";position:absolute;box-sizing:border-box}
-.nav-icon-dashboard:before{width:10px;height:10px;border-radius:3px;border:2px solid currentColor;opacity:.9}.nav-icon-dashboard:after{width:4px;height:4px;border-radius:2px;background:currentColor;right:4px;bottom:4px}
-.nav-icon-providers:before{width:12px;height:8px;border-radius:999px 999px 4px 4px;border:2px solid currentColor;top:5px}.nav-icon-providers:after{width:16px;height:5px;border-radius:999px;border:2px solid currentColor;bottom:4px}
-.nav-icon-manage:before{width:12px;height:12px;border-radius:4px;border:2px solid currentColor}.nav-icon-manage:after{width:7px;height:2px;background:currentColor;transform:rotate(45deg);right:3px;bottom:5px;border-radius:2px}
-.nav-icon-zoom:before{width:13px;height:9px;border-radius:4px;border:2px solid currentColor;left:4px}.nav-icon-zoom:after{width:6px;height:7px;border:2px solid currentColor;border-left:0;right:2px;border-radius:0 3px 3px 0}
-.nav-icon-sync:before{width:13px;height:13px;border-radius:999px;border:2px solid currentColor;border-right-color:transparent}.nav-icon-sync:after{width:5px;height:5px;border-top:2px solid currentColor;border-right:2px solid currentColor;right:4px;top:5px;transform:rotate(45deg)}
-.nav-icon-activity:before{width:13px;height:11px;border-radius:4px;border:2px solid currentColor}.nav-icon-activity:after{width:7px;height:2px;background:currentColor;left:7px;top:10px;box-shadow:0 4px 0 currentColor}
-.nav-icon-calendar:before{width:14px;height:13px;border-radius:4px;border:2px solid currentColor}.nav-icon-calendar:after{width:10px;height:2px;background:currentColor;top:7px}
-.nav-icon-files:before{width:11px;height:14px;border-radius:3px;border:2px solid currentColor}.nav-icon-files:after{width:6px;height:2px;background:currentColor;left:8px;top:8px;box-shadow:0 4px 0 currentColor}
-.nav.active .nav-icon,.sub.active .nav-icon{background:rgba(125,211,252,.16);border-color:rgba(125,211,252,.30);color:#e0f2fe}
-.nav:hover,.sub:hover,details.navgroup summary:hover{background:rgba(255,255,255,.07);border-color:rgba(125,211,252,.20)}
-.nav.active,.sub.active,.active{background:linear-gradient(135deg,rgba(20,184,166,.22),rgba(37,99,235,.26));border-color:rgba(125,211,252,.34);box-shadow:inset 0 1px 0 rgba(255,255,255,.06)}
-.badge{background:rgba(255,255,255,.10);border-color:rgba(255,255,255,.14);color:#dbeafe}
-.main{gap:20px;align-content:start;padding:0;border:0;background:transparent;box-shadow:none}
-.live-status-panel,.footer-note{display:none!important}
-.section-activity .main::after,.section-zoom_accounts .main::after{content:"";display:block;min-height:260px;border-radius:28px;border:1px solid rgba(51,65,85,.08);background:radial-gradient(circle at 14% 28%,rgba(20,184,166,.20),transparent 22%),radial-gradient(circle at 86% 24%,rgba(37,99,235,.16),transparent 26%),linear-gradient(135deg,rgba(255,255,255,.44),rgba(226,240,248,.86));box-shadow:inset 0 1px 0 rgba(255,255,255,.82),0 14px 34px rgba(15,35,58,.06)}
-.section-activity .main::before,.section-zoom_accounts .main::before{content:"";display:none}
-.panel,.card,.provider-card,.zoom-card{background:linear-gradient(180deg,#f6fafd,#edf5fa);border:1px solid rgba(51,65,85,.11);border-radius:22px;box-shadow:0 10px 28px rgba(15,35,58,.08);color:#203047}
-.panel .hero,.card>.head,.panel>.head{background:linear-gradient(135deg,#e7f3fb,#f3f8fc);border-bottom:1px solid rgba(51,65,85,.09)}
-.main>.panel>.head,.main>.card>.head{padding:30px 32px;min-height:132px;display:flex;flex-direction:column;justify-content:center;background:radial-gradient(circle at 12% 12%,rgba(125,211,252,.28),transparent 34%),linear-gradient(135deg,#0f766e,#155e75 54%,#2563eb);border-bottom:0;color:#f8fafc}
-.main>.panel>.head h3,.main>.card>.head h3{font-size:28px;line-height:1.1;color:#fff;margin-bottom:8px}
-.main>.panel>.head p,.main>.card>.head p{max-width:760px;color:#e0f2fe;font-size:15px;line-height:1.5}
-.main>.panel>.block,.main>.card>.block{padding:22px}
-.main>.panel>.empty{margin:22px}
-.main>.panel>.head+.empty{margin:0;padding:22px;background:linear-gradient(180deg,#f6fafd,#edf5fa);border:0;border-radius:0}
-.main>.panel>.head+.empty .calendar-toolbar{margin-bottom:14px}
-.main>.panel>.head+.empty #tmCalendar{box-shadow:0 16px 36px rgba(15,35,58,.12)}
-.main>.panel>.block.stack,.main>.card>.block.stack{background:linear-gradient(180deg,#f6fafd,#edf5fa)}
-.main>.panel>.block .field:first-child input,.main>.panel>.block .field:first-child select{max-width:560px}
-.hero h2,.head h3,.provider-card strong,.zoom-card strong,.card h3{color:#172033}
-.muted,.helper,.head p,.stat p{color:#5f7188}
-.stat,.setup-provider,.document-strip div,.modal-field,.live-status-card{background:linear-gradient(180deg,#fbfdff,#f3f7fb);border-color:rgba(51,65,85,.10);box-shadow:0 6px 18px rgba(15,35,58,.045)}
-.field input,.field select,.field textarea,input,select,textarea{background:#fbfdff;color:#203047;border-color:rgba(51,65,85,.15)}
-.field input:focus,.field select:focus,.field textarea:focus,input:focus,select:focus,textarea:focus{outline:2px solid rgba(37,99,235,.18);border-color:#60a5fa}
-.checkbox,.advanced-setup,.add-document-drawer{background:linear-gradient(180deg,#fbfdff,#f5f9fc);border-color:rgba(51,65,85,.11);color:#203047}
-.checkbox.master{background:#eef8ff;border-color:#bfdbfe}
-.btn{background:linear-gradient(135deg,#0f766e,#2563eb);box-shadow:0 8px 18px rgba(37,99,235,.16)}
-.btn.soft,.btn.ghost{background:linear-gradient(180deg,#fbfdff,#eef5fb);border:1px solid rgba(51,65,85,.12);color:#1d4ed8;box-shadow:0 6px 14px rgba(15,35,58,.055)}
-.btn.warn{background:linear-gradient(135deg,#f97316,#dc2626);color:#fff}
-.btn,.btn.small,.btn.soft,.btn.ghost,.btn.warn,button.btn,a.btn{font-weight:900;text-shadow:none;line-height:1.15}
-.btn:not(.soft):not(.ghost){color:#ffffff}
-.btn.soft,.btn.ghost{color:#1746b5!important;background:linear-gradient(180deg,#ffffff,#eef5fb)!important;border-color:rgba(37,99,235,.18)!important}
-.btn.warn{color:#ffffff!important}
-.btn:disabled{opacity:.62;cursor:not-allowed}
-.flash{background:#ecfeff;border-color:#a5f3fc;color:#155e75;box-shadow:0 10px 24px rgba(15,23,42,.06)}
-.course-table th{background:#e8f2fb;color:#53657a;border-color:rgba(51,65,85,.08)}
-.course-table td{border-color:rgba(51,65,85,.08);color:#203047}
-.status-tag{background:#eef4fb;border-color:rgba(15,23,42,.10);color:#334155}
-.status-tag.ok{background:#bbf7d0;border-color:#22c55e;color:#14532d;font-weight:900;box-shadow:inset 0 1px 0 rgba(255,255,255,.55)}.status-tag.due{background:#fef3c7;border-color:#fde68a;color:#92400e;font-weight:900}.status-tag.bad{background:#fee2e2;border-color:#fecaca;color:#991b1b;font-weight:900}.status-tag.neutral,.status-tag.later{background:#e0f2fe;border-color:#bae6fd;color:#075985;font-weight:900}
-.recommend{background:#f0f9ff;border-color:#bae6fd;color:#172033}
-.empty{background:#eef4fb;border:1px solid rgba(15,23,42,.08);border-radius:18px;color:#64748b}
-.top-account summary,.top-account .dropdown,.alert-dropdown,.alert-item{background:#fbfdff;color:#203047;border-color:rgba(51,65,85,.10);box-shadow:0 16px 36px rgba(15,35,58,.12)}
-.alert-title{color:#0f172a}.alert-message{color:#64748b}
-.pill{background:rgba(255,255,255,.10);border-color:rgba(255,255,255,.16);color:#e0f2fe}
-.certificate-panel{background:linear-gradient(180deg,#f4f9fd,#eef5fa);border-color:rgba(51,65,85,.10)}
-.certificate-panel .hero h2,.certificate-panel .head h3{color:#0f172a}.certificate-panel .hero .muted,.certificate-panel .head p{color:#64748b}
-.certificate-dashboard-panel .document-strip div{background:#fbfdff;border-color:rgba(51,65,85,.09)}
-.certificate-dashboard-panel .document-strip strong{color:#0f172a}.certificate-dashboard-panel .document-strip span{color:#64748b}
-.expiry-warning-row{background:#fff7ed;border-color:#fdba74}.expiry-warning-main strong{color:#7c2d12}.expiry-warning-main small{color:#92400e}.expiry-warning-row span{color:#9a3412}
-.add-document-drawer summary{color:#0f172a}
-.tm-progress-bubble{background:#fbfdff;color:#203047;border-color:rgba(51,65,85,.10);box-shadow:0 18px 45px rgba(15,35,58,.18)}
-.tm-progress-title{color:#0f172a}.tm-progress-subtitle{color:#64748b}.tm-progress-body{background:#f8fbff;border-color:rgba(15,23,42,.08)}.tm-progress-step{color:#334155}
-.tm-progress-bubble.idle{display:none}
-.dashboard-home .tm-chip.neutral{background:#eef4fb;border-color:rgba(15,23,42,.10);color:#475569}
-.tm-ready-panel .tm-chip.neutral{background:rgba(255,255,255,.16);border-color:rgba(255,255,255,.22);color:#fff}
-.tm-ready-panel .tm-quick-actions select{background:rgba(255,255,255,.94);border-color:rgba(255,255,255,.35);color:#0f172a}
-.tm-ready-panel .tm-quick-actions label{color:#dff7ff}
-.dashboard-home{color:#203047}
-.tm-next-panel,.tm-section,.tm-recommend-card{background:linear-gradient(180deg,#f4f9fd,#eef5fa);border-color:rgba(51,65,85,.10);box-shadow:0 16px 38px rgba(15,35,58,.09);color:#203047}
-.dashboard-home .tm-dashboard-grid{grid-template-columns:1fr}.dashboard-home .tm-dashboard-grid>aside{display:none}.dashboard-home .tm-dashboard-grid>div>.tm-section:first-child{display:none}
-.tm-upcoming-list summary{padding-bottom:14px;border-bottom:1px solid rgba(51,65,85,.08)}.tm-upcoming-list .tablewrap{margin-top:0!important;border-radius:0 0 18px 18px}.tm-upcoming-list .course-table th{font-size:11px}.tm-upcoming-list .course-table td{background:rgba(255,255,255,.30)}
-.tm-chip.ok{background:#bbf7d0!important;border-color:#22c55e!important;color:#14532d!important;font-weight:900}
-.tm-panel-title h3,.tm-recommend-card strong,.tm-provider-name,.tm-course-main strong,.tm-activity-row strong{color:#172033}
-.tm-course-card,.tm-provider-tile,.tm-mini-day{background:linear-gradient(180deg,#fbfdff,#f3f7fb);border-color:rgba(51,65,85,.09);box-shadow:0 6px 18px rgba(15,35,58,.045)}
-.tm-course-main span,.tm-activity-row span,.dashboard-home .helper,.dashboard-home .tm-panel-title p{color:#5f7188}
-.tm-check-item{background:#fff8ed;border-color:#f7d79c}.tm-check-item strong{color:#203047}.tm-check-item p{color:#5f7188}
-.empty{background:#e8f0f7;border-color:rgba(51,65,85,.10);color:#5f7188}
-
-/* Softer grey-blue app canvas */
-body{background:linear-gradient(180deg,#0b1728 0,#102237 106px,#d8e2ea 106px,#d8e2ea 100%);color:#203047}
-.layout{background:linear-gradient(180deg,#d7e2ea,#dce6ed 52%,#d8e2ea);box-shadow:inset 0 1px 0 rgba(255,255,255,.42)}
-.panel,.card,.provider-card,.zoom-card{background:linear-gradient(180deg,#eef4f8,#e5edf3);border-color:rgba(42,55,72,.14);box-shadow:0 10px 26px rgba(24,38,55,.075)}
-.panel .hero,.card>.head,.panel>.head{background:linear-gradient(135deg,#e1ebf2,#edf3f7);border-bottom-color:rgba(42,55,72,.10)}
-.main>.panel>.head,.main>.card>.head{background:radial-gradient(circle at 14% 14%,rgba(186,202,216,.32),transparent 34%),linear-gradient(135deg,#40586f,#2e6f86 55%,#315f9d);box-shadow:inset 0 1px 0 rgba(255,255,255,.14)}
-.main>.panel>.head+.empty,.main>.panel>.block.stack,.main>.card>.block.stack{background:linear-gradient(180deg,#eef4f8,#e5edf3)}
-.main>.panel>.head+.empty #tmCalendar{box-shadow:0 14px 30px rgba(24,38,55,.10)}
-.tm-next-panel,.tm-section,.tm-recommend-card,.certificate-panel{background:linear-gradient(180deg,#eaf1f6,#dfe9f0);border-color:rgba(42,55,72,.13);box-shadow:0 14px 32px rgba(24,38,55,.075)}
-.stat,.setup-provider,.document-strip div,.modal-field,.live-status-card,.tm-course-card,.tm-provider-tile,.tm-mini-day{background:linear-gradient(180deg,#f2f6f9,#e8eff4);border-color:rgba(42,55,72,.11);box-shadow:0 6px 16px rgba(24,38,55,.04)}
-.field input,.field select,.field textarea,input,select,textarea,.top-account summary,.top-account .dropdown,.alert-dropdown,.alert-item{background:#f2f6f9;border-color:rgba(42,55,72,.15);color:#203047}
-.checkbox,.advanced-setup,.add-document-drawer{background:linear-gradient(180deg,#f1f5f8,#e7eef3);border-color:rgba(42,55,72,.13)}
-.btn.soft,.btn.ghost{background:linear-gradient(180deg,#f4f7fa,#e5edf4)!important;border-color:rgba(49,95,157,.20)!important}
-.course-table th{background:#dbe6ee;color:#4f6072}
-.course-table td{background:rgba(238,244,248,.56);border-color:rgba(42,55,72,.09)}
-.tm-upcoming-list .course-table td{background:rgba(238,244,248,.64)}
-.empty{background:#dfe8ef;border-color:rgba(42,55,72,.12);color:#596c7e}
-.section-activity .main::after,.section-zoom_accounts .main::after{background:linear-gradient(135deg,rgba(225,235,242,.70),rgba(212,225,234,.92));border-color:rgba(42,55,72,.09);box-shadow:inset 0 1px 0 rgba(255,255,255,.52),0 12px 28px rgba(24,38,55,.045)}
-.tm-ready-panel{background:radial-gradient(circle at 16% 12%,rgba(226,232,240,.24),transparent 30%),linear-gradient(135deg,#465f76 0%,#2c7891 50%,#315f9d 100%);border:0}
-.tm-ready-panel.ready{background:radial-gradient(circle at 16% 12%,rgba(226,232,240,.25),transparent 30%),linear-gradient(135deg,#48667b 0%,#287f94 48%,#315f9d 100%);border:0}
-.tm-ready-panel.attention{background:radial-gradient(circle at 16% 12%,rgba(255,247,237,.28),transparent 30%),linear-gradient(135deg,#9a6b2f 0%,#3b7d8b 52%,#315f9d 100%);border:0}
-@keyframes tmPulse{0%{box-shadow:0 0 0 0 rgba(96,165,250,.55)}70%{box-shadow:0 0 0 9px rgba(96,165,250,0)}100%{box-shadow:0 0 0 0 rgba(96,165,250,0)}}
-@media(max-width:1100px){.tm-hero-board,.tm-dashboard-grid{grid-template-columns:1fr}.tm-metric-row{grid-template-columns:repeat(2,minmax(0,1fr))}}
-@media(max-width:720px){.modal-grid,.setup-provider-fields{grid-template-columns:1fr}.fc .fc-toolbar{display:grid;gap:8px}.fc .fc-toolbar-chunk{display:flex;justify-content:center;flex-wrap:wrap}}
-
-</style>
+<link rel='stylesheet' href='{{ url_for("static", filename="dashboard.css") }}'>
 </head>
 <body class='section-{{ current_section }}'>
 {% if current_section == 'dashboard' %}
@@ -7401,6 +7943,7 @@ body{background:linear-gradient(180deg,#0b1728 0,#102237 106px,#d8e2ea 106px,#d8
   </div>
 </div>
 {% endif %}
+<script src='{{ url_for("static", filename="support.js") }}'></script>
 <div class='shell'>
   <div class='top'>
     <div class='brand'>
@@ -7434,10 +7977,10 @@ body{background:linear-gradient(180deg,#0b1728 0,#102237 106px,#d8e2ea 106px,#d8
                       <button class='btn warn small' type='submit'>Delete</button>
                     </form>
                   {% elif alert.action == 'zoom_resolution' and alert.course_id %}
-                    <form method='post' action='{{ url_for("replace_course_zoom", course_id=alert.course_id) }}' onsubmit='return confirm("Replace the FOBS Zoom link with the correct TrainerMate Zoom link for this course?")'>
+                    <form method='post' action='{{ url_for("replace_course_zoom", course_id=alert.course_id) }}' onsubmit='return confirm("{% if alert.starts_within_72h %}This course starts within 72 hours. The existing FOBS link may already have gone to clients. Replace it only if you are sure.{% else %}Replace the FOBS Zoom link with the correct TrainerMate Zoom link for this course?{% endif %}")'>
                       <button class='btn small' type='submit'>Replace with correct Zoom link</button>
                     </form>
-                    <form method='post' action='{{ url_for("keep_fobs_zoom", course_id=alert.course_id) }}'>
+                    <form method='post' action='{{ url_for("keep_fobs_zoom", course_id=alert.course_id) }}' onsubmit='return confirm("Keep the existing FOBS link for this course and clear this warning?")'>
                       <button class='btn soft small' type='submit'>Keep FOBS link</button>
                     </form>
                     <a class='btn soft small' href='{{ url_for("open_fobs_course", course_id=alert.course_id) }}' target='_blank'>Open FOBS manually</a>
@@ -7489,6 +8032,11 @@ body{background:linear-gradient(180deg,#0b1728 0,#102237 106px,#d8e2ea 106px,#d8
                 <form method='post' action='{{ url_for("redeem") }}' style='display:grid;gap:10px;margin-top:10px'><input name='key' placeholder='Enter licence key'><button class='btn small' type='submit'>Activate licence</button></form>
               {% endif %}
             {% endif %}
+            <form method='post' action='{{ url_for("update_remember_me") }}' class='stack' style='margin-top:10px'>
+              <label class='checkbox'><input type='checkbox' name='remember_me' value='1' {% if remember_me_enabled %}checked{% endif %}> <span>Remember me on this computer</span></label>
+              <button class='btn soft small' type='submit'>Save sign-in setting</button>
+            </form>
+            <form method='post' action='{{ url_for("auth_logout") }}' style='margin-top:10px'><button class='btn soft small' type='submit'>Lock TrainerMate</button></form>
           </div>
         </details>
       </div>
@@ -7498,31 +8046,32 @@ body{background:linear-gradient(180deg,#0b1728 0,#102237 106px,#d8e2ea 106px,#d8
     <div class='panel sidebar'>
       <a class='nav {% if current_section == "dashboard" %}active{% endif %}' href='{{ url_for("home", section="dashboard", provider=selected_provider if selected_provider != "all" else None) }}'><span class='nav-left'><span class='nav-icon nav-icon-dashboard'></span><span>Dashboard</span></span></a>
       {% if not providers or current_section == "setup" %}<a class='nav {% if current_section == "setup" %}active{% endif %}' href='{{ url_for("home", section="setup") }}'><span class='nav-left'><span class='nav-icon nav-icon-manage'></span><span>Setup</span></span></a>{% endif %}
-      <details class='navgroup' {% if selected_provider != "all" %}open{% endif %}>
-        <summary><span class='nav-left'><span class='nav-icon nav-icon-providers'></span><span>Providers</span></span><span class='badge'>{{ providers|length }}</span></summary>
+      <details class='navgroup' {% if selected_provider != "all" or current_section == "manage_providers" %}open{% endif %}>
+        <summary><span class='nav-left'><span class='nav-icon nav-icon-providers'></span><span>Provider Management</span></span><span class='badge'>{{ providers|length }}</span></summary>
         <div class='sublist'>
           <a class='sub {% if selected_provider == "all" %}active{% endif %}' href='{{ url_for("home", section="dashboard") }}'><span class='nav-left'><span class='nav-icon nav-icon-providers'></span><span>All providers</span></span><span class='badge'>{{ total_courses }}</span></a>
           {% for provider in providers %}
             <a class='sub {% if selected_provider == provider.id %}active{% endif %}' href='{{ url_for("home", section="dashboard", provider=provider.id) }}'><span class='nav-left'><span class='nav-icon nav-icon-providers'></span><span>{{ provider.name }}</span></span><span class='badge'>{{ provider.course_count }}</span></a>
           {% endfor %}
+          <a class='sub {% if current_section == "manage_providers" %}active{% endif %}' href='{{ url_for("home", section="manage_providers") }}'><span class='nav-left'><span class='nav-icon nav-icon-manage'></span><span>Manage providers</span></span></a>
         </div>
       </details>
-      <a class='nav {% if current_section == "manage_providers" %}active{% endif %}' href='{{ url_for("home", section="manage_providers") }}'><span class='nav-left'><span class='nav-icon nav-icon-manage'></span><span>Manage providers</span></span></a>
-      <a class='nav {% if current_section == "zoom_accounts" %}active{% endif %}' href='{{ url_for("home", section="zoom_accounts") }}'><span class='nav-left'><span class='nav-icon nav-icon-zoom'></span><span>Zoom accounts</span></span></a>
-      <a class='nav {% if current_section == "automation" %}active{% endif %}' href='{{ url_for("home", section="automation") }}'><span class='nav-left'><span class='nav-icon nav-icon-sync'></span><span>Automatic Sync</span></span></a>
-      <a class='nav {% if current_section == "activity" %}active{% endif %}' href='{{ url_for("home", section="activity") }}'><span class='nav-left'><span class='nav-icon nav-icon-activity'></span><span>Messages & Activity{% if activity_counts.unread %}<span class='nav-alert'>{{ activity_counts.unread }}</span>{% endif %}</span></span></a>
       <a class='nav {% if current_section == "calendar" %}active{% endif %}' href='{{ url_for("home", section="calendar") }}'><span class='nav-left'><span class='nav-icon nav-icon-calendar'></span><span>Calendar</span></span></a>
       <a class='nav {% if current_section == "files" %}active{% endif %}' href='{{ url_for("home", section="files") }}'><span class='nav-left'><span class='nav-icon nav-icon-files'></span><span>Certificates{% if certificate_alerts_visible %}<span class='nav-alert'>!</span>{% endif %}</span></span></a>
+      <a class='nav {% if current_section == "zoom_accounts" %}active{% endif %}' href='{{ url_for("home", section="zoom_accounts") }}'><span class='nav-left'><span class='nav-icon nav-icon-zoom'></span><span>Zoom accounts</span></span></a>
+      <a class='nav {% if current_section == "automation" %}active{% endif %}' href='{{ url_for("home", section="automation") }}'><span class='nav-left'><span class='nav-icon nav-icon-sync'></span><span>Automatic Sync</span></span></a>
+      <a class='nav {% if current_section == "support" %}active{% endif %}' href='{{ url_for("home", section="support") }}'><span class='nav-left'><span class='nav-icon nav-icon-activity'></span><span>Support{% if activity_counts.unread %}<span class='nav-alert'>{{ activity_counts.unread }}</span>{% endif %}</span></span></a>
+      <a class='nav {% if current_section == "diagnostics" %}active{% endif %}' href='{{ url_for("home", section="diagnostics") }}'><span class='nav-left'><span class='nav-icon nav-icon-activity'></span><span>Diagnostics</span></span></a>
     </div>
     <div class='main'>
       {% if flash %}<div class='flash tm-top-flash'>{{ flash.text }}</div>{% endif %}
       <div class='tm-modal-backdrop' id='tmInfoModal' {% if not flash and not show_locked_section_modal %}hidden{% endif %}>
         <div class='tm-modal-card' role='dialog' aria-modal='true' aria-labelledby='tmInfoModalTitle'>
-          <button class='tm-modal-close-x' type='button' id='tmInfoModalX' data-tm-modal-close aria-label='Dismiss'>x</button>
-          <h3 id='tmInfoModalTitle'>{% if show_locked_section_modal %}{{ locked_section_title }}{% elif flash and flash.category == 'success' %}Done{% elif flash and flash.category == 'warning' %}Please note{% else %}TrainerMate{% endif %}</h3>
+          <button class='tm-modal-close-x' type='button' id='tmInfoModalX' data-tm-modal-close onclick='var m=document.getElementById("tmInfoModal"); if(m)m.hidden=true; document.body.classList.remove("tm-modal-open"); return false;' aria-label='Dismiss'>x</button>
+          <h3 id='tmInfoModalTitle'>{% if show_locked_section_modal %}{{ locked_section_title }}{% elif flash and flash.category == 'success' and flash.text %}{% set msg_lower = flash.text|lower %}{% if 'uploading certificate' in msg_lower or 'sending it to the selected provider' in msg_lower or 'will send' in msg_lower %}Uploading certificate{% elif 'queued' in msg_lower %}Certificate queued{% elif 'removing' in msg_lower %}Removing certificate{% elif 'removed' in msg_lower or 'delete' in msg_lower or 'deleted' in msg_lower %}Certificate removed{% elif 'checking' in msg_lower or 'checked' in msg_lower or 'scan' in msg_lower or 'sync' in msg_lower %}Checking certificates{% elif 'added' in msg_lower or 'saved' in msg_lower %}Certificate saved{% else %}Update in progress{% endif %}{% elif flash and flash.category == 'success' %}Update in progress{% elif flash and flash.category == 'warning' %}Needs attention{% elif flash and flash.category == 'error' %}Needs attention{% else %}TrainerMate{% endif %}</h3>
           <p id='tmInfoModalMessage'>{% if show_locked_section_modal %}{{ locked_section_message }}{% elif flash %}{{ flash.text }}{% endif %}</p>
-          <div class='tm-modal-sub'>Your current settings, providers, Zoom connection and course history are safe.</div>
-          <div class='tm-modal-actions'><button class='btn' type='button' id='tmInfoModalClose' data-tm-modal-close>Dismiss</button></div>
+          {% if show_locked_section_modal %}<div class='tm-modal-sub'>Your current settings, providers, Zoom connection and course history are safe.</div>{% endif %}
+          <div class='tm-modal-actions'><button class='btn' type='button' id='tmInfoModalClose' data-tm-modal-close onclick='var m=document.getElementById("tmInfoModal"); if(m)m.hidden=true; document.body.classList.remove("tm-modal-open"); return false;'>Dismiss</button></div>
         </div>
       </div>
 
@@ -7588,6 +8137,10 @@ body{background:linear-gradient(180deg,#0b1728 0,#102237 106px,#d8e2ea 106px,#d8
                 <h2>{{ dashboard_ready.title }}</h2>
                 <p>{{ dashboard_ready.message }}</p>
               </div>
+              <div class='tm-metric-row'>
+                <div class='tm-metric'><strong>{{ today_courses|length }}</strong><span>Courses running today</span></div>
+                <div class='tm-metric'><strong>{{ window_course_count }}</strong><span>Courses in the next {{ active_sync_window_label }}</span></div>
+              </div>
               <div class='tm-quick-actions'>
                 {% if state.sync_running %}
                   <form method='post' action='{{ url_for("stop_sync", provider=selected_provider if selected_provider != "all" else None) }}'><button class='btn warn' type='submit'>Stop sync</button></form>
@@ -7617,17 +8170,24 @@ body{background:linear-gradient(180deg,#0b1728 0,#102237 106px,#d8e2ea 106px,#d8
                         {% endfor %}
                       </select>
                     </div>
-                    <button class='btn' type='submit'>Sync quietly</button>
+                    <button class='btn' type='submit'>Run sync check</button>
                   </form>
                 {% endif %}
-                <a class='btn soft' href='{{ url_for("home", section="calendar") }}'>Calendar</a>
-                <a class='btn soft' href='{{ url_for("home", section="manage_providers") }}'>Providers</a>
               </div>
-              <div class='tm-metric-row'>
-                <div class='tm-metric'><strong>{{ today_courses|length }}</strong><span>Today</span></div>
-                <div class='tm-metric'><strong>{{ filtered_courses|length }}</strong><span>Next {{ active_sync_window_label }}</span></div>
-                <div class='tm-metric'><strong>{{ synced_count }}</strong><span>Synced</span></div>
-                <div class='tm-metric'><strong>{{ attention_count }}</strong><span>Needs attention</span></div>
+              <div class='tm-dashboard-hints'>
+                <div class='tm-dashboard-hint'>
+                  <strong>{% if zoom_connected %}Zoom connected{% else %}Zoom needs connecting{% endif %}</strong>
+                  <span>{% if zoom_connected %}TrainerMate can use your saved Zoom account when courses need updates.{% else %}Connect or reconnect Zoom before running course syncs that need meeting links.{% endif %}</span>
+                  {% if not zoom_connected %}<a class='btn soft small' href='{{ url_for("home", section="zoom_accounts") }}'>Open Zoom accounts</a>{% endif %}
+                </div>
+                <div class='tm-dashboard-hint'>
+                  <strong>Last check</strong>
+                  <span>{{ last_sync_text or 'No course check has completed yet.' }}</span>
+                </div>
+                <div class='tm-dashboard-hint'>
+                  <strong>Providers</strong>
+                  <span>{{ providers|length }} active provider{% if providers|length != 1 %}s{% endif %} set up for checks.</span>
+                </div>
               </div>
             </section>
             <aside class='tm-next-panel'>
@@ -7655,7 +8215,7 @@ body{background:linear-gradient(180deg,#0b1728 0,#102237 106px,#d8e2ea 106px,#d8
           <section class='tm-recommend-card'>
             <div>
               <div class='kicker'>Recommended next action</div>
-              <strong>{{ recommendation.title }}</strong>
+              <strong>{{ recommendation.title }}{% if recommendation.help %}<span class='tm-action-help' title='{{ recommendation.help }}'>?</span>{% endif %}</strong>
               <div class='helper'>{{ recommendation.reason }}</div>
             </div>
             <div class='compact-actions'>
@@ -7668,13 +8228,13 @@ body{background:linear-gradient(180deg,#0b1728 0,#102237 106px,#d8e2ea 106px,#d8
                   <button class='btn small' type='submit'>Check course only</button>
                 </form>
               {% elif recommendation.action == 'zoom_resolution' and recommendation.course_id and not state.sync_running %}
-                <form method='post' action='{{ url_for("replace_course_zoom", course_id=recommendation.course_id) }}'><button class='btn small' type='submit'>Replace Zoom link</button></form>
-                <form method='post' action='{{ url_for("keep_fobs_zoom", course_id=recommendation.course_id) }}'><button class='btn soft small' type='submit'>Keep FOBS link</button></form>
+                <form method='post' action='{{ url_for("replace_course_zoom", course_id=recommendation.course_id) }}' onsubmit='return confirm("{% if recommendation.starts_within_72h %}This course starts within 72 hours. The existing FOBS link may already have gone to clients. Replace it only if you are sure.{% else %}Replace the FOBS Zoom link with the correct TrainerMate Zoom link for this course?{% endif %}")'><button class='btn small' type='submit'>Replace Zoom link</button></form>
+                <form method='post' action='{{ url_for("keep_fobs_zoom", course_id=recommendation.course_id) }}' onsubmit='return confirm("Keep the existing FOBS link for this course and clear this warning?")'><button class='btn soft small' type='submit'>Keep FOBS link</button></form>
               {% elif recommendation.action == 'sync' and not state.sync_running %}
                 <form method='post' action='{{ url_for("start_sync", provider=recommendation.provider if recommendation.provider != "all" else None) }}'>
                   <input type='hidden' name='scan_provider' value='{{ recommendation.provider }}'>
                   <input type='hidden' name='scan_days' value='{{ recommendation.days }}'>
-                  <button class='btn small' type='submit'>Sync quietly</button>
+                  <button class='btn small' type='submit'>Run sync check</button>
                 </form>
               {% elif recommendation.action == 'providers' %}
                 <a class='btn small' href='{{ url_for("home", section="manage_providers") }}'>Open providers</a>
@@ -7715,7 +8275,7 @@ body{background:linear-gradient(180deg,#0b1728 0,#102237 106px,#d8e2ea 106px,#d8
                               <td>{{ row.date_label }}</td>
                               <td>{{ row.time_label }}</td>
                               <td><span class='status-tag {{ row.status_class }}'>{{ row.status_label }}</span></td>
-                              <td>{{ row.short_message }}{% if row.show_upgrade %}<a class='upgrade-link' href='https://www.trainermate.xyz/upgrade' target='_blank' rel='noopener'>Upgrade</a>{% endif %}{% if reviewer_demo_mode %}<form method='post' action='{{ url_for("reviewer_create_or_verify_zoom", course_id=row.id) }}' style='display:inline;margin-left:10px'><button class='btn small' type='submit'>{% if row.meeting_id %}Verify Zoom meeting{% else %}Create Zoom meeting{% endif %}</button></form><form method='post' action='{{ url_for("replace_course_zoom", course_id=row.id) }}' style='display:inline;margin-left:8px'><button class='btn soft small' type='submit'>Replace/update Zoom</button></form>{% endif %}{% if row.is_action_needed and not state.sync_running and not reviewer_demo_mode %}<form method='post' action='{{ url_for("check_course_only", course_id=row.id) }}' style='display:inline;margin-left:10px'><input type='hidden' name='course_key' value='{{ course_action_exact_key(row) }}'><input type='hidden' name='provider' value='{{ row.provider or "" }}'><input type='hidden' name='title' value='{{ row.title or "" }}'><input type='hidden' name='date_time' value='{{ row.date_time_raw or "" }}'><button class='btn small' type='submit'>Check course only</button></form>{% endif %}{% if row.can_confirm_removed %}<form method='post' action='{{ url_for("confirm_course_removed", course_id=row.id) }}' style='display:inline;margin-left:10px' onsubmit='return confirm("Only confirm if this course has genuinely been deleted/cancelled in FOBS. Remove it from TrainerMate?")'><button class='btn warn small' type='submit'>Confirm removed</button></form>{% endif %}</td>
+                              <td>{{ row.short_message }}{% if row.show_upgrade %}<a class='upgrade-link' href='https://www.trainermate.xyz/upgrade' target='_blank' rel='noopener'>Upgrade</a>{% endif %}{% if row.is_action_needed and not state.sync_running %}<form method='post' action='{{ url_for("check_course_only", course_id=row.id) }}' style='display:inline;margin-left:10px'><input type='hidden' name='course_key' value='{{ course_action_exact_key(row) }}'><input type='hidden' name='provider' value='{{ row.provider or "" }}'><input type='hidden' name='title' value='{{ row.title or "" }}'><input type='hidden' name='date_time' value='{{ row.date_time_raw or "" }}'><button class='btn small' type='submit'>Check course only</button></form>{% endif %}{% if row.can_confirm_removed %}<form method='post' action='{{ url_for("confirm_course_removed", course_id=row.id) }}' style='display:inline;margin-left:10px' onsubmit='return confirm("Only confirm if this course has genuinely been deleted/cancelled in FOBS. Remove it from TrainerMate?")'><button class='btn warn small' type='submit'>Confirm removed</button></form>{% endif %}</td>
                             </tr>
                           {% endfor %}
                         </tbody>
@@ -7748,7 +8308,7 @@ body{background:linear-gradient(180deg,#0b1728 0,#102237 106px,#d8e2ea 106px,#d8
                 </div>
               </section>
               <section class='tm-section'>
-                <div class='tm-panel-title'><div><h3>Recent activity</h3><p>Quiet updates from TrainerMate.</p></div><a href='{{ url_for("home", section="activity") }}'>View all</a></div>
+                <div class='tm-panel-title'><div><h3>Recent activity</h3><p>Quiet updates from TrainerMate.</p></div><a href='{{ url_for("home", section="support") }}'>View all</a></div>
                 <div class='tm-activity-list'>
                   {% for item in dashboard_activity_items %}
                     <div class='tm-activity-row'><strong>{{ item.title }}</strong><span>{{ item.summary or item.message }}</span></div>
@@ -7957,12 +8517,14 @@ body{background:linear-gradient(180deg,#0b1728 0,#102237 106px,#d8e2ea 106px,#d8
           <div class='head'><h3>Zoom accounts</h3><p>Connect the Zoom account TrainerMate should use for course meetings. TrainerMate never asks for your Zoom password.</p></div>
           <div class='block stack'>
             {% if ZOOM_CLIENT_ID and ZOOM_CLIENT_SECRET %}
-              <div class='stack' style='max-width:460px'>
+              <form method='get' action='{{ url_for("zoom_connect_start") }}' style='display:grid;gap:12px;max-width:460px' id='tmZoomConnectForm'>
+                <div class='field'><label>Account label</label><input name='zoom_nickname' id='tmZoomNickname' placeholder='Example: Billy's Zoom'></div>
                 <div class='inline-actions'>
-                  <a class='btn' href='{{ url_for("zoom_connect_start") }}?zoom_nickname=TrainerMate'>Connect Zoom account</a>
+                  <button class='btn' type='submit' onclick="var f=document.getElementById('tmZoomConnectForm'); if(f){ f.submit(); return false; }">Connect Zoom account</button>
+                  <a class='btn soft' id='tmZoomDirectConnect' href='{{ url_for("zoom_connect_start") }}' onclick="var n=document.getElementById('tmZoomNickname'); if(n && n.value){ this.href='{{ url_for("zoom_connect_start") }}?zoom_nickname='+encodeURIComponent(n.value); }">Open Zoom approval page</a>
                 </div>
                 <div class='helper'>You will be sent to Zoom to approve TrainerMate. After approval you will return here.</div>
-              </div>
+              </form>
             {% else %}
               <div class='provider-card'>
                 <strong>Zoom connection is not ready yet</strong>
@@ -8029,27 +8591,92 @@ body{background:linear-gradient(180deg,#0b1728 0,#102237 106px,#d8e2ea 106px,#d8
             <div class='tm-lock-overlay'><div class='tm-lock-card'><h3>Automatic Sync is a paid feature</h3><p>Free users can run manual trial syncs. Paid users can let TrainerMate quietly check upcoming courses in the background and notify them only when something changes or needs attention.</p><button class='btn tm-paid-modal-trigger' type='button' data-title='Automatic Sync is included with TrainerMate Paid' data-message='Automatic Sync can run a daily light check and a weekly full-window check while TrainerMate is open. It will not start on Free.'>Got it</button><div class='helper-dark'>Nothing has been enabled on this account.</div></div></div>
           {% endif %}
         </div>
-      {% elif current_section == 'activity' %}
-        <section class='card'><div class='head'><h3>Messages & Activity</h3><p>Support messages, sync summaries, course updates and items that need attention.</p></div><div class='block stack'>
-          {% if activity_items %}{% for item in activity_items[:12] %}<div class='provider-card'><div class='provider-header'><div><strong>{{ item.title }}</strong><div class='helper'>{{ item.created_at }} - {{ item.type|replace('_',' ') }}{% if not item.read_at %} - New{% endif %}</div></div><span class='status-tag {{ "bad" if item.severity in ["warning","error"] else "ok" }}'>{{ item.severity }}</span></div><p>{{ item.summary or item.message }}</p>{% if item.items %}<details><summary>View course detail</summary>{% for c in item.items[:10] %}<div class='helper' style='padding:8px 0;border-top:1px solid var(--line)'><strong>{{ c.provider }}</strong> - {{ c.date_time }}<br>{{ c.course_type }}<br>{{ c.action or c.status or c.error }}</div>{% endfor %}</details>{% endif %}</div>{% endfor %}<a class='btn soft' href='{{ url_for("activity_centre") }}'>Open full activity centre</a>{% else %}<div class='empty'>No messages or activity yet.</div>{% endif %}
+      {% elif current_section == 'support' %}
+        <section class='panel'>
+          <div class='hero'>
+            <div><h2>Support</h2><p class='muted'>Send a message with your NDORS number attached, or open WhatsApp if that is quicker.</p></div>
+            <div class='hero-actions'><a class='btn soft' id='tmSupportWhatsAppTop' href='{{ support_whatsapp_url }}' target='_blank' rel='noopener'>Message on WhatsApp</a></div>
+          </div>
+          <div class='block grid-two'>
+            <div class='provider-card'>
+              <div class='provider-header'><div><strong>Contact support</strong><div class='helper'>Subject defaults to your NDORS number so it is easy to find you in admin.</div></div></div>
+              <form class='stack' id='tmSupportForm' method='post' action='{{ url_for("support_message_route") }}'>
+                {{ csrf_hidden_field()|safe }}
+                <div class='field'><label>Subject</label><input id='tmSupportSubject' name='subject' value='{{ support_subject }}' autocomplete='off'></div>
+                <div class='field'><label>Message</label><textarea id='tmSupportBody' name='message' rows='7' placeholder='Tell support what happened, what you expected, and roughly when it happened.'></textarea></div>
+                <input type='hidden' id='tmSupportSummaryField' name='summary' value=''>
+                <div class='inline-actions'>
+                  <button class='btn' type='submit' id='tmSendSupportMessage'>Send to support</button>
+                  <a class='btn' id='tmSupportWhatsApp' href='{{ support_whatsapp_url }}' target='_blank' rel='noopener'>Open WhatsApp</a>
+                  <button class='btn soft' type='button' id='tmCopySupportSummary'>Copy support summary</button>
+                </div>
+                <div class='helper' id='tmSupportResult' aria-live='polite'></div>
+              </form>
+            </div>
+            <div class='provider-card'>
+              <div class='provider-header'><div><strong>Support summary</strong><div class='helper'>Useful if you need to paste details into a message.</div></div></div>
+              <div class='stack' id='tmSupportSummary'>
+                <div class='helper'><strong>NDORS:</strong> {{ identity.ndors or 'Not saved' }}</div>
+                <div class='helper'><strong>Plan:</strong> {{ account_plan_label }}</div>
+                <div class='helper'><strong>Version:</strong> {{ build_label }}</div>
+                <div class='helper'><strong>Status:</strong> {{ friendly_status }}</div>
+                <div class='helper'><strong>Last sync:</strong> {{ last_sync_text or 'Not run yet' }}</div>
+                <div class='helper'><strong>Providers:</strong> {{ providers|length }}</div>
+                <div class='helper'><strong>Zoom accounts:</strong> {{ zoom_accounts|length }}</div>
+              </div>
+            </div>
+          </div>
+        </section>
+        <section class='panel'><div class='head'><h3>Recent support messages</h3><p>Support replies, sync summaries, course updates and items that need attention.</p></div><div class='block stack'>
+          {% if activity_items %}{% for item in activity_items[:12] %}<div class='provider-card'><div class='provider-header'><div><strong>{{ item.title }}</strong><div class='helper'>{{ item.created_at }} - {{ item.type|replace('_',' ') }}{% if not item.read_at %} - New{% endif %}</div></div><span class='status-tag {{ "bad" if item.severity in ["warning","error"] else "ok" }}'>{{ item.severity }}</span></div><p>{{ item.summary or item.message }}</p>{% if item.get('items') %}<details><summary>View course detail</summary>{% for c in item.get('items')[:10] %}<div class='helper' style='padding:8px 0;border-top:1px solid var(--line)'><strong>{{ c.provider }}</strong> - {{ c.date_time }}<br>{{ c.course_type }}<br>{{ c.action or c.status or c.error }}</div>{% endfor %}</details>{% endif %}</div>{% endfor %}<a class='btn soft' href='{{ url_for("activity_centre") }}'>Open full support history</a>{% else %}<div class='empty'>No messages yet.</div>{% endif %}
         </div></section>
+      {% elif current_section == 'diagnostics' %}
+        <section class='panel'>
+          <div class='hero'>
+            <div><h2>Diagnostics</h2><p class='muted'>Local read-only status for support and troubleshooting.</p></div>
+            <div class='hero-actions'><a class='btn soft' href='{{ url_for("home", section="support") }}'>Contact support</a></div>
+          </div>
+          <div class='block grid-two'>
+            <div class='provider-card'>
+              <div class='provider-header'><div><strong>Support bundle summary</strong><div class='helper'>No passwords or tokens are shown here.</div></div></div>
+              <div class='stack'>
+                {% for line in diagnostics_summary_lines %}
+                  <div class='helper'>{{ line }}</div>
+                {% endfor %}
+              </div>
+            </div>
+            <div class='provider-card'>
+              <div class='provider-header'><div><strong>Current app state</strong><div class='helper'>Useful when a sync or certificate job is running.</div></div></div>
+              <div class='stack'>
+                <div class='helper'><strong>Sync running:</strong> {{ 'Yes' if state.sync_running else 'No' }}</div>
+                <div class='helper'><strong>Current provider:</strong> {{ debug_current_provider }}</div>
+                <div class='helper'><strong>Current course:</strong> {{ debug_current_course }}</div>
+                <div class='helper'><strong>Latest message:</strong> {{ debug_latest_message }}</div>
+                <div class='helper'><strong>Debug endpoints:</strong> {{ 'Enabled' if diagnostics_debug_enabled else 'Off' }}</div>
+              </div>
+            </div>
+          </div>
+        </section>
+        <section class='panel'>
+          <div class='head'><h3>Recent local log</h3><p>Latest bot log tail, redacted for normal display. Raw debug endpoints require TRAINERMATE_DEBUG=1.</p></div>
+          <div class='block'>
+            <pre style='white-space:pre-wrap;margin:0;max-height:420px;overflow:auto;border:1px solid var(--line);border-radius:14px;padding:14px;background:#0f172a;color:#dbeafe'>{{ diagnostics_log_text }}</pre>
+          </div>
+        </section>
       {% elif current_section == 'calendar' %}
         {% if calendar_sync_allowed %}
-          <div class='panel'><div class='head'><h3>Calendar</h3><p>Click any course to see details and open the right provider tools</p></div><div class='empty'><div class='calendar-toolbar'>{% for provider in providers %}<span><i class='cal-dot' style='background:{{ provider.color }}'></i> {{ provider.name }}</span>{% endfor %}<span>Status is shown on each course</span></div><div id='tmCalendar'></div></div></div>
+          <div class='panel'><div class='head'><h3>Calendar</h3><p>Click any course to see details and open the right provider tools</p></div><div class='empty'><div class='calendar-toolbar'>{% for provider in providers %}<span><i class='cal-dot' style='background:{{ provider.color }}'></i> {{ provider.name }}</span>{% endfor %}<span>Status is shown on each course</span></div><div id='tmCalendar' data-events-url='{{ url_for("calendar_events") }}'></div></div></div>
         {% else %}
           <div class='tm-lock-wrap is-locked'><div class='tm-lock-content'><div class='panel'><div class='head'><h3>Calendar</h3><p>Calendar view and calendar sync are included with TrainerMate Paid.</p></div><div class='empty' style='min-height:360px'>Your course list remains available on the dashboard.</div></div></div><div class='tm-lock-overlay'><div class='tm-lock-card'><h3>Calendar is a paid feature</h3><p>Free users can still view courses, manage providers and connect Zoom. Paid unlocks calendar tools and automatic calendar updates.</p><button class='btn tm-paid-modal-trigger' type='button' data-title='Calendar is included with TrainerMate Paid' data-message='Calendar tools unlock when your paid plan is active. Your existing courses and settings have not been changed.'>Got it</button><div class='helper-dark'>Nothing has been changed.</div></div></div></div>
         {% endif %}
       {% elif current_section == 'files' %}
-      <div class='certificate-workspace{% if certificate_alerts_visible %} certificate-has-attention{% endif %}' id='tmCertificateWorkspace'>
+      <div class='certificate-workspace{% if certificate_alerts_visible %} certificate-has-attention{% endif %}{% if certificate_busy %} certificate-busy{% endif %}' id='tmCertificateWorkspace'>
         <div class='panel certificate-panel certificate-dashboard-panel'>
           <div class='hero'>
-            <div><h2>Certificates</h2><p class='muted'>Add your certificates, check expiry dates, and compare them with what FOBS currently holds.</p></div>
+            <div><h2>Certificates</h2><p class='muted'>Keep local certificates and provider copies aligned. Add a file, choose the providers, and TrainerMate will check FOBS afterwards.</p></div>
             <div class='hero-actions'>
-              {% if certificate_manage_allowed %}<form method='post' action='{{ url_for("scan_all_certificates") }}' class='certificate-refresh-form'><button class='btn soft certificate-job-control' type='submit'>Refresh FOBS certificates</button></form>{% else %}<button class='btn soft tm-paid-modal-trigger' type='button' data-title='Certificates are included with TrainerMate Paid' data-message='You can still view certificate status on Free. Refreshing provider certificates, uploading files and deleting FOBS copies are paid features.'>Refresh FOBS certificates</button>{% endif %}
+              {% if certificate_manage_allowed %}<form method='post' action='{{ url_for("scan_all_certificates") }}' class='certificate-refresh-form'><button class='btn soft certificate-job-control' type='submit'>Check FOBS now</button></form>{% else %}<button class='btn soft tm-paid-modal-trigger' type='button' data-title='Certificates are included with TrainerMate Paid' data-message='You can still view certificate status on Free. Refreshing provider certificates, uploading files and deleting FOBS copies are paid features.'>Check FOBS now</button>{% endif %}
             </div>
-          </div>
-          <div class='document-strip'>
-            <div><strong>{{ document_summary.expired + document_summary.expiring }}</strong><span>Expiry warnings</span></div>
           </div>
           {% if document_expiry_warnings %}
             <div class='expiry-warning-list'>
@@ -8061,13 +8688,13 @@ body{background:linear-gradient(180deg,#0b1728 0,#102237 106px,#d8e2ea 106px,#d8
               {% endfor %}
             </div>
           {% endif %}
-          <div class='certificate-progress idle' id='tmCertificateProgress'>
+          <div class='certificate-progress {{ certificate_progress_class }}' id='tmCertificateProgress'>
             <div class='certificate-progress-top'>
               <div>
-                <div class='certificate-progress-title' id='tmCertificateProgressTitle'>Certificate refresh idle</div>
-                <div class='certificate-progress-detail' id='tmCertificateProgressDetail'>Refresh FOBS certificates to check provider files.</div>
+                <div class='certificate-progress-title' id='tmCertificateProgressTitle'>{{ certificate_progress_title }}</div>
+                <div class='certificate-progress-detail' id='tmCertificateProgressDetail'>{{ certificate_progress_detail }}</div>
               </div>
-              <span class='status-tag neutral' id='tmCertificateProgressState'>idle</span>
+              <span class='status-tag {{ certificate_state_class }}' id='tmCertificateProgressState'>{{ certificate_state_text }}</span>
             </div>
           </div>
           <div class='certificate-busy-note' id='tmCertificateBusyNote'>
@@ -8075,8 +8702,8 @@ body{background:linear-gradient(180deg,#0b1728 0,#102237 106px,#d8e2ea 106px,#d8
               <div class='certificate-busy-main'>
                 <span class='certificate-spinner'></span>
                 <div>
-                  <div class='certificate-busy-title' id='tmCertificateBusyTitle'>TrainerMate is checking certificates</div>
-                <div class='certificate-busy-detail' id='tmCertificateBusyDetail'>Checking the provider certificate lists.</div>
+                  <div class='certificate-busy-title' id='tmCertificateBusyTitle'>{{ certificate_progress_title }}</div>
+                <div class='certificate-busy-detail' id='tmCertificateBusyDetail'>{{ certificate_progress_detail }}</div>
                 </div>
               </div>
               <span class='status-tag due'>working</span>
@@ -8086,7 +8713,7 @@ body{background:linear-gradient(180deg,#0b1728 0,#102237 106px,#d8e2ea 106px,#d8
           <div class='certificate-action-zone' id='tmCertificateActionZone'>
           {% if certificate_alerts_visible %}
             <div class='certificate-attention'>
-              <div class='certificate-attention-title'>Certificates !</div>
+              <div class='certificate-attention-title'>Needs attention</div>
               {% for item in certificate_alerts_visible %}
                 <div class='certificate-attention-row' data-auto-dismiss-alert-id='{{ (item.alert_ids or [item.alert_id])|join(",") }}'>
                   <div>
@@ -8103,27 +8730,30 @@ body{background:linear-gradient(180deg,#0b1728 0,#102237 106px,#d8e2ea 106px,#d8
           <div class='tm-lock-wrap {% if not certificate_manage_allowed %}is-locked{% endif %}'>
             <div class='tm-lock-content'>
               <details class='add-document-drawer' {% if add_document_form %}open{% endif %}>
-                <summary><span>Add certificate</span><span class='badge'>+</span></summary>
+                <summary><span>Add a certificate</span><span class='badge'>+</span></summary>
                 <form method='post' action='{{ url_for("add_document") }}' enctype='multipart/form-data' class='stack'>
-              <p class='helper'>TrainerMate will use the selected file name as the certificate name.</p>
+              <p class='helper'>Choose the certificate file, set an expiry date if it has one, then select where it should be used.</p>
               <div class='field'><label>Expiry date</label><input type='date' name='expiry_date' value='{{ add_document_form.expiry_date or "" }}'></div>
               <div class='field'><label>File</label><input type='file' name='document_file' accept='.docx,.pdf,.doc,.xls,.xlsx,.odt,.jpg,.jpeg,.png,.tif,.tiff' required>{% if add_document_form %}<span class='helper'>Please choose the certificate file again. Your details below have been kept.</span>{% endif %}</div>
               <div class='field document-provider-field'><label>Use for providers</label>
                 {% if providers %}
+                  {% set selected_document_provider_ids = add_document_form.provider_ids if add_document_form else providers|map(attribute='id')|list %}
+                  {% set all_document_providers_selected = selected_document_provider_ids|length == providers|length %}
                   <div class='document-provider-tools'>
-                    <label class='checkbox master'><input type='checkbox' id='selectAllDocumentProviders' checked> <span>Use for all providers</span></label>
-                    <span class='helper'>Untick any provider that should not use this certificate.</span>
+                    <label class='checkbox master'><input type='checkbox' id='selectAllDocumentProviders' name='use_all_providers' value='1' {% if all_document_providers_selected %}checked{% endif %}> <span>Use for all providers</span></label>
+                    <span class='helper' id='documentProviderHelper'>Tick this to use the certificate with every provider. Untick it to clear the list, then choose providers manually.</span>
                   </div>
-                  <div class='document-provider-grid'>
+                  <div class='document-provider-grid' id='documentProviderGrid'>
                     {% for provider in providers %}
-                      <label class='checkbox'><input type='checkbox' class='document-provider-checkbox' name='provider_ids' value='{{ provider.id }}' {% if not add_document_form or provider.id in add_document_form.provider_ids %}checked{% endif %}> <span>{{ provider.name }}</span></label>
+                      <label class='checkbox {% if all_document_providers_selected %}is-disabled{% endif %}'><input type='checkbox' class='document-provider-checkbox' name='provider_ids' value='{{ provider.id }}' {% if all_document_providers_selected or provider.id in selected_document_provider_ids %}checked{% endif %} {% if all_document_providers_selected %}disabled aria-disabled='true'{% endif %}> <span>{{ provider.name }}</span></label>
                     {% endfor %}
                   </div>
+                  <script src='{{ url_for("static", filename="document_provider_picker.js") }}'></script>
                 {% else %}
                   <div class='helper'>Add providers first, then assign documents to them.</div>
                 {% endif %}
               </div>
-              <div class='inline-actions'><button class='btn' type='submit'>Add to TrainerMate</button></div>
+              <div class='inline-actions'><button class='btn' type='submit'>Add certificate</button></div>
                 </form>
               </details>
             </div>
@@ -8135,7 +8765,11 @@ body{background:linear-gradient(180deg,#0b1728 0,#102237 106px,#d8e2ea 106px,#d8
         </div>
 
         <div class='panel certificate-panel certificate-fobs-panel certificate-action-zone'>
-          <div class='head fobs-head'><h3>Certificates currently in FOBS</h3><p>Click a provider below to open its certificate list. The colours match your provider colours.</p></div>
+          {% if certificate_busy %}
+            <div class='head fobs-head'><h3>Checking your certificates</h3><p>Please wait while TrainerMate updates your certificate list from FOBS.</p></div>
+            <div class='empty'><span class='certificate-spinner'></span> Updating certificate list. This page will refresh automatically when it is ready.</div>
+          {% else %}
+          <div class='head fobs-head'><h3>FOBS certificate lists</h3><p>Certificates shown here match the latest FOBS check.</p></div>
           <div class='block stack'>
             {% for provider in providers %}
               {% set certs = provider_certificates_by_provider.get(provider.id, []) %}
@@ -8145,7 +8779,7 @@ body{background:linear-gradient(180deg,#0b1728 0,#102237 106px,#d8e2ea 106px,#d8
                     <span class='provider-colour-dot'></span>
                     <span>
                       <strong>{{ provider.name }}</strong>
-                      <span class='provider-summary-helper'>Click to show certificates</span>
+                      <span class='provider-summary-helper'>Open certificate list</span>
                     </span>
                   </span>
                   <span class='provider-summary-right'>
@@ -8153,21 +8787,20 @@ body{background:linear-gradient(180deg,#0b1728 0,#102237 106px,#d8e2ea 106px,#d8
                     <span class='expand-word'>Open</span>
                   </span>
                 </summary>
-                {% if certificate_manage_allowed %}<form method='post' action='{{ url_for("scan_provider_certificates_route", provider_id=provider.id) }}' class='certificate-refresh-form provider-refresh-form'><button class='btn soft small certificate-job-control' type='submit'>Refresh {{ provider.name }}</button></form>{% else %}<button class='btn soft small tm-paid-modal-trigger' type='button' data-title='Certificates are included with TrainerMate Paid' data-message='Refreshing certificates from FOBS is available on the paid plan. You can still view the most recent certificate status on Free.'>Refresh {{ provider.name }}</button>{% endif %}
                 {% if certs %}
                   <div class='tablewrap'>
                     <table class='course-table'>
                       <thead><tr><th>Certificate in FOBS</th><th>Expiry</th><th>File</th><th>Action</th></tr></thead>
                       <tbody>
                         {% for cert in certs %}
-                          <tr>
+                          <tr data-provider-certificate-id='{{ cert.id }}'>
                             <td><strong>{{ cert.certificate_name }}</strong></td>
                             <td>{% if cert.expiry_date %}{{ cert.expiry_date }}{% else %}-{% endif %}</td>
                             <td>
                               {% if cert.cached_file_available %}
                                 <a class='btn soft small' href='{{ url_for("view_provider_certificate_file", certificate_id=cert.id) }}' target='_blank' rel='noopener'>View file</a>
                               {% else %}
-                                <span class='helper'>Refresh to save file</span>
+                                <button class='btn soft small' type='button' disabled title='TrainerMate is still preparing this file from FOBS.'>View file</button>
                               {% endif %}
                             </td>
                             <td>
@@ -8190,6 +8823,7 @@ body{background:linear-gradient(180deg,#0b1728 0,#102237 106px,#d8e2ea 106px,#d8
             {% endfor %}
             {% if not providers %}<div class='empty'>Add providers first.</div>{% endif %}
           </div>
+          {% endif %}
         </div>
       </div>
       {% endif %}
@@ -8217,832 +8851,17 @@ body{background:linear-gradient(180deg,#0b1728 0,#102237 106px,#d8e2ea 106px,#d8
     </div>
   </div>
 </div>
+<script src='{{ url_for("static", filename="certificate_status.js") }}'></script>
 <script>
-function tmOpenModal(title, message){
-  const modal = document.getElementById('tmInfoModal');
-  if(!modal) return;
-  const titleEl = document.getElementById('tmInfoModalTitle');
-  const msgEl = document.getElementById('tmInfoModalMessage');
-  if(titleEl) titleEl.textContent = title || 'TrainerMate';
-  if(msgEl) msgEl.textContent = message || '';
-  modal.hidden = false;
-  document.body.classList.add('tm-modal-open');
-}
-function tmCloseModal(){
-  const modal = document.getElementById('tmInfoModal');
-  if(!modal) return;
-  modal.hidden = true;
-  document.body.classList.remove('tm-modal-open');
-}
-document.addEventListener('click', function(e){
-  const trigger = e.target.closest('.tm-paid-modal-trigger');
-  if(trigger){ e.preventDefault(); tmOpenModal(trigger.dataset.title, trigger.dataset.message); return; }
-  const closeTrigger = e.target.closest && e.target.closest('[data-tm-modal-close],#tmInfoModalClose,#tmInfoModalX');
-  if(closeTrigger || e.target.id === 'tmInfoModal'){
-    e.preventDefault();
-    tmCloseModal();
-  }
-});
-document.addEventListener('keydown', function(e){ if(e.key === 'Escape') tmCloseModal(); });
-window.addEventListener('load', function(){ const modal=document.getElementById('tmInfoModal'); if(modal && !modal.hidden) document.body.classList.add('tm-modal-open'); });
-const presets = {{ provider_presets_json|safe }};
-const presetSelect = document.getElementById('provider_preset');
-const providerName = document.getElementById('provider_name');
-const loginUrl = document.getElementById('login_url');
-const providerColor = document.getElementById('provider_color');
-window.tmProviderPresetChanged = function(selectEl) {
-  const s = selectEl || document.getElementById('provider_preset');
-  const n = document.getElementById('provider_name');
-  const u = document.getElementById('login_url');
-  const option = s && s.options ? s.options[s.selectedIndex] : null;
-  const isManual = !!s && s.value === 'manual';
-  const name = option ? (option.getAttribute('data-provider-name') || '') : '';
-  const url = option ? (option.getAttribute('data-login-url') || '') : '';
-  if (n) {
-    n.value = isManual ? '' : name;
-    n.readOnly = !isManual;
-    n.required = isManual;
-    n.placeholder = isManual ? 'Provider name' : name;
-  }
-  if (u) {
-    u.value = isManual ? '' : url;
-    u.readOnly = !isManual && !!url;
-    u.required = isManual;
-    u.placeholder = isManual ? 'https://.../Account/Login' : (url || 'FOBS details not confirmed yet');
-  }
-  document.querySelectorAll('.manual-provider-field').forEach(function(field){
-    field.style.display = isManual ? 'grid' : 'none';
-  });
+window.TRAINERMATE_UI_CONFIG = {
+  csrfToken: '{{ csrf_token() }}',
+  providerPresets: {{ provider_presets_json|safe }},
+  autoDismissMissingCertificatePromptsUrl: '{{ url_for("auto_dismiss_missing_certificate_prompts") }}',
+  certificateBusy: {{ 'true' if certificate_busy else 'false' }}
 };
-(() => {
-  const screen = document.getElementById('tmStartupScreen');
-  if (!screen) return;
-  const title = document.getElementById('tmStartupTitle');
-  const subtitle = document.getElementById('tmStartupSubtitle');
-  const stepsEl = document.getElementById('tmStartupSteps');
-  const skip = document.getElementById('tmStartupSkip');
-  const skippedKey = 'tmStartupScreenSkipped';
-  let hidden = false;
-  let startedAt = Date.now();
-  let intervalId = null;
-
-  function hide(){
-    if (hidden) return;
-    hidden = true;
-    screen.classList.remove('show');
-    if (intervalId) window.clearInterval(intervalId);
-  }
-
-  function iconFor(status){
-    status = (status || '').toLowerCase();
-    if (status === 'complete') return 'OK';
-    if (status === 'skipped') return '-';
-    if (status === 'warning' || status === 'error') return '!';
-    return '...';
-  }
-
-  function render(data){
-    if (!stepsEl) return;
-    if (title) title.textContent = data.message || 'Getting TrainerMate ready';
-    if (subtitle) subtitle.textContent = data.running ? 'TrainerMate is getting today ready.' : 'Ready when you are.';
-    stepsEl.innerHTML = '';
-    (data.steps || []).forEach(function(step){
-      const status = (step.status || 'waiting').toLowerCase();
-      const row = document.createElement('div');
-      row.className = 'startup-step state-' + status;
-      const icon = document.createElement('span');
-      icon.className = 'startup-step-icon';
-      icon.textContent = iconFor(status);
-      const main = document.createElement('span');
-      main.className = 'startup-step-main';
-      const label = document.createElement('span');
-      label.className = 'startup-step-label';
-      label.textContent = step.label || '';
-      const detail = document.createElement('span');
-      detail.className = 'startup-step-detail';
-      detail.textContent = step.detail || '';
-      const state = document.createElement('span');
-      state.className = 'startup-step-state';
-      state.textContent = status === 'complete' ? 'done' : status;
-      main.appendChild(label);
-      main.appendChild(detail);
-      row.appendChild(icon);
-      row.appendChild(main);
-      row.appendChild(state);
-      stepsEl.appendChild(row);
-    });
-  }
-
-  async function pollStartup(){
-    if (hidden) return;
-    try {
-      const r = await fetch('/startup-status?_=' + Date.now(), {cache: 'no-store'});
-      if (!r.ok) throw new Error('HTTP ' + r.status);
-      const data = await r.json();
-      render(data);
-      if (data.done || (!data.running && Date.now() - startedAt > 1600)) {
-        window.setTimeout(hide, data.needs_attention ? 1800 : 700);
-      }
-    } catch (_) {
-      if (Date.now() - startedAt > 3500) hide();
-    }
-    if (Date.now() - startedAt > 14000) hide();
-  }
-
-  if (skip) {
-    skip.addEventListener('click', function(){
-      try { sessionStorage.setItem(skippedKey, '1'); } catch (_) {}
-      hide();
-    });
-  }
-
-  try {
-    if (sessionStorage.getItem(skippedKey) === '1') return;
-  } catch (_) {}
-  window.setTimeout(function(){
-    if (!hidden) screen.classList.add('show');
-  }, 120);
-  pollStartup();
-  intervalId = window.setInterval(pollStartup, 850);
-})();
-if (presetSelect && providerName && loginUrl) {
-  const applyProviderPreset = () => {
-    const option = presetSelect.options[presetSelect.selectedIndex];
-    const selected = presets[presetSelect.value] || {};
-    const isManual = presetSelect.value === 'manual';
-    const optionName = option && option.getAttribute('data-provider-name') ? option.getAttribute('data-provider-name') : '';
-    const optionUrl = option && option.getAttribute('data-login-url') ? option.getAttribute('data-login-url') : '';
-    const name = String(selected.name || optionName || '').trim();
-    const url = String(selected.login_url || optionUrl || '').trim();
-    if (!isManual) providerName.value = name;
-    else if (!providerName.value) providerName.value = '';
-    loginUrl.value = isManual ? loginUrl.value : url;
-    providerName.readOnly = !isManual;
-    loginUrl.readOnly = !isManual && !!url;
-    providerName.placeholder = isManual ? 'Provider name' : name;
-    loginUrl.placeholder = isManual ? 'https://.../Account/Login' : (url || 'FOBS details not confirmed yet');
-    if (providerColor && typeof selected.color === 'string') providerColor.value = selected.color;
-    const managed = document.querySelector('.provider-managed-toggle');
-    if (managed && typeof selected.provider_manages_zoom !== 'undefined') managed.checked = !!selected.provider_manages_zoom;
-    syncManagedZoom(document);
-    window.tmProviderPresetChanged(presetSelect);
-  };
-  presetSelect.addEventListener('change', applyProviderPreset);
-  presetSelect.addEventListener('change', () => window.tmProviderPresetChanged(presetSelect));
-  presetSelect.addEventListener('click', () => window.tmProviderPresetChanged(presetSelect));
-  applyProviderPreset();
-  window.tmProviderPresetChanged(presetSelect);
-}
-function syncManagedZoom(root) {
-  const forms = root.querySelectorAll ? root.querySelectorAll('form') : [];
-  forms.forEach(form => {
-    const managed = form.querySelector('.provider-managed-toggle');
-    const overwrite = form.querySelector('.overwrite-toggle');
-    if (!managed) return;
-    const refresh = () => {
-      if (overwrite && managed.checked) {
-        overwrite.checked = true;
-        overwrite.disabled = true;
-        overwrite.closest('.checkbox')?.classList.add('linked-setting');
-      } else if (overwrite) {
-        overwrite.disabled = false;
-        overwrite.closest('.checkbox')?.classList.remove('linked-setting');
-      }
-    };
-    managed.addEventListener('change', refresh);
-    refresh();
-  });
-}
-syncManagedZoom(document);
-
-(() => {
-  const rows = Array.from(document.querySelectorAll('[data-auto-dismiss-alert-id]'));
-  if (!rows.length) return;
-  let sent = false;
-  const dismissSeenCertificateNotices = () => {
-    if (sent) return;
-    sent = true;
-    const ids = Array.from(new Set(rows.flatMap((row) => (row.getAttribute('data-auto-dismiss-alert-id') || '').split(',')).map((id) => id.trim()).filter(Boolean)));
-    if (!ids.length) return;
-    const form = new FormData();
-    form.append('_csrf_token', '{{ csrf_token() }}');
-    ids.forEach((id) => form.append('alert_ids', id));
-    try {
-      if (navigator.sendBeacon) {
-        navigator.sendBeacon('{{ url_for("auto_dismiss_missing_certificate_prompts") }}', form);
-        return;
-      }
-    } catch (_) {}
-    try {
-      fetch('{{ url_for("auto_dismiss_missing_certificate_prompts") }}', {method: 'POST', body: form, keepalive: true, credentials: 'same-origin'});
-    } catch (_) {}
-  };
-  window.addEventListener('pagehide', dismissSeenCertificateNotices);
-  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') dismissSeenCertificateNotices(); });
-})();
-
-(() => {
-  document.querySelectorAll('form').forEach(function(form){
-    if (form.dataset.tmSubmitGuard === '1') return;
-    form.dataset.tmSubmitGuard = '1';
-    form.addEventListener('submit', function(event){
-      if (event.defaultPrevented) return true;
-      const method = (form.getAttribute('method') || 'get').toLowerCase();
-      if (method === 'post' && !form.querySelector('input[name="_csrf_token"]')) {
-        const token = document.createElement('input');
-        token.type = 'hidden';
-        token.name = '_csrf_token';
-        token.value = '{{ csrf_token() }}';
-        form.appendChild(token);
-      }
-      if (form.dataset.tmSubmitting === '1') {
-        event.preventDefault();
-        return false;
-      }
-      form.dataset.tmSubmitting = '1';
-      window.setTimeout(function(){
-        form.querySelectorAll('button[type="submit"],input[type="submit"]').forEach(function(button){
-          button.disabled = true;
-          if (button.tagName.toLowerCase() === 'button' && !button.dataset.tmOriginalText) {
-            button.dataset.tmOriginalText = button.textContent || '';
-            if ((button.textContent || '').trim()) button.textContent = 'Working...';
-          }
-        });
-      }, 0);
-      return true;
-    });
-  });
-})();
-
-(() => {
-  const debugDetailsEl = document.getElementById('debugDetails');
-  const debugLogEl = document.getElementById('debugLog');
-  const clearDebugBtn = document.getElementById('clearDebugBtn');
-  const copyDebugBtn = document.getElementById('copyDebugBtn');
-  const providerEl = document.getElementById('debugProvider');
-  const courseEl = document.getElementById('debugCourse');
-  const messageEl = document.getElementById('debugMessage');
-
-  if (!debugLogEl) return;
-
-  let userPinnedToBottom = true;
-  let lastText = debugLogEl.textContent || '';
-  let clearHoldUntil = 0;
-
-  function isNearBottom() {
-    return (debugLogEl.scrollHeight - debugLogEl.scrollTop - debugLogEl.clientHeight) < 24;
-  }
-
-  function forceBottom() {
-    debugLogEl.scrollTop = debugLogEl.scrollHeight;
-  }
-
-  function setTerminalText(text) {
-    text = text || '';
-    if (text === lastText) return;
-    lastText = text;
-    debugLogEl.textContent = text;
-    if (userPinnedToBottom) {
-      forceBottom();
-      requestAnimationFrame(forceBottom);
-    }
-  }
-
-  debugLogEl.addEventListener('scroll', () => {
-    userPinnedToBottom = isNearBottom();
-    debugLogEl.classList.toggle('user-scrolled', !userPinnedToBottom);
-  }, {passive: true});
-
-  if (debugDetailsEl) {
-    debugDetailsEl.addEventListener('toggle', () => {
-      if (debugDetailsEl.open && userPinnedToBottom) requestAnimationFrame(forceBottom);
-    });
-  }
-
-  async function refreshDebugState() {
-    try {
-      const r = await fetch('/debug-state?_=' + Date.now(), {cache: 'no-store'});
-      if (!r.ok) return;
-      const s = await r.json();
-      if (providerEl) providerEl.textContent = s.current_provider || '-';
-      if (courseEl) courseEl.textContent = s.current_course || '-';
-      if (messageEl) messageEl.textContent = s.last_message || s.last_status || s.last_run_status || 'Idle';
-    } catch (_) {}
-  }
-
-  async function refreshDebugLog() {
-    if (Date.now() < clearHoldUntil) return;
-    try {
-      const wasPinned = isNearBottom();
-      if (wasPinned) userPinnedToBottom = true;
-      const r = await fetch('/debug-log?lines=180&_=' + Date.now(), {cache: 'no-store'});
-      if (!r.ok) throw new Error('HTTP ' + r.status);
-      const data = await r.json();
-      const text = typeof data.text === 'string' ? data.text : ((data.lines || []).join('\n'));
-      setTerminalText(text);
-    } catch (err) {
-      setTerminalText('Live log unavailable: ' + err.message);
-    }
-  }
-
-  async function clearDebugLog() {
-    clearHoldUntil = Date.now() + 1200;
-    userPinnedToBottom = true;
-    setTerminalText('');
-    forceBottom();
-    try {
-      const r = await fetch('/debug-log/clear?_=' + Date.now(), {
-        method: 'POST',
-        cache: 'no-store',
-        headers: {'Cache-Control': 'no-cache'}
-      });
-      if (!r.ok) throw new Error('HTTP ' + r.status);
-      setTerminalText('');
-      setTimeout(refreshDebugLog, 1300);
-    } catch (err) {
-      setTerminalText('Could not clear log: ' + err.message);
-    }
-  }
-
-  function fallbackCopy(text) {
-    const ta = document.createElement('textarea');
-    ta.value = text;
-    ta.setAttribute('readonly', '');
-    ta.style.position = 'fixed';
-    ta.style.left = '-9999px';
-    ta.style.top = '0';
-    document.body.appendChild(ta);
-    ta.focus();
-    ta.select();
-    const ok = document.execCommand('copy');
-    document.body.removeChild(ta);
-    if (!ok) throw new Error('copy command failed');
-  }
-
-  async function copyLast30Lines() {
-    const text = (debugLogEl.textContent || '').split('\n').slice(-30).join('\n');
-    try {
-      if (navigator.clipboard && window.isSecureContext) {
-        await navigator.clipboard.writeText(text);
-      } else {
-        fallbackCopy(text);
-      }
-      copyDebugBtn.textContent = 'Copied';
-    } catch (err) {
-      try {
-        fallbackCopy(text);
-        copyDebugBtn.textContent = 'Copied';
-      } catch (_) {
-        copyDebugBtn.textContent = 'Copy failed';
-      }
-    }
-    setTimeout(() => { copyDebugBtn.textContent = 'Copy last 30 lines'; }, 1200);
-  }
-
-  if (clearDebugBtn) clearDebugBtn.onclick = clearDebugLog;
-  if (copyDebugBtn) copyDebugBtn.onclick = copyLast30Lines;
-
-  userPinnedToBottom = true;
-  forceBottom();
-  refreshDebugState();
-  refreshDebugLog();
-  setInterval(refreshDebugState, 1000);
-  setInterval(refreshDebugLog, 750);
-  window.addEventListener('load', () => requestAnimationFrame(forceBottom));
-})();
 </script>
-
-<script>
-(function(){
-  function setText(id, value){
-    var el = document.getElementById(id);
-    if(el) el.textContent = value || '-';
-  }
-
-  function makeRow(left, right){
-    var div = document.createElement('div');
-    div.className = 'live-status-row';
-    var a = document.createElement('span');
-    var b = document.createElement('span');
-    a.textContent = left || '';
-    b.textContent = right || '';
-    div.appendChild(a);
-    div.appendChild(b);
-    return div;
-  }
-
-  var tmSyncSawRunning = sessionStorage.getItem('tmSyncSawRunning') === '1';
-  var tmSyncReloading = false;
-  var tmSyncReloadTimer = null;
-  var tmSyncCompletionHoldMs = 18000;
-  function markSyncRunning(){
-    tmSyncSawRunning = true;
-    sessionStorage.setItem('tmSyncSawRunning', '1');
-  }
-  function clearSyncRunningMarker(){
-    tmSyncSawRunning = false;
-    sessionStorage.removeItem('tmSyncSawRunning');
-  }
-  function reloadDashboardAfterSync(){
-    if(tmSyncReloading) return;
-    tmSyncReloading = true;
-    clearSyncRunningMarker();
-    var target = new URL(window.location.href);
-    target.searchParams.set('section', 'dashboard');
-    target.searchParams.set('sync_refreshed', Date.now().toString());
-    window.location.href = target.toString();
-  }
-
-  function rememberSyncCompletion(message){
-    try{
-      if(!message) return;
-      sessionStorage.setItem('tmLastSyncCompletion', JSON.stringify({message:String(message), at:Date.now()}));
-    }catch(e){}
-  }
-  function recentSyncCompletion(){
-    try{
-      var raw = sessionStorage.getItem('tmLastSyncCompletion');
-      if(!raw) return '';
-      var obj = JSON.parse(raw);
-      if(!obj || !obj.message || Date.now() - Number(obj.at || 0) > tmSyncCompletionHoldMs){
-        sessionStorage.removeItem('tmLastSyncCompletion');
-        return '';
-      }
-      return String(obj.message || '');
-    }catch(e){ return ''; }
-  }
-
-  var tmCertificateRefreshPending = sessionStorage.getItem('tmCertificateRefreshPending') === '1';
-  var tmCertificateRefreshSawRunning = sessionStorage.getItem('tmCertificateRefreshSawRunning') === '1';
-  var tmObservedCertificateRunning = sessionStorage.getItem('tmObservedCertificateRunning') === '1';
-  var tmCertificateStayInPlace = sessionStorage.getItem('tmCertificateStayInPlace') === '1';
-  var tmCertificateDeleteRow = null;
-  function markCertificateRefreshStarted(){
-    tmCertificateRefreshPending = true;
-    tmCertificateRefreshSawRunning = false;
-    tmCertificateStayInPlace = false;
-    sessionStorage.setItem('tmCertificateRefreshPending', '1');
-    sessionStorage.setItem('tmCertificateRefreshSawRunning', '0');
-    sessionStorage.removeItem('tmCertificateStayInPlace');
-  }
-  function markCertificateInPlaceStarted(){
-    tmCertificateRefreshPending = true;
-    tmCertificateRefreshSawRunning = false;
-    tmCertificateStayInPlace = true;
-    sessionStorage.setItem('tmCertificateRefreshPending', '1');
-    sessionStorage.setItem('tmCertificateRefreshSawRunning', '0');
-    sessionStorage.setItem('tmCertificateStayInPlace', '1');
-  }
-  function markCertificateRefreshRunning(){
-    tmCertificateRefreshSawRunning = true;
-    tmObservedCertificateRunning = true;
-    sessionStorage.setItem('tmCertificateRefreshSawRunning', '1');
-    sessionStorage.setItem('tmObservedCertificateRunning', '1');
-  }
-  function clearCertificateRefreshMarker(){
-    tmCertificateRefreshPending = false;
-    tmCertificateRefreshSawRunning = false;
-    tmObservedCertificateRunning = false;
-    sessionStorage.removeItem('tmCertificateRefreshPending');
-    sessionStorage.removeItem('tmCertificateRefreshSawRunning');
-    sessionStorage.removeItem('tmObservedCertificateRunning');
-    sessionStorage.removeItem('tmCertificateStayInPlace');
-  }
-  function reloadCertificatesView(){
-    clearCertificateRefreshMarker();
-    var target = new URL(window.location.href);
-    target.searchParams.set('section', 'files');
-    target.searchParams.set('certificates_refreshed', Date.now().toString());
-    window.location.href = target.toString();
-  }
-  function finishCertificateInPlace(latestStatus){
-    var row = tmCertificateDeleteRow;
-    clearCertificateRefreshMarker();
-    if(row && (latestStatus || '').toLowerCase() === 'complete'){
-      row.style.transition = 'opacity .22s ease';
-      row.style.opacity = '0';
-      window.setTimeout(function(){ if(row.parentNode) row.parentNode.removeChild(row); }, 240);
-    } else if(row) {
-      row.querySelectorAll('button,input,select,textarea').forEach(function(control){ control.disabled = false; });
-      row.querySelectorAll('.provider-certificate-delete-form').forEach(function(form){ form.classList.remove('is-working'); form.dataset.tmSubmitting = '0'; });
-      row.querySelectorAll('.btn.remove-fobs').forEach(function(button){ button.textContent = button.dataset.tmOriginalText || 'Remove from FOBS'; });
-      row.querySelectorAll('.provider-delete-cancel').forEach(function(button){ button.textContent = 'Cancel'; });
-    }
-    tmCertificateDeleteRow = null;
-  }
-
-  async function refreshTrainerMateLiveStatus(){
-    try{
-      var r = await fetch('/live-status?_=' + Date.now(), {cache:'no-store'});
-      if(!r.ok) throw new Error('HTTP ' + r.status);
-      var data = await r.json();
-
-      var syncIsRunning = !!data.sync_running;
-      if(syncIsRunning){
-        if(tmSyncReloadTimer){ window.clearTimeout(tmSyncReloadTimer); tmSyncReloadTimer = null; }
-        markSyncRunning();
-      } else if(tmSyncSawRunning){
-        var terminalState = String(data.sync_state || '').toLowerCase();
-        if(terminalState.indexOf('complete') >= 0 || terminalState.indexOf('stopped') >= 0 || terminalState.indexOf('idle') >= 0 || terminalState.indexOf('failed') >= 0 || terminalState.indexOf('warning') >= 0){
-          if(!tmSyncReloadTimer){
-            // Keep the completion result visible long enough to read, then refresh rows automatically.
-            tmSyncReloadTimer = window.setTimeout(reloadDashboardAfterSync, 12000);
-          }
-        }
-      }
-
-      setText('tmLiveBadge', data.running ? 'syncing' : 'idle');
-      setText('tmLiveSyncState', data.sync_state || 'Idle');
-      setText('tmLiveProvider', data.current_provider || '-');
-      setText('tmLiveCourse', data.current_course || '-');
-      setText('tmLiveZoom', data.zoom_result || 'Waiting');
-
-      var list = document.getElementById('tmLiveList');
-      if(list){
-        list.innerHTML = '';
-        (data.rows || []).forEach(function(item){
-          list.appendChild(makeRow(item.left, item.right));
-        });
-      }
-      var bubble = document.getElementById('tmProgressBubble');
-      var title = document.getElementById('tmProgressTitle');
-      var subtitle = document.getElementById('tmProgressSubtitle');
-      var state = document.getElementById('tmProgressState');
-      var icon = document.getElementById('tmProgressIcon');
-      var body = document.getElementById('tmProgressBody');
-      var syncOverlay = document.getElementById('tmSyncOverlay');
-      if(syncOverlay) syncOverlay.classList.toggle('is-visible', !!data.sync_running);
-      var certProgress = document.getElementById('tmCertificateProgress');
-      var certTitle = document.getElementById('tmCertificateProgressTitle');
-      var certDetail = document.getElementById('tmCertificateProgressDetail');
-      var certState = document.getElementById('tmCertificateProgressState');
-      var certWorkspace = document.getElementById('tmCertificateWorkspace');
-      var certBusyNote = document.getElementById('tmCertificateBusyNote');
-      var certBusyTitle = document.getElementById('tmCertificateBusyTitle');
-      var certBusyDetail = document.getElementById('tmCertificateBusyDetail');
-      if(certWorkspace) certWorkspace.classList.toggle('certificate-has-attention', !!document.querySelector('.certificate-attention'));
-      if(certProgress){
-        var cert = data.certificate_scan || {};
-        var latest = cert.latest || {};
-        var certRunning = !!data.certificate_running;
-        certProgress.classList.remove('idle','running','error');
-        certProgress.classList.add(certRunning ? 'running' : ((latest.status || '').toLowerCase() === 'error' ? 'error' : 'idle'));
-        if(certTitle) certTitle.textContent = latest.message || (certRunning ? 'Refreshing FOBS certificates' : 'Certificate refresh idle');
-        if(certDetail) certDetail.textContent = latest.detail || (certRunning ? 'Checking provider certificate lists.' : 'Refresh FOBS certificates to check provider files.');
-        if(certState) {
-          certState.textContent = certRunning ? 'working' : (latest.status || 'idle');
-          certState.className = 'status-tag ' + (certRunning ? 'due' : ((latest.status || '').toLowerCase() === 'error' ? 'bad' : 'neutral'));
-        }
-        var detailText = (latest.detail || '').toLowerCase();
-        var messageText = (latest.message || '').toLowerCase();
-        var lightCertificateTask = certRunning && (detailText.indexOf('remove the certificate') >= 0 || detailText.indexOf('gone from fobs') >= 0 || messageText.indexOf('removing from') >= 0);
-        if(certWorkspace) certWorkspace.classList.toggle('certificate-busy', certRunning && !lightCertificateTask);
-        if(certBusyTitle) certBusyTitle.textContent = latest.message || 'TrainerMate is checking certificates';
-        if(certBusyDetail) certBusyDetail.textContent = latest.detail || 'Checking the provider certificate lists.';
-        document.querySelectorAll('.certificate-job-control').forEach(function(control){
-          if(control.closest('.provider-certificate-delete-form.is-working')) return;
-          control.disabled = certRunning && !lightCertificateTask;
-        });
-        if(certRunning){
-          markCertificateRefreshRunning();
-        } else if((tmCertificateRefreshPending || tmObservedCertificateRunning || tmCertificateRefreshSawRunning) && ['complete','error','cancelled'].indexOf((latest.status || '').toLowerCase()) >= 0){
-          if(tmCertificateStayInPlace){
-            window.setTimeout(function(){ finishCertificateInPlace(latest.status || ''); }, 350);
-          } else {
-            window.setTimeout(reloadCertificatesView, 350);
-          }
-        }
-      }
-      document.querySelectorAll('.provider-certificate-delete-form').forEach(function(form){
-        if(form.dataset.tmBound === '1') return;
-        form.dataset.tmBound = '1';
-        form.addEventListener('submit', function(e){
-          e.preventDefault();
-          if(form.dataset.tmSubmitting === '1') return false;
-          form.dataset.tmSubmitting = '1';
-          markCertificateInPlaceStarted();
-          tmCertificateDeleteRow = form.closest('tr');
-          form.classList.add('is-working');
-          var btn = form.querySelector('button');
-          var cancelBtn = form.querySelector('.provider-delete-cancel');
-          if(btn){
-            btn.disabled = true;
-            if(!btn.dataset.tmOriginalText) btn.dataset.tmOriginalText = btn.textContent || 'Remove from FOBS';
-            btn.textContent = 'Removing...';
-          }
-          if(cancelBtn) cancelBtn.disabled = false;
-          if(certProgress){
-            certProgress.classList.remove('idle','error');
-            certProgress.classList.add('running');
-          }
-          var providerName = form.dataset.providerName || 'provider';
-          if(certTitle) certTitle.textContent = 'Removing from ' + providerName;
-          if(certDetail) certDetail.textContent = 'TrainerMate is asking FOBS to remove the certificate.';
-          if(certState) {
-            certState.textContent = 'working';
-            certState.className = 'status-tag due';
-          }
-          fetch(form.action, {
-            method:'POST',
-            body:new FormData(form),
-            credentials:'same-origin',
-            headers:{'Accept':'application/json'}
-          })
-            .then(function(r){ if(!r.ok) throw new Error('HTTP ' + r.status); return r.json().catch(function(){ return {}; }); })
-            .then(function(payload){
-              if(payload && payload.started === false) throw new Error(payload.message || 'Not started');
-              refreshTrainerMateLiveStatus();
-            })
-            .catch(function(){
-              form.classList.remove('is-working');
-              form.dataset.tmSubmitting = '0';
-              if(btn){
-                btn.disabled = false;
-                btn.textContent = btn.dataset.tmOriginalText || 'Remove from FOBS';
-              }
-              if(cancelBtn) cancelBtn.disabled = false;
-              clearCertificateRefreshMarker();
-            });
-        }, true);
-        var cancel = form.querySelector('.provider-delete-cancel');
-        if(cancel && cancel.dataset.tmCancelBound !== '1'){
-          cancel.dataset.tmCancelBound = '1';
-          cancel.addEventListener('click', function(){
-            if(form.dataset.tmSubmitting !== '1') return;
-            cancel.disabled = true;
-            cancel.textContent = 'Cancelling...';
-            if(certDetail) certDetail.textContent = 'Cancelling if FOBS has not removed it yet.';
-            fetch(form.dataset.cancelAction || '', {
-              method:'POST',
-              body:new FormData(form),
-              credentials:'same-origin',
-              headers:{'Accept':'application/json'}
-            }).catch(function(){});
-          });
-        }
-      });
-      document.querySelectorAll('.certificate-refresh-form').forEach(function(form){
-        if(form.dataset.tmBound === '1') return;
-        form.dataset.tmBound = '1';
-        form.addEventListener('submit', function(e){
-          e.preventDefault();
-          markCertificateRefreshStarted();
-          var btn = form.querySelector('button');
-          if(btn){
-            btn.disabled = true;
-            btn.textContent = 'Starting...';
-          }
-          if(certProgress){
-            certProgress.classList.remove('idle','error');
-            certProgress.classList.add('running');
-          }
-          if(certTitle) certTitle.textContent = 'Starting certificate refresh';
-          if(certDetail) certDetail.textContent = 'TrainerMate will keep checking this for you.';
-          if(certState) {
-            certState.textContent = 'working';
-            certState.className = 'status-tag due';
-          }
-          fetch(form.action, {method:'POST', body:new FormData(form), credentials:'same-origin'})
-            .then(function(){ refreshTrainerMateLiveStatus(); })
-            .catch(function(){ form.submit(); });
-        });
-      });
-      if(bubble && body){
-        var doneMessage = data.completion_message || data.progress_summary || data.last_message || '';
-        if(doneMessage && doneMessage !== 'No sync running.') rememberSyncCompletion(doneMessage);
-        if((!doneMessage || doneMessage === 'No sync running.') && !data.running){
-          doneMessage = recentSyncCompletion();
-        }
-        var hasDoneMessage = !!(doneMessage && doneMessage !== 'No sync running.');
-        bubble.classList.remove('idle','running','error','done');
-        bubble.classList.add(data.running ? 'running' : ((data.sync_state || '').toLowerCase().indexOf('error') >= 0 ? 'error' : (hasDoneMessage ? 'done' : 'idle')));
-        if(title) title.textContent = data.certificate_running ? 'Checking certificates' : (data.running ? 'Syncing TrainerMate' : (hasDoneMessage ? 'Sync completed' : 'TrainerMate ready'));
-        if(subtitle) subtitle.textContent = data.running ? (data.progress_summary || data.current_course || data.current_provider || 'Working on this now.') : (doneMessage || 'No sync running.');
-        if(state) state.textContent = data.running ? 'working' : (hasDoneMessage ? 'done' : 'idle');
-        if(icon) icon.textContent = data.running ? '...' : (hasDoneMessage ? '✓' : 'OK');
-        if((data.running || hasDoneMessage) && bubble) bubble.open = true;
-        body.innerHTML = '';
-        var renderedRows = (data.rows || []).slice(0, 8);
-        if(!renderedRows.length && hasDoneMessage){
-          renderedRows = [{left:'Latest sync', right:doneMessage}];
-        }
-        renderedRows.forEach(function(item){
-          var step = document.createElement('div');
-          step.className = 'tm-progress-step';
-          var dot = document.createElement('i');
-          var span = document.createElement('span');
-          span.textContent = item.left || '';
-          var small = document.createElement('small');
-          small.textContent = item.right || '';
-          span.appendChild(small);
-          step.appendChild(dot);
-          step.appendChild(span);
-          body.appendChild(step);
-        });
-      }
-    }catch(err){
-      // Keep the page calm if the one-second status poll misses while the dashboard is starting/reloading.
-      setText('tmLiveBadge', 'idle');
-      setText('tmLiveSyncState', 'Waiting for dashboard status');
-      var certProgress = document.getElementById('tmCertificateProgress');
-      var certTitle = document.getElementById('tmCertificateProgressTitle');
-      var certDetail = document.getElementById('tmCertificateProgressDetail');
-      var certState = document.getElementById('tmCertificateProgressState');
-      if(certProgress){
-        certProgress.classList.remove('running','error');
-        certProgress.classList.add('idle');
-      }
-      var certWorkspace = document.getElementById('tmCertificateWorkspace');
-      if(certWorkspace) certWorkspace.classList.remove('certificate-busy');
-      document.querySelectorAll('.certificate-job-control').forEach(function(control){
-        control.disabled = false;
-      });
-      if(certTitle) certTitle.textContent = 'Dashboard status loading';
-      if(certDetail) certDetail.textContent = 'This usually clears after a refresh or restart.';
-      if(certState){
-        certState.textContent = 'idle';
-        certState.className = 'status-tag neutral';
-      }
-      var syncOverlay = document.getElementById('tmSyncOverlay');
-      if(syncOverlay) syncOverlay.classList.remove('is-visible');
-      var list = document.getElementById('tmLiveList');
-      if(list){
-        list.innerHTML = '';
-        list.appendChild(makeRow('Waiting for status', 'Refresh the page if this stays here.'));
-      }
-    }
-  }
-
-  document.querySelectorAll('form.scan-form, form[action*="/sync/start"]').forEach(function(form){
-    if(form.dataset.tmSyncSubmitBound === '1') return;
-    form.dataset.tmSyncSubmitBound = '1';
-    form.addEventListener('submit', function(){
-      markSyncRunning();
-      var bubble = document.getElementById('tmProgressBubble');
-      var title = document.getElementById('tmProgressTitle');
-      var subtitle = document.getElementById('tmProgressSubtitle');
-      var state = document.getElementById('tmProgressState');
-      var icon = document.getElementById('tmProgressIcon');
-      var syncOverlay = document.getElementById('tmSyncOverlay');
-      if(syncOverlay) syncOverlay.classList.add('is-visible');
-      if(bubble){
-        bubble.classList.remove('idle','error');
-        bubble.classList.add('running');
-        bubble.open = true;
-      }
-      if(title) title.textContent = 'Syncing TrainerMate';
-      if(subtitle) subtitle.textContent = 'Starting sync. TrainerMate will update this panel as courses are checked.';
-      if(state) state.textContent = 'working';
-      if(icon) icon.textContent = '...';
-    });
-  });
-
-  if(document.readyState === 'loading'){
-    document.addEventListener('DOMContentLoaded', refreshTrainerMateLiveStatus);
-  } else {
-    refreshTrainerMateLiveStatus();
-  }
-  setInterval(refreshTrainerMateLiveStatus, 1000);
-})();
-(function(){
-  const master = document.getElementById('selectAllDocumentProviders');
-  const boxes = Array.from(document.querySelectorAll('.document-provider-checkbox'));
-  if (!master || !boxes.length) return;
-  const setProviderLockedState = () => {
-    boxes.forEach((box) => {
-      box.disabled = master.checked;
-      if (master.checked) box.checked = true;
-      const label = box.closest('label');
-      if (label) {
-        label.classList.toggle('is-disabled', master.checked);
-        label.setAttribute('aria-disabled', master.checked ? 'true' : 'false');
-      }
-    });
-  };
-  const syncMaster = () => {
-    master.checked = boxes.every((box) => box.checked);
-    setProviderLockedState();
-  };
-  master.addEventListener('change', () => {
-    boxes.forEach((box) => { box.checked = master.checked; });
-    setProviderLockedState();
-  });
-  boxes.forEach((box) => box.addEventListener('change', syncMaster));
-  syncMaster();
-})();
-
-</script>
-
-
-
-
-<div class="tm-sync-overlay" id="tmSyncOverlay" aria-live="polite" aria-hidden="true">
-  <div class="tm-sync-overlay-card">
-    <span class="tm-sync-overlay-spinner"></span>
-    <span><span class="tm-sync-overlay-title">TrainerMate is checking your courses</span><span class="tm-sync-overlay-detail">This will clear automatically when sync completes.</span></span>
-  </div>
-</div>
-
+<script src='{{ url_for("static", filename="app_ui.js") }}'></script>
+<script src='{{ url_for("static", filename="live_status.js") }}'></script>
 <details class="tm-progress-bubble idle" id="tmProgressBubble">
   <summary>
     <span class="tm-progress-icon" id="tmProgressIcon">OK</span>
@@ -9082,202 +8901,7 @@ syncManagedZoom(document);
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/fullcalendar@6.1.15/index.global.min.js"></script>
-<script>
-(function(){
-  const calendarEl = document.getElementById('tmCalendar');
-  if(!calendarEl) return;
-
-  const modal = document.getElementById('tmCourseModal');
-  const close = document.getElementById('tmModalClose');
-  const confirmForm = document.getElementById('tmConfirmRemovedForm');
-  const openBothBtn = document.getElementById('tmOpenBothBtn');
-  const openZoomBtn = document.getElementById('tmOpenZoomBtn');
-  const openFobsBtn = document.getElementById('tmOpenFobsBtn');
-  const openJoinBtn = document.getElementById('tmOpenJoinBtn');
-  const launchStatus = document.getElementById('tmLaunchStatus');
-  let currentToolUrls = {};
-  let fobsStatusTimer = null;
-  function setText(id, value){ const el=document.getElementById(id); if(el) el.textContent=value || '-'; }
-  function setLink(el, url){ if(!el) return; if(url){el.href=url;el.classList.remove('disabled');el.removeAttribute('aria-disabled');}else{el.href='#';el.classList.add('disabled');el.setAttribute('aria-disabled','true');} }
-  function openUrl(url){ if(url){ window.open(url, '_blank', 'noopener'); } }
-  function setLaunchStatus(message, level){
-    if(!launchStatus) return;
-    launchStatus.textContent = message || '';
-    launchStatus.className = 'launch-status' + (level ? ' ' + level : '');
-  }
-  function stopFobsStatusPolling(){
-    if(fobsStatusTimer){
-      clearInterval(fobsStatusTimer);
-      fobsStatusTimer = null;
-    }
-  }
-  function pollFobsStatus(launchId){
-    stopFobsStatusPolling();
-    if(!launchId) return;
-    const refresh = function(){
-      fetch('/calendar/fobs-launch-status/' + encodeURIComponent(launchId), {cache: 'no-store'})
-        .then(function(response){ if(!response.ok){ throw new Error('HTTP ' + response.status); } return response.json(); })
-        .then(function(data){
-          const status = data.status || '';
-          if(data.message){ setLaunchStatus(data.message, status === 'error' ? 'error' : ''); }
-          if(status === 'opened' || status === 'error'){
-            stopFobsStatusPolling();
-          }
-        })
-        .catch(function(err){
-          setLaunchStatus('Could not read FOBS launch status: ' + err, 'warn');
-          stopFobsStatusPolling();
-        });
-    };
-    refresh();
-    fobsStatusTimer = setInterval(refresh, 1000);
-  }
-  function launchFobsCourse(url){
-    if(!url){ return false; }
-    setLaunchStatus('Starting authenticated FOBS browser. This can take a few seconds...', '');
-    fetch(url, {method: 'GET', credentials: 'same-origin'})
-      .then(function(response){
-        if(!response.ok){ throw new Error('HTTP ' + response.status); }
-        return response.json().catch(function(){ return {}; });
-      })
-      .then(function(data){
-        if(data && data.ok === false){ throw new Error(data.error || 'FOBS launch failed'); }
-        setLaunchStatus('FOBS is opening in a separate TrainerMate browser window. It will log in and then open the course summary.', '');
-        if(data && data.launchId){ pollFobsStatus(data.launchId); }
-      })
-      .catch(function(err){ setLaunchStatus('TrainerMate could not start FOBS automatically: ' + err, 'error'); });
-    return true;
-  }
-  function openTwoTabs(firstUrl, secondUrl){
-    // Avoid popup blockers by opening only the Zoom tab from the browser.
-    // FOBS is opened by TrainerMate in an authenticated Playwright browser window.
-    const zoomUrl = firstUrl || '';
-    const fobsUrl = secondUrl || '';
-    if(zoomUrl){
-      const tab = window.open(zoomUrl, '_blank', 'noopener');
-      if(!tab){
-        setLaunchStatus('Zoom tab was blocked. Use the separate Open Zoom meeting button, or allow popups for TrainerMate.', 'warn');
-      } else {
-        setLaunchStatus('Zoom meeting opened. Starting FOBS next...', '');
-      }
-    }
-    if(fobsUrl){
-      launchFobsCourse(fobsUrl);
-    }
-    if(!zoomUrl && !fobsUrl){
-      setLaunchStatus('No Zoom or FOBS link is available for this course yet. Run sync/import first.', 'warn');
-    }
-  }
-  function setStatusClass(value){ const el=document.getElementById('tmModalStatus'); if(!el) return; el.className='status-tag neutral'; const v=(value||'').toLowerCase(); if(v.includes('sync due')) el.className='status-tag due'; else if(v.includes('need')) el.className='status-tag bad'; else if(v.includes('synced')||v.includes('ready')) el.className='status-tag ok'; else if(v.includes('later')||v.includes('scheduled')) el.className='status-tag later'; }
-  function openModal(props){
-    currentToolUrls = props || {};
-    stopFobsStatusPolling();
-    setLaunchStatus('', '');
-    setText('tmModalProvider', props.provider || 'Course');
-    setText('tmModalProviderName', props.provider || '-');
-    setText('tmModalTitle', props.courseTitle || 'Course');
-    setText('tmModalDate', props.date || '');
-    setText('tmModalTime', props.time || '');
-    setText('tmModalStatus', props.status || 'Status');
-    setStatusClass(props.status || '');
-    setText('tmModalAdvice', props.advice || props.note || '');
-    const zoomLabel = props.providerManagesZoom ? 'Provider managed' : (props.zoomAccountLabel || 'Linked Zoom account not selected');
-    setText('tmModalZoomAccount', zoomLabel);
-    setText('tmModalMeetingId', props.meetingId || 'No Zoom meeting yet');
-    setText('tmModalFobsSpecific', props.fobsUrl ? (props.fobsUrlIsExact ? 'Course summary' : 'Provider course list') : 'Not available yet');
-    setLink(openZoomBtn, props.zoomUrl || props.zoomAccountUrl || '');
-    if(openZoomBtn){ openZoomBtn.textContent = props.zoomUrl ? 'Open Zoom meeting' : 'Open Zoom account'; }
-    setLink(openFobsBtn, props.fobsLaunchUrl || props.fobsUrl || '');
-    if(openFobsBtn){ openFobsBtn.textContent = 'Open FOBS course'; }
-    setLink(openJoinBtn, props.meetingLink || '');
-    if(openBothBtn){
-      openBothBtn.disabled = !(props.zoomUrl || props.fobsLaunchUrl || props.fobsUrl);
-      openBothBtn.classList.toggle('disabled', openBothBtn.disabled);
-      openBothBtn.textContent = 'Open Zoom meeting + FOBS';
-    }
-    const helper = document.getElementById('tmModalHelper');
-    if(helper){
-      helper.textContent = props.zoomUrl
-        ? ('Opens the Zoom meeting summary. If Zoom asks you to sign in or switch account, use ' + zoomLabel + '. Then FOBS opens separately.')
-        : ('No specific Zoom meeting is stored yet. Open ' + zoomLabel + ' and FOBS to check this course.');
-    }
-    if(confirmForm){
-      if(props.canConfirmRemoved && props.courseId){
-        confirmForm.style.display = 'block';
-        confirmForm.action = '/course/' + encodeURIComponent(props.courseId) + '/confirm-removed';
-      } else {
-        confirmForm.style.display = 'none';
-        confirmForm.action = '#';
-      }
-    }
-    if(modal) modal.classList.add('open');
-  }
-  if(openBothBtn) openBothBtn.onclick = function(){
-    openTwoTabs(currentToolUrls.zoomUrl || '', currentToolUrls.fobsLaunchUrl || currentToolUrls.fobsUrl || '');
-  };
-  if(openFobsBtn) openFobsBtn.onclick = function(e){
-    const fobsUrl = currentToolUrls.fobsLaunchUrl || currentToolUrls.fobsUrl || '';
-    if(fobsUrl && fobsUrl.indexOf('/calendar/open-fobs-course/') === 0){
-      e.preventDefault();
-      launchFobsCourse(fobsUrl);
-    }
-  };
-  function closeCourseModal(e){
-    if(e) e.preventDefault();
-    stopFobsStatusPolling();
-    if(modal) modal.classList.remove('open');
-  }
-  if(close) close.addEventListener('click', closeCourseModal);
-  if(modal) modal.addEventListener('click', (e) => {
-    const closeTrigger = e.target && e.target.closest && e.target.closest('[data-calendar-modal-close],#tmModalClose,.modal-close');
-    if(e.target === modal || closeTrigger){
-      closeCourseModal(e);
-    }
-  });
-
-  const params = new URLSearchParams(window.location.search);
-  const provider = params.get('provider') || 'all';
-
-  const calendar = new FullCalendar.Calendar(calendarEl, {
-    initialView: 'dayGridMonth',
-    height: 'auto',
-    firstDay: 1,
-    nowIndicator: true,
-    headerToolbar: {
-      left: 'prev,next today',
-      center: 'title',
-      right: 'dayGridMonth,timeGridWeek,listMonth'
-    },
-    eventTimeFormat: {hour: '2-digit', minute: '2-digit', hour12: false},
-    slotLabelFormat: {hour: '2-digit', minute: '2-digit', hour12: false},
-    dayHeaderFormat: {weekday: 'short', day: 'numeric', month: 'numeric'},
-    dayMaxEventRows: 4,
-    views: { dayGridMonth: { dayMaxEventRows: 4 } },
-    events: '/calendar-events?provider=' + encodeURIComponent(provider),
-    eventContent: function(arg) {
-      const esc = function(value){return String(value || '').replace(/[&<>]/g, function(c){return ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]);});};
-      const p = arg.event.extendedProps || {};
-      return {html: '<div class="tm-cal-event"><div class="tm-cal-time">' + esc(arg.timeText) + '</div><div class="tm-cal-title">' + esc(p.courseTitle || arg.event.title || 'Course') + '</div><div class="tm-cal-provider">' + esc(p.provider || '') + (p.status ? ' - ' + esc(p.status) : '') + '</div></div>'};
-    },
-    eventClick: function(info) {
-      info.jsEvent.preventDefault();
-      openModal(info.event.extendedProps || {});
-    },
-    // TRAINERMATE_PROTECTED: calendar-provider-colours
-    // Do not remove this block. Month view must force provider colours onto the rendered event element.
-    eventDidMount: function(info) {
-      const p = info.event.extendedProps || {};
-      const color = p.providerColor || info.event.backgroundColor || '#2563eb';
-      const textColor = info.event.textColor || '#ffffff';
-      info.el.style.backgroundColor = color;
-      info.el.style.borderColor = color;
-      info.el.style.color = textColor;
-      info.el.title = (p.status || '') + (p.note ? ' - ' + p.note : '');
-    }
-  });
-  calendar.render();
-})();
-</script>
+<script src='{{ url_for("static", filename="calendar.js") }}'></script>
 
 </body>
 </html>
@@ -9302,7 +8926,7 @@ def get_flash():
 def remember_add_document_form(form):
     session['add_document_form'] = {
         'expiry_date': (form.get('expiry_date') or '').strip(),
-        'provider_ids': valid_document_provider_ids(form.getlist('provider_ids')),
+        'provider_ids': selected_document_provider_ids(form),
     }
 
 
@@ -9349,32 +8973,13 @@ def tail_bot_log(max_lines=120):
     Keep this deliberately boring: the terminal should display the file tail,
     not synthetic appended state lines. That makes Clear log genuinely empty.
     """
-    try:
-        max_lines = max(1, min(int(max_lines or 120), 500))
-    except Exception:
-        max_lines = 120
-
-    if not BOT_LOG_PATH.exists():
-        return []
-
-    try:
-        with BOT_LOG_PATH.open('r', encoding='utf-8', errors='replace') as f:
-            lines = [line.rstrip('\n') for line in f.readlines()]
-    except Exception as exc:
-        return [f'Could not read debug log: {exc}']
-
-    latest_start = None
-    for idx, line in enumerate(lines):
-        if 'Sync starting' in line or '[MAIN] Bot starting.' in line:
-            latest_start = idx
-    if latest_start is not None:
-        lines = lines[latest_start:]
-
-    return lines[-max_lines:]
+    return tail_log(BOT_LOG_PATH, max_lines=max_lines)
 
 
 @app.route('/debug-log')
 def debug_log():
+    if not debug_tools_enabled():
+        abort(404)
     try:
         max_lines = int(request.args.get('lines', '160') or 160)
     except Exception:
@@ -9385,6 +8990,8 @@ def debug_log():
 
 @app.route('/debug-log/clear', methods=['POST'])
 def clear_debug_log():
+    if not debug_tools_enabled():
+        abort(404)
     try:
         BOT_LOG_PATH.write_text('', encoding='utf-8')
         return jsonify({'ok': True, 'lines': [], 'text': '', 'message': 'Log cleared.'})
@@ -9394,7 +9001,9 @@ def clear_debug_log():
 
 @app.route('/debug-state')
 def debug_state():
-    state = reconcile_running_state()
+    if not debug_tools_enabled():
+        abort(404)
+    state = load_app_state()
     return jsonify({
         'sync_running': bool(state.get('sync_running')),
         'pid': state.get('pid'),
@@ -9451,7 +9060,7 @@ def _live_course_sort_key(item):
 
 @app.route('/live-status')
 def live_status_panel():
-    state = reconcile_running_state()
+    state = load_app_state()
     cert_snapshot = certificate_scan_snapshot()
 
     running = bool(state.get('sync_running') or state.get('running'))
@@ -9461,16 +9070,6 @@ def live_status_panel():
     last_status = (state.get('last_status') or state.get('status') or '').strip()
     last_message = (state.get('last_message') or state.get('message') or '').strip()
     last_run_status = (state.get('last_run_status') or '').strip()
-    zoom_connected_for_status = has_connected_zoom_account()
-
-    def stale_zoom_disconnected_message(value):
-        text = str(value or '').strip().lower()
-        return 'zoom is not connected yet' in text or 'connect zoom before syncing' in text
-
-    # If Zoom has since been connected, do not keep showing an old
-    # pre-connection warning in the live bubble/status panel.
-    if zoom_connected_for_status and stale_zoom_disconnected_message(last_message) and not running:
-        last_message = ''
 
     sync_state = 'Sync running' if running else ('Certificate refresh running' if cert_running else (last_status or last_run_status or 'Idle'))
     zoom_result = 'Waiting'
@@ -9491,28 +9090,6 @@ def live_status_panel():
         rows.append({'left': 'Requested scan', 'right': f'{provider_text} - {days_text}'})
 
     summary = state.get('run_summary') if isinstance(state.get('run_summary'), dict) else {}
-    completion_message = ''
-    if summary and not running:
-        msg = summary.get('message') or last_message or ''
-        if zoom_connected_for_status and stale_zoom_disconnected_message(msg):
-            msg = ''
-        if msg:
-            completion_message = str(msg)
-            rows.append({'left': 'Latest sync', 'right': completion_message})
-        counters = []
-        for label, key in (
-            ('found', 'courses_found'),
-            ('processed', 'courses_processed'),
-            ('checked', 'fobs_checked'),
-            ('verified existing', 'zoom_existing_verified'),
-            ('created/refreshed', 'fobs_updated'),
-            ('failed', 'fobs_failed'),
-        ):
-            if summary.get(key) is not None:
-                counters.append(f"{summary.get(key)} {label}")
-        if counters:
-            rows.append({'left': 'Course totals', 'right': ' - '.join(counters)})
-
     if summary and running:
         msg = summary.get('message') or summary.get('outcome') or ''
         if msg:
@@ -9523,8 +9100,7 @@ def live_status_panel():
             ('found', 'courses_found'),
             ('processed', 'courses_processed'),
             ('checked', 'fobs_checked'),
-            ('verified existing', 'zoom_existing_verified'),
-            ('created/refreshed', 'fobs_updated'),
+            ('updated', 'fobs_updated'),
             ('failed', 'fobs_failed'),
         ):
             if summary.get(key) is not None:
@@ -9532,12 +9108,10 @@ def live_status_panel():
         if counters and running:
             rows.append({'left': 'Course totals', 'right': ' - '.join(counters)})
 
-        if int(summary.get('zoom_existing_verified') or 0):
-            zoom_result = f"{summary.get('zoom_existing_verified')} existing Zoom meeting(s) verified"
-        elif summary.get('fobs_updated') is not None:
-            zoom_result = f"{summary.get('fobs_updated')} Zoom meeting(s) created/refreshed"
+        if summary.get('fobs_updated') is not None:
+            zoom_result = f"{summary.get('fobs_updated')} Zoom link(s) updated"
         elif summary.get('fobs_checked') is not None:
-            zoom_result = f"{summary.get('fobs_checked')} Zoom meeting(s) checked"
+            zoom_result = f"{summary.get('fobs_checked')} Zoom link(s) checked"
 
     if running:
         courses = state.get('courses') if isinstance(state.get('courses'), dict) else {}
@@ -9552,8 +9126,8 @@ def live_status_panel():
             lower = action.lower()
 
             if 'already has valid live zoom' in lower or 'already present' in lower or 'zoom joining instructions already present' in lower:
-                result = 'Zoom meeting already exists - verified'
-                zoom_result = 'Existing Zoom meeting verified'
+                result = 'FOBS + Zoom OK'
+                zoom_result = 'Existing Zoom instructions found'
             elif 'updated successfully' in lower or 'fobs updated successfully' in lower:
                 result = 'Zoom link updated successfully'
                 zoom_result = 'Zoom link updated'
@@ -9570,18 +9144,21 @@ def live_status_panel():
 
             rows.append({'left': key, 'right': result})
 
-    for cert_state in cert_snapshot.get('rows', []):
-        msg = cert_state.get('message') or ''
-        detail = cert_state.get('detail') or ''
-        if msg and (cert_running or not rows):
+    if cert_running:
+        for cert_state in cert_snapshot.get('rows', []):
+            msg = cert_state.get('message') or ''
+            detail = cert_state.get('detail') or ''
+            if msg:
+                rows.append({'left': msg, 'right': detail})
+    elif not rows:
+        latest_cert = cert_snapshot.get('latest') or {}
+        msg = latest_cert.get('message') or ''
+        detail = latest_cert.get('detail') or ''
+        if msg:
             rows.append({'left': msg, 'right': detail})
 
     if not rows:
-        if last_message and not running and not (zoom_connected_for_status and stale_zoom_disconnected_message(last_message)):
-            completion_message = last_message
-            rows.append({'left': 'Latest sync', 'right': last_message})
-        else:
-            rows.append({'left': 'No sync running', 'right': 'Start sync or refresh certificates to see live progress here.'})
+        rows.append({'left': 'No sync running', 'right': 'Start sync or refresh certificates to see live progress here.'})
 
     if cert_running:
         latest_cert = cert_snapshot.get('latest') or {}
@@ -9589,7 +9166,7 @@ def live_status_panel():
     elif running:
         progress_summary = current_course or last_message or (rows[0].get('right') if rows else '')
     else:
-        progress_summary = completion_message or last_message or 'No sync running.'
+        progress_summary = 'No sync running.'
 
     return jsonify({
         'running': running or cert_running,
@@ -9600,9 +9177,6 @@ def live_status_panel():
         'current_course': current_course or '-',
         'zoom_result': zoom_result,
         'progress_summary': progress_summary,
-        'completion_message': completion_message,
-        'last_message': last_message,
-        'last_run_status': last_run_status,
         'certificate_scan': cert_snapshot,
         'rows': rows,
     })
@@ -9617,7 +9191,9 @@ def startup_status_panel():
     active_provider_count = sum(1 for provider in providers if provider.get('active', True))
     course_count = sum(course_counts_by_provider().values())
 
-    cert_latest = cert_snapshot.get('latest') or {}
+    cert_rows = cert_snapshot.get('rows') if isinstance(cert_snapshot.get('rows'), list) else []
+    cert_all = next((row for row in cert_rows if row.get('provider_id') == 'all'), None)
+    cert_latest = cert_all if (cert_all and not cert_snapshot.get('running')) else (cert_snapshot.get('latest') or {})
     cert_status = (cert_latest.get('status') or 'idle').lower()
     if not STARTUP_CERTIFICATE_SCAN_ENABLED:
         provider_step = {
@@ -9638,7 +9214,7 @@ def startup_status_panel():
             'key': 'providers',
             'label': cert_latest.get('message') or 'Checking providers',
             'status': 'running',
-            'detail': cert_latest.get('detail') or 'Checking provider certificate lists.',
+            'detail': cert_latest.get('detail') or 'Updating your certificate list.',
         }
     elif cert_status in {'complete', 'error'}:
         provider_step = {
@@ -9652,14 +9228,14 @@ def startup_status_panel():
             'key': 'providers',
             'label': 'Checking providers',
             'status': 'waiting',
-            'detail': 'Provider certificate check is queued.',
+            'detail': 'Certificate check will start shortly.',
         }
     else:
         provider_step = {
             'key': 'providers',
             'label': 'Checking providers',
             'status': 'waiting',
-            'detail': 'Provider checks will start shortly.',
+            'detail': 'Certificate check will start shortly.',
         }
 
     zoom_state = (zoom_status.get('status') or 'idle').lower()
@@ -9818,6 +9394,8 @@ def build_course_action_alerts(rows, dismissed=None, state=None):
         if zoom_resolution_alert:
             title = 'Zoom link mismatch confirmed'
             action = 'zoom_resolution'
+            if row.get('starts_within_72h'):
+                title = 'Course starts soon - Zoom decision needed'
         elif row_status == 'needs confirmation' or row.get('can_confirm_removed'):
             title = 'Confirm provider cancellation/deletion'
         elif row_status in {'not checked', 'not synced', 'sync due'}:
@@ -9834,6 +9412,7 @@ def build_course_action_alerts(rows, dismissed=None, state=None):
             'title_text': row.get('title') or '',
             'date_time_raw': row.get('date_time_raw') or '',
             'action': action,
+            'starts_within_72h': bool(row.get('starts_within_72h')),
         })
     if sync_recommended and 'course-sync-recommended' not in dismissed:
         providers = sorted({row.get('provider') or 'Provider' for row in sync_recommended})
@@ -9876,14 +9455,69 @@ def recommended_scan_days_for_rows(rows, active_sync_window_days):
         return 60
     return cap
 
+def actionable_health_issues(state, providers=None):
+    """Return current dashboard health issues, ignoring stale generic portal noise.
+
+    Older sync runs could record a provider as "portal unavailable" when a smart
+    sync did not actually inspect that provider. Treat those rows as run noise
+    unless the provider is explicitly paused/failed in the saved provider config.
+    """
+    issues = list(state.get('health_issues') or []) if isinstance(state, dict) else []
+    summary = state.get('run_summary') if isinstance(state.get('run_summary'), dict) else {}
+    provider_results = summary.get('providers') if isinstance(summary.get('providers'), list) else []
+    provider_result_by_id = {
+        provider_slug(item.get('id') or item.get('name') or ''): item
+        for item in provider_results
+        if isinstance(item, dict)
+    }
+    provider_config_by_id = {
+        provider_slug(item.get('id') or item.get('name') or ''): item
+        for item in (providers or [])
+        if isinstance(item, dict)
+    }
+    filtered = []
+    for issue in issues:
+        text = str(issue or '').strip()
+        lower_text = text.lower()
+        if 'portal unavailable or login did not complete for' in lower_text:
+            provider_name = lower_text.split('for', 1)[-1].strip(' .')
+            provider_id = provider_slug(provider_name)
+            result = provider_result_by_id.get(provider_id) or {}
+            config = provider_config_by_id.get(provider_id) or {}
+            explicitly_failed = bool(config.get('paused_for_login') or config.get('last_login_test_status') == 'failed')
+            empty_unchecked_result = (
+                (result.get('status') or '').lower() == 'unavailable'
+                and int(result.get('courses_found') or 0) == 0
+                and int(result.get('courses_processed') or 0) == 0
+                and int(result.get('fobs_failed') or 0) == 0
+            )
+            if empty_unchecked_result and not explicitly_failed:
+                continue
+        if text:
+            filtered.append(text)
+    return filtered
+
+
 def build_recommendation(courses, providers, state, active_sync_window_days):
     """Return one compact recommendation, capped to the issue date range."""
-    health_text = ' '.join(str(x) for x in (state.get('health_issues') or [])) if isinstance(state, dict) else ''
+    health_text = ' '.join(str(x) for x in actionable_health_issues(state, providers)) if isinstance(state, dict) else ''
     last_message = (state.get('last_message') or '') if isinstance(state, dict) else ''
     combined = f'{health_text} {last_message}'.lower()
 
+    paused_providers = [p for p in (providers or []) if p.get('paused_for_login') or p.get('last_login_test_status') == 'failed']
+    if paused_providers:
+        names = [p.get('name') or p.get('id') or 'Provider' for p in paused_providers]
+        shown = ', '.join(names[:3])
+        if len(names) > 3:
+            shown += f' +{len(names) - 3} more'
+        return {'action': 'providers', 'title': f'Provider login needs checking: {shown}', 'reason': f'TrainerMate has paused automatic checks for {shown} to avoid repeated failed logins or account lockout. Open Manage providers, reconfirm the FOBS details, then use Test login to resume.', 'provider': 'all', 'days': min(active_sync_window_days or 84, 14)}
+
     if 'login' in combined or 'credential' in combined:
-        return {'action': 'providers', 'title': 'Provider login needs checking', 'reason': 'TrainerMate can no longer log in to one provider. If the password changed, open Manage providers and reconfirm it.', 'provider': 'all', 'days': min(active_sync_window_days or 84, 14)}
+        provider_names = [p.get('name') or p.get('id') for p in (providers or []) if p.get('last_login_test_message') or p.get('paused_for_login')]
+        provider_names = [n for n in provider_names if n]
+        if provider_names:
+            shown = ', '.join(provider_names[:3])
+            return {'action': 'providers', 'title': f'Provider login needs checking: {shown}', 'reason': f'TrainerMate can no longer log in to {shown}. If the password changed, open Manage providers, reconfirm it, then use Test login.', 'provider': 'all', 'days': min(active_sync_window_days or 84, 14)}
     if 'zoom' in combined and ('token' in combined or 'disconnect' in combined or 'oauth' in combined):
         return {'action': 'zoom', 'title': 'Check Zoom connection', 'reason': 'Zoom access needs attention before syncing will be reliable.', 'provider': 'all', 'days': min(active_sync_window_days or 84, 14)}
 
@@ -9899,10 +9533,15 @@ def build_recommendation(courses, providers, state, active_sync_window_days):
 
     zoom_resolution_row = next((r for r in action_rows if r.get('zoom_mismatch_confirmed')), None)
     if zoom_resolution_row:
+        starts_soon = bool(zoom_resolution_row.get('starts_within_72h'))
         return {
             'action': 'zoom_resolution',
-            'title': 'Resolve Zoom link mismatch',
-            'reason': f"{zoom_resolution_row.get('provider')} - {zoom_resolution_row.get('title')} - {zoom_resolution_row.get('date_label')} - {zoom_resolution_row.get('time_label')} has already been checked and needs a decision.",
+            'title': 'Course starts soon - Zoom decision needed' if starts_soon else 'Resolve Zoom link mismatch',
+            'reason': (
+                f"{zoom_resolution_row.get('provider')} - {zoom_resolution_row.get('title')} - {zoom_resolution_row.get('date_label')} - {zoom_resolution_row.get('time_label')} starts within 72 hours. TrainerMate has protected the existing FOBS link; choose Keep FOBS link or Replace Zoom link."
+                if starts_soon else
+                f"{zoom_resolution_row.get('provider')} - {zoom_resolution_row.get('title')} - {zoom_resolution_row.get('date_label')} - {zoom_resolution_row.get('time_label')} has already been checked and needs a decision."
+            ),
             'provider': zoom_resolution_row.get('provider_id') or 'all',
             'days': scan_days_for_course_datetime(zoom_resolution_row.get('date_time_raw') or '', active_sync_window_days),
             'course_id': zoom_resolution_row.get('id') or '',
@@ -9910,10 +9549,23 @@ def build_recommendation(courses, providers, state, active_sync_window_days):
             'title_text': zoom_resolution_row.get('title') or '',
             'date_time_raw': zoom_resolution_row.get('date_time_raw') or '',
             'provider_name': zoom_resolution_row.get('provider') or '',
+            'starts_within_72h': starts_soon,
+            'help': 'TrainerMate will not disturb an existing FOBS link this close to delivery unless you explicitly choose Replace. Keep FOBS link records that decision; Replace queues a single-course replacement check.',
         }
 
     target_row = best_single_course_check_row(action_rows)
     if target_row:
+        status = (target_row.get('status_label') or '').lower()
+        if status in {'not checked', 'not synced', 'sync due'} and not row_needs_trainer_decision(target_row):
+            rec_days = recommended_scan_days_for_rows(action_rows, active_sync_window_days)
+            return {
+                'action': 'sync',
+                'title': 'Run a sync check',
+                'reason': f"{len(action_rows)} course(s) are due a normal check. The nearest is {target_row.get('provider')} - {target_row.get('title')} - {target_row.get('date_label')} - {target_row.get('time_label')}.",
+                'provider': 'all',
+                'days': rec_days,
+                'help': 'Runs TrainerMate’s normal course check for the selected provider/window. It reads FOBS, compares saved courses and Zoom details, and only updates where normal sync rules say it should.',
+            }
         return {
             'action': 'target_course',
             'title': f"Check {target_row.get('provider')} course only",
@@ -9925,6 +9577,7 @@ def build_recommendation(courses, providers, state, active_sync_window_days):
             'title_text': target_row.get('title') or '',
             'date_time_raw': target_row.get('date_time_raw') or '',
             'provider_name': target_row.get('provider') or '',
+            'help': 'Checks only this exact course against the provider. It is used when TrainerMate needs to confirm a possible mismatch, cancellation, or manual decision without scanning everything.',
         }
 
     rec_days = recommended_scan_days_for_rows(action_rows, active_sync_window_days)
@@ -9937,38 +9590,51 @@ def build_recommendation(courses, providers, state, active_sync_window_days):
     if len(by_provider) == 1:
         provider_id, rows = next(iter(by_provider.items()))
         provider_name = rows[0].get('provider') or 'selected provider'
-        return {'action': 'sync', 'title': f'Run {provider_name} sync', 'reason': f'{len(rows)} course(s) need checking within the {rec_label}.', 'provider': provider_id, 'days': rec_days}
+        return {'action': 'sync', 'title': f'Run {provider_name} sync check', 'reason': f'{len(rows)} course(s) are due a normal check within the {rec_label}.', 'provider': provider_id, 'days': rec_days, 'help': 'Runs TrainerMate’s normal check for this provider and selected time window. It reads FOBS, compares courses and Zoom details, and only updates where normal sync rules say it should.'}
 
-    return {'action': 'sync', 'title': 'Run all providers sync', 'reason': f'{len(action_rows)} course(s) need checking across multiple providers within the {rec_label}.', 'provider': 'all', 'days': rec_days}
+    return {'action': 'sync', 'title': 'Run all providers sync check', 'reason': f'{len(action_rows)} course(s) are due a normal check across multiple providers within the {rec_label}.', 'provider': 'all', 'days': rec_days, 'help': 'Runs TrainerMate’s normal check across providers in the selected time window. It reads FOBS, compares courses and Zoom details, and only updates where normal sync rules say it should.'}
 
 
 def dashboard_ready_model(state, courses, providers, zoom_accounts, dashboard_alerts):
-    attention_count = sum(1 for row in courses or [] if row.get('is_action_needed'))
+    attention_count = sum(1 for row in courses or [] if row_needs_trainer_decision(row))
+    health_issues = actionable_health_issues(state, providers)
+    decision_alerts = [alert for alert in (dashboard_alerts or []) if (alert.get('action') or '') != 'sync']
     provider_issues = [
         provider for provider in providers or []
         if not provider.get('active', True)
-        or not ((provider.get('credentials') or {}).get('username') and (provider.get('credentials') or {}).get('password'))
+        or provider.get('paused_for_login')
+        or provider.get('last_login_test_status') == 'failed'
     ]
     zoom_connected = any((account.get('status') or 'connected').lower() == 'connected' for account in zoom_accounts or [])
     if state.get('sync_running'):
         return {
             'tone': 'running',
-            'label': 'Sync running',
+            'label': 'Checking now',
             'title': 'TrainerMate is checking your courses',
-            'message': state.get('last_message') or 'This can carry on quietly while you work.',
+            'message': state.get('last_message') or 'This can carry on in the background while you work.',
         }
-    if dashboard_alerts or attention_count or state.get('health_issues') or provider_issues or not zoom_connected:
+    if decision_alerts or attention_count or health_issues or provider_issues or not zoom_connected:
+        if health_issues:
+            message = health_issues[0]
+        elif attention_count:
+            message = f'{attention_count} item(s) inside your sync window may need a quick check.'
+        elif provider_issues:
+            message = 'One or more providers are paused or need reconfirming.'
+        elif not zoom_connected:
+            message = 'Zoom is not connected, so course syncs may need setup first.'
+        else:
+            message = 'A quick check is recommended.'
         return {
             'tone': 'attention',
             'label': 'Needs attention',
             'title': 'A few things need a look',
-            'message': (state.get('health_issues') or [None])[0] or f'{attention_count + len(provider_issues)} item(s) may need a quick check.',
+            'message': message,
         }
     return {
         'tone': 'ready',
         'label': 'Ready',
         'title': 'Ready for today',
-        'message': 'Courses, providers and Zoom look in order.',
+        'message': 'Courses inside your sync window, providers and Zoom look in order.',
     }
 
 
@@ -10008,39 +9674,567 @@ def course_rows_for_today(rows):
     return today
 
 
-def compact_activity_items(limit=4):
-    return [item for item in reversed(load_activity_history()) if not item.get('dismissed_at')][:limit]
+def row_needs_trainer_decision(row):
+    if not isinstance(row, dict) or row.get('is_outside_window'):
+        return False
+    status = (row.get('status_label') or '').strip().lower()
+    message = (row.get('short_message') or '').strip().lower()
+    return bool(
+        status in {'needs attention', 'needs confirmation'}
+        or row.get('zoom_mismatch_confirmed')
+        or row.get('can_confirm_removed')
+        or 'manual decision' in message
+        or 'confirm to remove' in message
+    )
 
 
-
-@app.route('/login', methods=['GET', 'POST'])
-def trainer_login():
-    if not reviewer_demo_enabled():
-        return redirect(url_for('home'))
-    error = ''
-    default_email = os.getenv('TRAINERMATE_LOGIN_EMAIL', 'reviewer@zoom.us').strip() or 'reviewer@zoom.us'
-    entered_email = default_email
-    if request.method == 'POST':
-        entered_email = (request.form.get('email') or '').strip().lower()
-        supplied = request.form.get('password') or ''
-        expected = REVIEWER_PASSWORD or 'zoomreview'
-        if entered_email == default_email.lower() and hmac.compare_digest(supplied, expected):
-            session['reviewer_demo_ok'] = True
-            return redirect(request.args.get('next') or url_for('home'))
-        error = 'The email or password was not accepted.'
-    return render_template_string("""
-<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>TrainerMate Login</title>
-<style>body{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;background:#0b1220;color:#e5eefb;min-height:100vh;display:grid;place-items:center;padding:24px}.card{width:min(520px,100%);background:#111827;border:1px solid rgba(96,165,250,.35);border-radius:24px;padding:28px;box-shadow:0 24px 80px rgba(0,0,0,.35)}h1{margin:0 0 8px;font-size:28px}.muted{color:#a9b7cc;line-height:1.5;margin:0 0 22px}.field{display:grid;gap:8px;margin-bottom:16px}label{font-weight:800}input{border:1px solid #334155;background:#0f172a;color:white;border-radius:12px;padding:12px;font-size:16px}.btn{width:100%;border:0;border-radius:12px;background:#2563eb;color:white;font-weight:900;padding:12px 16px;cursor:pointer;font-size:16px}.err{color:#fecaca;background:rgba(220,38,38,.18);border:1px solid rgba(248,113,113,.35);border-radius:12px;padding:10px;margin-bottom:14px}</style></head>
-<body><main class="card"><h1>TrainerMate</h1><p class="muted">Sign in to open your TrainerMate dashboard.</p>{% if error %}<div class="err">{{ error }}</div>{% endif %}<form method="post">{{ csrf_hidden_field()|safe }}<div class="field"><label>Email</label><input type="email" name="email" value="{{ entered_email }}" autocomplete="username" autofocus required></div><div class="field"><label>Password</label><input type="password" name="password" autocomplete="current-password" required></div><button class="btn" type="submit">Sign in</button></form></main></body></html>
-    """, error=error, entered_email=entered_email, csrf_hidden_field=csrf_hidden_field)
-@app.route('/logout', methods=['POST'])
-def trainer_logout():
-    session.pop('reviewer_demo_ok', None)
-    return redirect(url_for('trainer_login'))
-
-@app.route('/health')
 def health_check():
     return 'OK', 200
+
+AUTH_TEMPLATE = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TrainerMate sign in</title>
+  <style>
+    :root{--navy:#083047;--teal:#1196a3;--blue:#2563eb;--text:#071225;--muted:#526985;--line:#cfe0f2;--warn-bg:#fff7ed;--warn-border:#fdba74;--warn-text:#8a2c0a}
+    *{box-sizing:border-box}html,body{min-height:100%;margin:0}body{font-family:Inter,Segoe UI,Arial,sans-serif;background:linear-gradient(180deg,#f4f9ff,#e8f2fb);color:var(--text);display:grid;place-items:center;padding:22px}.shell{width:min(900px,100%);min-height:540px;display:grid;grid-template-columns:360px 1fr;background:#fff;border:1px solid #d7e3f1;border-radius:26px;overflow:hidden;box-shadow:0 28px 80px rgba(15,23,42,.17)}
+    .brand{background:linear-gradient(180deg,#083047,#138f9a);color:#fff;padding:40px 32px;display:flex;align-items:center}.pill{display:inline-flex;border:1px solid rgba(255,255,255,.3);background:rgba(255,255,255,.12);border-radius:999px;padding:8px 12px;font-size:13px;font-weight:900;margin-bottom:18px}.brand h1{font-size:38px;line-height:1.06;margin:0 0 15px}.brand p{font-size:16px;line-height:1.45;margin:0 0 22px;max-width:300px}.mini-steps{display:grid;gap:10px;margin-top:26px}.mini-step{display:flex;gap:10px;align-items:center;color:#dff8fb;font-size:14px;font-weight:750}.dot{width:26px;height:26px;display:grid;place-items:center;border-radius:999px;background:rgba(255,255,255,.18);font-weight:950;color:#fff;flex:none}
+    .auth{display:grid;place-items:center;padding:34px}.login-card{width:min(390px,100%);border:1px solid var(--line);border-radius:22px;background:linear-gradient(180deg,#fbfdff,#f7fbff);padding:26px;box-shadow:0 18px 42px rgba(15,23,42,.09)}.logo-line{display:flex;align-items:center;gap:10px;margin-bottom:16px}.logo-mark{width:38px;height:38px;border-radius:13px;background:linear-gradient(135deg,var(--teal),var(--blue));display:grid;place-items:center;color:white;font-weight:950}.logo-line span{font-weight:950;color:#0b2b45}.message{border:1px solid var(--warn-border);background:var(--warn-bg);color:var(--warn-text);border-radius:14px;padding:12px 14px;font-weight:850;margin-bottom:14px;font-size:14px;line-height:1.35}.mode-title{margin:0 0 7px;font-size:27px;line-height:1.15}.mode-copy{margin:0 0 18px;color:var(--muted);font-size:14.5px;line-height:1.4}.field{margin-bottom:13px}.field label{display:block;font-size:13px;font-weight:900;margin:0 0 6px;color:#13233d}.field input{width:100%;height:47px;border:1px solid #bad0e8;border-radius:13px;background:#fff;padding:0 14px;font-size:16px;color:#071225}.field input:focus{outline:3px solid rgba(37,99,235,.15);border-color:#69a4ff}.remember-row{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:4px 0 16px}.remember{display:flex;align-items:center;gap:9px;font-size:13.5px;color:#18314f}.remember input{width:17px;height:17px}.small-link{border:0;background:transparent;padding:0;color:#0b5cab;font-weight:850;cursor:pointer;text-decoration:none;font-size:13.5px}.small-link:hover{text-decoration:underline}.btn{width:100%;height:48px;border:0;border-radius:14px;background:linear-gradient(90deg,var(--teal),var(--blue));color:white;font-size:15.5px;font-weight:950;cursor:pointer}.helper{font-size:13.5px;color:#526985;line-height:1.45;margin-top:18px;text-align:center}.helper b{color:#0b3d68}.auth-form{display:none}.auth-form.active{display:block}.fine-print{font-size:12.5px;color:#60758f;line-height:1.35;margin-top:14px;text-align:center}
+    @media(max-width:800px){body{padding:12px;display:block}.shell{grid-template-columns:1fr;min-height:auto;border-radius:20px}.brand{padding:28px 24px}.brand h1{font-size:32px}.brand p{max-width:none}.mini-steps{display:none}.auth{padding:20px}.login-card{padding:22px}}
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <section class="brand"><div><div class="pill">TrainerMate desktop</div><h1>Welcome to TrainerMate</h1><p>Manage providers, Zoom links and compliance from one clean dashboard.</p><div class="mini-steps"><div class="mini-step"><span class="dot">1</span><span>Sign in with your NDORS trainer ID</span></div><div class="mini-step"><span class="dot">2</span><span>Use your local TrainerMate password</span></div><div class="mini-step"><span class="dot">3</span><span>Set up providers and Zoom when ready</span></div></div></div></section>
+    <section class="auth"><div class="login-card"><div class="logo-line"><div class="logo-mark">TM</div><span>TrainerMate</span></div>{% if message %}<div class="message">{{ message }}</div>{% endif %}
+
+      <form id="loginForm" class="auth-form {% if auth_mode not in ['register','forgot'] %}active{% endif %}" method="post" action="{{ url_for('auth_login') }}">
+        {{ csrf_hidden_field()|safe }}<input type="hidden" name="next" value="{{ next_url }}">
+        <h2 class="mode-title">Log in</h2><p class="mode-copy">Enter your NDORS trainer ID and TrainerMate dashboard password.</p>
+        <div class="field"><label>NDORS trainer ID</label><input name="ndors" value="{{ ndors_prefill }}" autocomplete="username" required pattern="[A-Za-z0-9_-]+" title="Use your NDORS trainer ID, not your email address"></div>
+        <div class="field"><label>Password</label><input name="password" type="password" autocomplete="current-password" required></div>
+        <div class="remember-row"><label class="remember"><input type="checkbox" name="remember_me" value="1" {% if remember_me %}checked{% endif %}><span>Remember me</span></label><button class="small-link" type="button" data-mode="forgot">Forgot password?</button></div>
+        <button class="btn" type="submit">Log in</button>
+        <div class="helper">Not registered? <button class="small-link" type="button" data-mode="register"><b>Create free account</b></button></div>
+        <div class="fine-print">Use your NDORS trainer ID only. Email addresses are not accepted for login.</div>
+      </form>
+
+      <form id="registerForm" class="auth-form {% if auth_mode == 'register' %}active{% endif %}" method="post" action="{{ url_for('auth_register') }}">
+        {{ csrf_hidden_field()|safe }}<input type="hidden" name="next" value="{{ next_url }}">
+        <h2 class="mode-title">Create free account</h2><p class="mode-copy">Use your NDORS trainer ID, email address and a new TrainerMate password.</p>
+        <div class="field"><label>NDORS trainer ID</label><input name="ndors" value="{{ ndors_prefill }}" autocomplete="username" required pattern="[A-Za-z0-9_-]+" title="Use your NDORS trainer ID, not your email address"></div>
+        <div class="field"><label>Email address</label><input name="email" type="email" value="{{ identity.email }}" autocomplete="email" required></div>
+        <div class="field"><label>Create password</label><input name="password" type="password" autocomplete="new-password" minlength="8" required></div>
+        <div class="field"><label>Confirm password</label><input name="confirm_password" type="password" autocomplete="new-password" minlength="8" required></div>
+        <div class="remember-row"><label class="remember"><input type="checkbox" name="remember_me" value="1" {% if remember_me %}checked{% endif %}><span>Remember me</span></label><button class="small-link" type="button" data-mode="login">Already registered?</button></div>
+        <button class="btn" type="submit">Create free account</button>
+        <div class="helper">Already registered? <button class="small-link" type="button" data-mode="login"><b>Log in instead</b></button></div>
+      </form>
+
+      <form id="forgotForm" class="auth-form {% if auth_mode == 'forgot' %}active{% endif %}" method="post" action="{{ url_for('auth_forgot_password') }}">
+        {{ csrf_hidden_field()|safe }}<input type="hidden" name="next" value="{{ next_url }}">
+        <h2 class="mode-title">Reset password</h2><p class="mode-copy">Enter your NDORS trainer ID and registered email. TrainerMate will email a one-time reset code.</p>
+        <div class="field"><label>NDORS trainer ID</label><input name="ndors" value="{{ ndors_prefill }}" required pattern="[A-Za-z0-9_-]+" title="Use your NDORS trainer ID, not your email address"></div>
+        <div class="field"><label>Registered email</label><input name="email" type="email" value="" autocomplete="email" required></div>
+        <button class="btn" type="submit">Email reset code</button>
+        <div class="helper"><button class="small-link" type="button" data-mode="login"><b>Back to login</b></button></div>
+        <div class="fine-print">The code expires in 15 minutes and can only be used once.</div>
+      </form>
+    </div></section>
+  </main>
+  <script>
+    (function(){const forms={login:document.getElementById('loginForm'),register:document.getElementById('registerForm'),forgot:document.getElementById('forgotForm')};function setMode(mode){Object.keys(forms).forEach(k=>forms[k].classList.toggle('active',k===mode));try{history.replaceState(null,'','?mode='+mode);}catch(e){}}document.querySelectorAll('[data-mode]').forEach(btn=>btn.addEventListener('click',()=>setMode(btn.dataset.mode)));})();
+  </script>
+</body>
+</html>
+"""
+
+
+def safe_next_url(value):
+    value = (value or '').strip()
+    if not value or not value.startswith('/') or value.startswith('//'):
+        return url_for('home')
+    if value.startswith('/login') or value.startswith('/register') or value.startswith('/welcome'):
+        return url_for('home')
+    return value
+
+
+def safe_ndors_prefill(value):
+    value = (value or '').strip()
+    # Do not prefill an email address into the NDORS trainer ID box.
+    if '@' in value:
+        return ''
+    return value
+
+
+def valid_ndors_login_id(value):
+    value = (value or '').strip()
+    # Login must be by NDORS trainer ID only, never an email address.
+    if not value or '@' in value:
+        return False
+    return bool(re.match(r'^[A-Za-z0-9_-]{3,40}$', value))
+
+
+CHANGE_PASSWORD_TEMPLATE = """
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Change TrainerMate password</title>
+<style>
+body{margin:0;min-height:100vh;display:grid;place-items:center;background:#eef6fb;font-family:Inter,Segoe UI,Arial,sans-serif;color:#071225}.card{width:min(420px,calc(100vw - 28px));background:white;border:1px solid #cfe0f2;border-radius:20px;padding:26px;box-shadow:0 24px 70px rgba(15,23,42,.16)}h1{margin:0 0 8px;font-size:26px}.copy{color:#526985;line-height:1.4;margin:0 0 18px}.message{border:1px solid #fdba74;background:#fff7ed;color:#8a2c0a;border-radius:14px;padding:12px 14px;font-weight:850;margin-bottom:14px;font-size:14px;line-height:1.35}.field{margin-bottom:13px}.field label{display:block;font-size:13px;font-weight:900;margin:0 0 6px}.field input{width:100%;height:47px;border:1px solid #bad0e8;border-radius:13px;padding:0 14px;font-size:16px;box-sizing:border-box}.btn{width:100%;height:48px;border:0;border-radius:14px;background:linear-gradient(90deg,#1196a3,#2563eb);color:#fff;font-size:15.5px;font-weight:950;cursor:pointer}.fine{font-size:12.5px;color:#60758f;line-height:1.35;margin-top:14px;text-align:center}
+</style></head><body><main class="card">
+{% if message %}<div class="message">{{ message }}</div>{% endif %}
+<h1>Change password</h1><p class="copy">An admin reset your password. Enter the temporary password, then choose a new private password before using TrainerMate.</p>
+<form method="post" action="{{ url_for('auth_change_password') }}">
+{{ csrf_hidden_field()|safe }}<input type="hidden" name="next" value="{{ next_url }}">
+<div class="field"><label>NDORS trainer ID</label><input name="ndors" value="{{ ndors }}" readonly></div>
+<div class="field"><label>Temporary password</label><input name="current_password" type="password" autocomplete="current-password" required></div>
+<div class="field"><label>New password</label><input name="new_password" type="password" autocomplete="new-password" minlength="8" required></div>
+<div class="field"><label>Confirm new password</label><input name="confirm_password" type="password" autocomplete="new-password" minlength="8" required></div>
+<button class="btn" type="submit">Set new password</button>
+<div class="fine">Your new password is saved securely on this computer and in your TrainerMate account.</div>
+</form></main></body></html>
+"""
+
+
+RESET_CONFIRM_TEMPLATE = """
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reset TrainerMate password</title>
+<style>
+body{margin:0;min-height:100vh;display:grid;place-items:center;background:#eef6fb;font-family:Inter,Segoe UI,Arial,sans-serif;color:#071225}.card{width:min(420px,calc(100vw - 28px));background:white;border:1px solid #cfe0f2;border-radius:20px;padding:26px;box-shadow:0 24px 70px rgba(15,23,42,.16)}h1{margin:0 0 8px;font-size:26px}.copy{color:#526985;line-height:1.4;margin:0 0 18px}.message{border:1px solid #fdba74;background:#fff7ed;color:#8a2c0a;border-radius:14px;padding:12px 14px;font-weight:850;margin-bottom:14px;font-size:14px;line-height:1.35}.field{margin-bottom:13px}.field label{display:block;font-size:13px;font-weight:900;margin:0 0 6px}.field input{width:100%;height:47px;border:1px solid #bad0e8;border-radius:13px;padding:0 14px;font-size:16px;box-sizing:border-box}.btn{width:100%;height:48px;border:0;border-radius:14px;background:linear-gradient(90deg,#1196a3,#2563eb);color:#fff;font-size:15.5px;font-weight:950;cursor:pointer}.fine{font-size:12.5px;color:#60758f;line-height:1.35;margin-top:14px;text-align:center}
+</style></head><body><main class="card">
+{% if message %}<div class="message">{{ message }}</div>{% endif %}
+<h1>Enter reset code</h1><p class="copy">Check your registered email for the one-time TrainerMate reset code, then choose a new password.</p>
+<form method="post" action="{{ url_for('auth_confirm_password_reset') }}">
+{{ csrf_hidden_field()|safe }}<input type="hidden" name="next" value="{{ next_url }}">
+<div class="field"><label>NDORS trainer ID</label><input name="ndors" value="{{ ndors }}" readonly></div>
+<div class="field"><label>Reset code</label><input name="reset_token" autocomplete="one-time-code" required></div>
+<div class="field"><label>New password</label><input name="password" type="password" autocomplete="new-password" minlength="8" required></div>
+<div class="field"><label>Confirm new password</label><input name="confirm_password" type="password" autocomplete="new-password" minlength="8" required></div>
+<button class="btn" type="submit">Reset password</button>
+<div class="fine">The code expires after 15 minutes and only works once.</div>
+</form></main></body></html>
+"""
+
+
+@app.route('/welcome')
+def auth_welcome():
+    return render_template_string(
+        AUTH_TEMPLATE,
+        identity=get_identity(),
+        ndors_prefill=safe_ndors_prefill(get_identity().get('ndors')),
+        has_password=password_record_exists(),
+        next_url=safe_next_url(request.args.get('next') or ''),
+        message=session.pop('auth_message', ''),
+        auth_mode=session.pop('auth_mode', request.args.get('mode') or 'login'),
+        remember_me=local_remember_me_enabled(),
+        csrf_hidden_field=csrf_hidden_field,
+    )
+
+
+@app.get('/login')
+def auth_login_page():
+    return redirect(url_for('auth_welcome', next=safe_next_url(request.args.get('next') or ''), mode='login'))
+
+
+@app.get('/register')
+def auth_register_page():
+    return redirect(url_for('auth_welcome', next=safe_next_url(request.args.get('next') or ''), mode='register'))
+
+
+@app.get('/change-password')
+def auth_change_password_page():
+    ndors = safe_ndors_prefill(session.get('password_change_ndors') or get_identity().get('ndors'))
+    if not session.get('password_must_change') or not ndors:
+        return redirect(url_for('auth_welcome', mode='login'))
+    return render_template_string(
+        CHANGE_PASSWORD_TEMPLATE,
+        ndors=ndors,
+        next_url=safe_next_url(request.args.get('next') or ''),
+        message=session.pop('auth_message', ''),
+        csrf_hidden_field=csrf_hidden_field,
+    )
+
+
+@app.get('/confirm-password-reset')
+def auth_confirm_password_reset_page():
+    ndors = safe_ndors_prefill(session.get('reset_ndors') or get_identity().get('ndors'))
+    if not ndors:
+        return redirect(url_for('auth_welcome', mode='forgot'))
+    return render_template_string(
+        RESET_CONFIRM_TEMPLATE,
+        ndors=ndors,
+        next_url=safe_next_url(request.args.get('next') or ''),
+        message=session.pop('auth_message', ''),
+        csrf_hidden_field=csrf_hidden_field,
+    )
+
+
+@app.post('/change-password')
+def auth_change_password():
+    ndors = safe_ndors_prefill(session.get('password_change_ndors') or request.form.get('ndors') or get_identity().get('ndors'))
+    current_password = request.form.get('current_password') or ''
+    new_password = request.form.get('new_password') or ''
+    confirm = request.form.get('confirm_password') or ''
+    next_url = safe_next_url(request.form.get('next') or '')
+    if not session.get('password_must_change') or not valid_ndors_login_id(ndors):
+        return redirect(url_for('auth_welcome', mode='login'))
+    allowed, limit_message = check_local_auth_rate_limit('change_password', ndors, LOCAL_AUTH_RATE_LIMIT_MAX_ATTEMPTS)
+    if not allowed:
+        session['auth_message'] = limit_message
+        return redirect(url_for('auth_change_password_page', next=next_url))
+    if len(new_password) < 8:
+        session['auth_message'] = 'Choose a new password with at least 8 characters.'
+        return redirect(url_for('auth_change_password_page', next=next_url))
+    if new_password != confirm:
+        session['auth_message'] = 'The two new passwords did not match.'
+        return redirect(url_for('auth_change_password_page', next=next_url))
+    payload = {
+        'ndors_trainer_id': ndors,
+        'current_password': current_password,
+        'new_password': new_password,
+        'device_id': get_device_id(),
+        'device_name': 'desktop',
+        'app_version': APP_VERSION,
+    }
+    try:
+        response = requests.post(f'{API_URL}/change-password', json=payload, timeout=20)
+        if response.status_code != 200:
+            try:
+                detail = response.json().get('detail') or response.text
+            except Exception:
+                detail = response.text or 'Password change failed.'
+            session['auth_message'] = str(detail)
+            return redirect(url_for('auth_change_password_page', next=next_url))
+        data = response.json()
+        access = data.get('access') if isinstance(data, dict) else {}
+        set_local_password(new_password)
+        set_local_remember_me(False)
+        clear_password_change_required()
+        remember_dashboard_login(ndors)
+        clear_local_auth_rate_limit('change_password', ndors)
+        clear_local_auth_rate_limit('login', ndors)
+        if access:
+            save_cached_access(access)
+        set_flash('Password changed. TrainerMate is unlocked on this computer.', 'success')
+        return redirect(next_url)
+    except Exception as exc:
+        session['auth_message'] = f'Could not reach account service: {exc}'
+        return redirect(url_for('auth_change_password_page', next=next_url))
+
+
+@app.post('/register')
+def auth_register():
+    ndors = (request.form.get('ndors') or '').strip()
+    email = (request.form.get('email') or '').strip()
+    password = request.form.get('password') or ''
+    confirm = request.form.get('confirm_password') or ''
+    remember_me = request.form.get('remember_me') == '1'
+    next_url = safe_next_url(request.form.get('next') or '')
+    allowed, limit_message = check_local_auth_rate_limit('register', ndors, LOCAL_AUTH_RATE_LIMIT_MAX_ATTEMPTS)
+    if not allowed:
+        session['auth_message'] = limit_message
+        session['auth_mode'] = 'register'
+        return redirect(url_for('auth_welcome', next=next_url, mode='register'))
+    if not valid_ndors_login_id(ndors):
+        session['auth_message'] = 'Enter your NDORS trainer ID only. Do not use your email address.'
+        session['auth_mode'] = 'register'
+        return redirect(url_for('auth_welcome', next=next_url, mode='register'))
+    if not email or not re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', email):
+        session['auth_message'] = 'Enter a valid email address to register.'
+        session['auth_mode'] = 'register'
+        return redirect(url_for('auth_welcome', next=next_url, mode='register'))
+    if len(password) < 8:
+        session['auth_message'] = 'Choose a password with at least 8 characters.'
+        session['auth_mode'] = 'register'
+        return redirect(url_for('auth_welcome', next=next_url, mode='register'))
+    if password != confirm:
+        session['auth_message'] = 'The two passwords did not match.'
+        session['auth_mode'] = 'register'
+        return redirect(url_for('auth_welcome', next=next_url, mode='register'))
+
+    keyring.set_password('trainermate', 'ndors_id', ndors)
+    keyring.set_password('trainermate', 'email', email)
+    payload = {
+        'ndors_trainer_id': ndors,
+        'email': email,
+        'password': password,
+        'device_id': get_device_id(),
+        'device_name': 'desktop',
+        'app_version': APP_VERSION,
+    }
+    access = {}
+    remote_warning = ''
+    try:
+        response = requests.post(f'{API_URL}/register-account', json=payload, timeout=20)
+        if response.status_code in {200, 201}:
+            data = response.json()
+            access = data.get('access') if isinstance(data, dict) else {}
+            save_cached_access(access)
+        else:
+            try:
+                remote_warning = response.json().get('detail') or response.text
+            except Exception:
+                remote_warning = response.text or 'TrainerMate account service did not confirm registration.'
+    except Exception as exc:
+        remote_warning = f'Could not reach account service: {exc}'
+
+    if remote_warning:
+        session['auth_message'] = shorten_message(str(remote_warning), 220)
+        session['auth_mode'] = 'register'
+        return redirect(url_for('auth_welcome', next=next_url, mode='register'))
+
+    # Only set the local dashboard password after the account service accepts
+    # registration. This avoids turning registration into a password bypass for
+    # an existing NDORS account.
+    set_local_password(password)
+    set_local_remember_me(remember_me)
+    remember_dashboard_login(ndors)
+    clear_local_auth_rate_limit('register', ndors)
+    cached_paid = cached_access_for_identity(ndors)
+    if should_keep_paid_cache(access or {}, cached_paid):
+        access = cached_paid
+        save_cached_access(access)
+    elif access:
+        save_cached_access(access)
+    if access and access.get('allowed'):
+        set_flash('TrainerMate account ready. You can add providers and connect Zoom now.', 'success')
+    elif access:
+        set_flash(f"Local dashboard password saved, but access needs attention: {access.get('reason', 'unknown')}", 'warning')
+    else:
+        set_flash('Local dashboard password saved. You can continue setup now.', 'success')
+    return redirect(next_url)
+
+
+@app.post('/login')
+def auth_login():
+    ndors = (request.form.get('ndors') or '').strip()
+    password = request.form.get('password') or ''
+    remember_me = request.form.get('remember_me') == '1'
+    next_url = safe_next_url(request.form.get('next') or '')
+    identity = get_identity()
+    saved_ndors = safe_ndors_prefill(identity.get('ndors'))
+    allowed, limit_message = check_local_auth_rate_limit('login', ndors, LOCAL_AUTH_RATE_LIMIT_MAX_ATTEMPTS)
+    if not allowed:
+        session['auth_message'] = limit_message
+        session['auth_mode'] = 'login'
+        return redirect(url_for('auth_welcome', next=next_url, mode='login'))
+    if not valid_ndors_login_id(ndors):
+        session['auth_message'] = 'Use your NDORS trainer ID to log in. Email address login is no longer accepted.'
+        session['auth_mode'] = 'login'
+        return redirect(url_for('auth_welcome', next=next_url, mode='login'))
+    if password_record_exists() and verify_local_password(password) and (not saved_ndors or not ndors or ndors.lower() == saved_ndors.lower()):
+        try:
+            response = requests.post(f'{API_URL}/login-account', json={
+                'ndors_trainer_id': ndors or saved_ndors,
+                'password': password,
+                'device_id': get_device_id(),
+                'device_name': 'desktop',
+                'app_version': APP_VERSION,
+            }, timeout=8)
+            if response.status_code == 200:
+                data = response.json()
+                account = data.get('account') if isinstance(data, dict) else {}
+                access = data.get('access') if isinstance(data, dict) else {}
+                if account.get('password_must_change'):
+                    keyring.set_password('trainermate', 'ndors_id', ndors or saved_ndors)
+                    require_password_change(ndors or saved_ndors)
+                    return redirect(url_for('auth_change_password_page', next=next_url))
+                if ndors:
+                    keyring.set_password('trainermate', 'ndors_id', ndors)
+                set_local_remember_me(remember_me)
+                remember_dashboard_login(ndors or saved_ndors)
+                clear_password_change_required()
+                clear_local_auth_rate_limit('login', ndors or saved_ndors)
+                if access:
+                    save_cached_access(access)
+                return redirect(next_url)
+            try:
+                detail = response.json().get('detail') or response.text
+            except Exception:
+                detail = response.text or 'Login failed.'
+            session['auth_message'] = str(detail)
+            session['auth_mode'] = 'login'
+            return redirect(url_for('auth_welcome', next=next_url, mode='login'))
+        except Exception:
+            if ndors:
+                keyring.set_password('trainermate', 'ndors_id', ndors)
+            set_local_remember_me(remember_me)
+            remember_dashboard_login(ndors or saved_ndors)
+            clear_local_auth_rate_limit('login', ndors or saved_ndors)
+            return redirect(next_url)
+
+    payload = {
+        'ndors_trainer_id': ndors,
+        'password': password,
+        'device_id': get_device_id(),
+        'device_name': 'desktop',
+        'app_version': APP_VERSION,
+    }
+    try:
+        response = requests.post(f'{API_URL}/login-account', json=payload, timeout=20)
+        if response.status_code != 200:
+            try:
+                detail = response.json().get('detail') or response.text
+            except Exception:
+                detail = response.text or 'Login failed.'
+            if password_record_exists() and verify_local_password(password):
+                if ndors:
+                    keyring.set_password('trainermate', 'ndors_id', ndors)
+                set_local_remember_me(remember_me)
+                remember_dashboard_login(ndors or saved_ndors)
+                return redirect(next_url)
+            session['auth_message'] = str(detail)
+            session['auth_mode'] = 'login'
+            return redirect(url_for('auth_welcome', next=next_url, mode='login'))
+        data = response.json()
+        account = data.get('account') if isinstance(data, dict) else {}
+        access = data.get('access') if isinstance(data, dict) else {}
+        keyring.set_password('trainermate', 'ndors_id', ndors)
+        if account.get('email'):
+            keyring.set_password('trainermate', 'email', account.get('email'))
+        set_local_password(password)
+        if account.get('password_must_change'):
+            require_password_change(ndors)
+            clear_local_auth_rate_limit('login', ndors)
+            return redirect(url_for('auth_change_password_page', next=next_url))
+        set_local_remember_me(remember_me)
+        clear_password_change_required()
+        clear_local_auth_rate_limit('login', ndors)
+        cached_paid = cached_access_for_identity(ndors or saved_ndors)
+        if should_keep_paid_cache(access or {}, cached_paid):
+            access = cached_paid
+        if access:
+            save_cached_access(access)
+    except Exception as exc:
+        if password_record_exists() and verify_local_password(password):
+            set_local_remember_me(remember_me)
+            remember_dashboard_login(ndors or saved_ndors)
+            return redirect(next_url)
+        session['auth_message'] = f'Could not reach account service: {exc}'
+        session['auth_mode'] = 'login'
+        return redirect(url_for('auth_welcome', next=next_url, mode='login'))
+    remember_dashboard_login(ndors or saved_ndors)
+    return redirect(next_url)
+
+
+@app.post('/forgot-password')
+def auth_forgot_password():
+    ndors = (request.form.get('ndors') or '').strip()
+    email = (request.form.get('email') or '').strip()
+    next_url = safe_next_url(request.form.get('next') or '')
+    allowed, limit_message = check_local_auth_rate_limit('reset_password', ndors, LOCAL_AUTH_RESET_RATE_LIMIT_MAX_ATTEMPTS)
+    if not allowed:
+        session['auth_message'] = limit_message
+        session['auth_mode'] = 'forgot'
+        return redirect(url_for('auth_welcome', next=next_url, mode='forgot'))
+    if not valid_ndors_login_id(ndors):
+        session['auth_message'] = 'Enter your NDORS trainer ID only. Do not use your email address.'
+        session['auth_mode'] = 'forgot'
+        return redirect(url_for('auth_welcome', next=next_url, mode='forgot'))
+    if not email or not re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', email):
+        session['auth_message'] = 'Enter the email address registered to that NDORS ID.'
+        session['auth_mode'] = 'forgot'
+        return redirect(url_for('auth_welcome', next=next_url, mode='forgot'))
+    payload = {
+        'ndors_trainer_id': ndors,
+        'email': email,
+        'device_id': get_device_id(),
+        'device_name': 'desktop',
+        'app_version': APP_VERSION,
+    }
+    try:
+        response = requests.post(f'{API_URL}/reset-password', json=payload, timeout=20)
+        if response.status_code != 200:
+            try:
+                detail = response.json().get('detail') or response.text
+            except Exception:
+                detail = response.text or 'Password reset could not be verified.'
+            session['auth_message'] = str(detail)
+            session['auth_mode'] = 'forgot'
+            return redirect(url_for('auth_welcome', next=next_url, mode='forgot'))
+        keyring.set_password('trainermate', 'ndors_id', ndors)
+        keyring.set_password('trainermate', 'email', email)
+        session['reset_ndors'] = ndors
+        session['auth_message'] = 'If those details match, a one-time reset code has been emailed. Enter it below.'
+        return redirect(url_for('auth_confirm_password_reset_page', next=next_url))
+    except Exception as exc:
+        session['auth_message'] = f'Could not reach account service: {exc}'
+        session['auth_mode'] = 'forgot'
+        return redirect(url_for('auth_welcome', next=next_url, mode='forgot'))
+
+
+@app.post('/confirm-password-reset')
+def auth_confirm_password_reset():
+    ndors = safe_ndors_prefill(session.get('reset_ndors') or request.form.get('ndors') or '')
+    reset_token = (request.form.get('reset_token') or '').strip()
+    password = request.form.get('password') or ''
+    confirm = request.form.get('confirm_password') or ''
+    next_url = safe_next_url(request.form.get('next') or '')
+    allowed, limit_message = check_local_auth_rate_limit('confirm_password_reset', ndors, LOCAL_AUTH_RESET_RATE_LIMIT_MAX_ATTEMPTS)
+    if not allowed:
+        session['auth_message'] = limit_message
+        return redirect(url_for('auth_confirm_password_reset_page', next=next_url))
+    if not valid_ndors_login_id(ndors):
+        return redirect(url_for('auth_welcome', next=next_url, mode='forgot'))
+    if len(password) < 8:
+        session['auth_message'] = 'Choose a new password with at least 8 characters.'
+        return redirect(url_for('auth_confirm_password_reset_page', next=next_url))
+    if password != confirm:
+        session['auth_message'] = 'The two new passwords did not match.'
+        return redirect(url_for('auth_confirm_password_reset_page', next=next_url))
+    payload = {
+        'ndors_trainer_id': ndors,
+        'reset_token': reset_token,
+        'password': password,
+        'device_id': get_device_id(),
+        'device_name': 'desktop',
+        'app_version': APP_VERSION,
+    }
+    try:
+        response = requests.post(f'{API_URL}/confirm-password-reset', json=payload, timeout=20)
+        if response.status_code != 200:
+            try:
+                detail = response.json().get('detail') or response.text
+            except Exception:
+                detail = response.text or 'Password reset could not be verified.'
+            session['auth_message'] = str(detail)
+            return redirect(url_for('auth_confirm_password_reset_page', next=next_url))
+        data = response.json()
+        access = data.get('access') if isinstance(data, dict) else {}
+        keyring.set_password('trainermate', 'ndors_id', ndors)
+        set_local_password(password)
+        set_local_remember_me(False)
+        session.pop('reset_ndors', None)
+        clear_password_change_required()
+        clear_local_auth_rate_limit('reset_password', ndors)
+        clear_local_auth_rate_limit('confirm_password_reset', ndors)
+        clear_local_auth_rate_limit('login', ndors)
+        if access:
+            save_cached_access(access)
+        remember_dashboard_login(ndors)
+        set_flash('Password reset. TrainerMate is unlocked on this computer.', 'success')
+        return redirect(next_url)
+    except Exception as exc:
+        session['auth_message'] = f'Could not reach account service: {exc}'
+        return redirect(url_for('auth_confirm_password_reset_page', next=next_url))
+
+
+@app.post('/logout')
+def auth_logout():
+    session.pop('trainer_auth_ok', None)
+    session.pop('trainer_auth_ndors', None)
+    clear_password_change_required()
+    set_local_remember_me(False)
+    return redirect(url_for('auth_welcome'))
+
+
+@app.post('/account/remember-me')
+def update_remember_me():
+    set_local_remember_me(request.form.get('remember_me') == '1')
+    set_flash('Remember me setting updated.', 'success')
+    return redirect(url_for('home'))
 
 @app.route('/')
 @app.route('/dashboard')
@@ -10048,6 +10242,13 @@ def home():
     state = reconcile_running_state()
     access = check_access(timeout_seconds=HOME_ACCESS_TIMEOUT_SECONDS, prefer_cached=True)
     identity = get_identity()
+    if isinstance(access, dict) and access.get('password_must_change'):
+        require_password_change(identity.get('ndors'))
+        return redirect(url_for('auth_change_password_page', next=request.full_path if request.query_string else request.path))
+    cached_paid = cached_access_for_identity(identity.get('ndors'))
+    if should_keep_paid_cache(access or {}, cached_paid):
+        access = cached_paid
+        save_cached_access(access)
     sync_provider_login_failures_from_state()
     providers = load_providers()
     zoom_accounts = load_zoom_accounts()
@@ -10057,23 +10258,53 @@ def home():
     if selected_provider == 'provider':
         selected_provider = 'all'
     current_section = (request.args.get('section') or 'dashboard').strip().lower()
-    if current_section not in {'dashboard', 'setup', 'manage_providers', 'zoom_accounts', 'automation', 'activity', 'calendar', 'files'}:
+    if current_section == 'activity':
+        current_section = 'support'
+    if current_section not in {'dashboard', 'setup', 'manage_providers', 'zoom_accounts', 'automation', 'support', 'diagnostics', 'calendar', 'files'}:
         current_section = 'dashboard'
     if current_section == 'dashboard' and not providers:
         current_section = 'setup'
-    if current_section == 'dashboard':
+    if providers:
+        # Keep the read-only startup certificate scan on the dashboard/course view.
+        # This warms the certificate cache in the background so the Certificates
+        # page opens quickly later; the Certificates page now auto-refreshes when
+        # this background scan finishes.
         start_startup_certificate_scan_once(providers)
     clear_false_zoom_mismatch_flags()
     raw_courses = load_courses(selected_provider)
     repair_pending_upload_presence()
+    cleanup_expected_certificate_removal_noise()
     trainer_documents = load_documents()
     doc_summary = document_summary(trainer_documents)
     expiry_warnings = document_expiry_warnings(trainer_documents)
     document_provider_health = provider_document_health(trainer_documents, providers)
     provider_certificates_by_provider = load_provider_certificates()
     certificate_match_overview = build_certificate_match_overview(trainer_documents, providers, provider_certificates_by_provider)
+    certificate_scan = certificate_scan_snapshot()
+    certificate_running = bool(certificate_scan.get('running'))
+    certificate_latest = certificate_scan.get('latest') or {}
+    certificate_latest_status = (certificate_latest.get('status') or 'idle').lower()
+    certificate_latest_message = certificate_latest.get('message') or ''
+    certificate_latest_detail = certificate_latest.get('detail') or ''
+    certificate_startup_resolving = bool(
+        providers
+        and STARTUP_CERTIFICATE_SCAN_ENABLED
+        and STARTUP_CERTIFICATE_SCAN_STARTED
+        and certificate_latest_status not in {'complete', 'error'}
+    )
+    certificate_light_task = certificate_running and (
+        'remove the certificate' in certificate_latest_detail.lower()
+        or 'gone from fobs' in certificate_latest_detail.lower()
+        or 'removing from' in certificate_latest_message.lower()
+    )
+    certificate_resolving = bool(certificate_running or certificate_startup_resolving)
+    certificate_progress_class = 'running' if certificate_resolving else ('error' if certificate_latest_status == 'error' else 'idle')
+    certificate_state_text = 'working' if certificate_resolving else (certificate_latest_status or 'idle')
+    certificate_state_class = 'due' if certificate_resolving else ('bad' if certificate_latest_status == 'error' else 'neutral')
+    certificate_progress_title = certificate_latest_message or ('Refreshing FOBS certificates' if certificate_resolving else 'Certificate refresh idle')
+    certificate_progress_detail = certificate_latest_detail or ('Checking provider certificate lists.' if certificate_resolving else 'Refresh FOBS certificates to check provider files.')
     certificate_attention = certificate_attention_items(trainer_documents)
-    certificate_alerts_visible = [] if certificate_job_running() else certificate_attention
+    certificate_alerts_visible = [] if certificate_resolving else certificate_attention
     alert_dismissed = load_alert_ack()
     dashboard_alerts = []
     providers_by_slug = {p['id']: p for p in providers}
@@ -10087,10 +10318,15 @@ def home():
     for provider in providers:
         provider['course_count'] = counts.get(provider['id'], 0)
     dashboard_alerts = build_course_action_alerts(filtered_courses, alert_dismissed) + build_dashboard_alerts(filtered_courses, alert_dismissed)
+    dashboard_decision_alerts = [alert for alert in dashboard_alerts if (alert.get('action') or '') != 'sync']
     recommendation = build_recommendation(filtered_courses, providers, state, active_sync_window_days)
     total_courses = sum(counts.values())
     today_courses = course_rows_for_today(filtered_courses)
     next_courses = filtered_courses[:5]
+    window_courses = [row for row in filtered_courses if not row.get('is_outside_window')]
+    window_synced_count = sum(1 for c in window_courses if c['status_label'] == 'Synced')
+    window_attention_count = sum(1 for c in window_courses if row_needs_trainer_decision(c))
+    zoom_connected = any((account.get('status') or 'connected').lower() == 'connected' for account in zoom_accounts or [])
     provider_health = dashboard_provider_health(providers, counts)
     dashboard_ready = dashboard_ready_model(state, filtered_courses, providers, zoom_accounts, dashboard_alerts)
     dashboard_activity_items = compact_activity_items(4)
@@ -10105,11 +10341,17 @@ def home():
                 events.append(row)
         mini_calendar_days.append({'label': day_date.strftime('%a %d'), 'events': events[:4]})
     selected_provider_name = next((p['name'] for p in providers if p['id'] == selected_provider), 'All providers') if selected_provider != 'all' else 'All providers'
+    display_state = dict(state)
+    display_health_issues = actionable_health_issues(state, providers)
+    display_state['health_issues'] = display_health_issues
+    if not display_health_issues and 'warning' in (display_state.get('last_status') or '').lower():
+        display_state['last_status'] = 'Ready'
+        display_state['last_run_status'] = 'completed'
     status_message = 'Everything looks in order.'
     if state.get('sync_running'):
         status_message = 'TrainerMate is checking courses and Zoom details.'
-    elif state.get('health_issues'):
-        status_message = shorten_message((state.get('health_issues') or [''])[0], 120)
+    elif display_health_issues:
+        status_message = shorten_message(display_health_issues[0], 120)
     elif state.get('last_message'):
         status_message = shorten_message(state.get('last_message') or '', 120)
 
@@ -10117,6 +10359,29 @@ def home():
     debug_current_course = state.get('current_course') or '-'
     debug_latest_message = state.get('last_message') or state.get('last_status') or status_message or 'Idle'
     initial_debug_log = '\n'.join(tail_bot_log(80)) or 'No debug output yet.'
+    support_plan_label = 'Paid' if is_paid_account else 'Free'
+    support_subject = (identity.get('ndors') or 'NDORS not saved').strip()
+    support_summary_text = support_message_text(
+        subject=support_subject,
+        identity=identity,
+        plan_label=support_plan_label,
+        build_label=BUILD_LABEL,
+        status=build_friendly_status(display_state),
+        last_sync=format_last_sync(state),
+        providers=providers,
+        zoom_accounts=zoom_accounts,
+    )
+    diagnostics_summary_lines = support_summary_lines(
+        identity=identity,
+        plan_label=support_plan_label,
+        build_label=BUILD_LABEL,
+        status=build_friendly_status(display_state),
+        last_sync=format_last_sync(state),
+        providers=providers,
+        zoom_accounts=zoom_accounts,
+    )
+    diagnostics_log_text = sanitize_support_text('\n'.join(tail_bot_log(160)) or 'No debug output yet.')
+    support_whatsapp_url = 'https://wa.me/447368271579?text=' + quote(support_summary_text)
     provider_form = make_provider_defaults(request.args.get('provider_name', ''), request.args.get('login_url', ''), True)
     if request.args.get('zoom_account_id') is not None:
         provider_form['zoom_account_id'] = request.args.get('zoom_account_id')
@@ -10129,7 +10394,7 @@ def home():
     return render_template_string(
         TEMPLATE,
         access=access,
-        account_plan_label=('Paid' if is_paid_account else 'Free'),
+        account_plan_label=support_plan_label,
         is_paid_account=is_paid_account,
         calendar_sync_allowed=calendar_sync_allowed,
         certificate_manage_allowed=certificate_manage_allowed,
@@ -10139,31 +10404,38 @@ def home():
         active_sync_window_days=active_sync_window_days,
         active_sync_window_label=sync_window_label(active_sync_window_days),
         recommendation=recommendation,
-        dashboard_alerts=dashboard_alerts,
+        dashboard_alerts=dashboard_decision_alerts,
         identity=identity,
+        remember_me_enabled=local_remember_me_enabled(),
         masked_email=mask_email(identity.get('email', '')),
         state=state,
         providers=providers,
         zoom_accounts=zoom_accounts,
+        zoom_connected=zoom_connected,
         selected_provider=selected_provider,
         selected_provider_name=selected_provider_name,
         total_courses=total_courses,
         filtered_courses=filtered_courses,
+        window_courses=window_courses,
         today_courses=today_courses,
         next_courses=next_courses,
         provider_health=provider_health,
         dashboard_ready=dashboard_ready,
         dashboard_activity_items=dashboard_activity_items,
         mini_calendar_days=mini_calendar_days,
-        synced_count=sum(1 for c in filtered_courses if c['status_label'] == 'Synced'),
-        attention_count=sum(1 for c in filtered_courses if c.get('is_action_needed')),
-        status_dot_class=get_status_dot_class(state),
-        friendly_status=build_friendly_status(state),
+        synced_count=window_synced_count,
+        attention_count=window_attention_count,
+        window_course_count=len(window_courses),
+        status_dot_class=get_status_dot_class(display_state),
+        friendly_status=build_friendly_status(display_state),
         status_message=status_message,
         debug_current_provider=debug_current_provider,
         debug_current_course=debug_current_course,
         debug_latest_message=debug_latest_message,
         initial_debug_log=initial_debug_log,
+        diagnostics_summary_lines=diagnostics_summary_lines,
+        diagnostics_log_text=diagnostics_log_text,
+        diagnostics_debug_enabled=debug_tools_enabled(),
         last_sync_text=format_last_sync(state),
         flash=get_flash(),
         auto_refresh=False,
@@ -10183,8 +10455,18 @@ def home():
         automatic_sync_allowed=automatic_sync_allowed_value,
         activity_items=[item for item in reversed(load_activity_history()) if not item.get('dismissed_at')],
         activity_counts=activity_counts(),
+        support_subject=support_subject,
+        support_whatsapp_url=support_whatsapp_url,
         certificate_attention_items=certificate_attention,
         certificate_alerts_visible=certificate_alerts_visible,
+        certificate_scan=certificate_scan,
+        certificate_running=certificate_resolving,
+        certificate_busy=certificate_resolving and not certificate_light_task,
+        certificate_progress_class=certificate_progress_class,
+        certificate_state_text=certificate_state_text,
+        certificate_state_class=certificate_state_class,
+        certificate_progress_title=certificate_progress_title,
+        certificate_progress_detail=certificate_progress_detail,
         document_types=DOCUMENT_TYPES,
         ZOOM_CLIENT_ID=ZOOM_CLIENT_ID,
         ZOOM_CLIENT_SECRET=ZOOM_CLIENT_SECRET,
@@ -10204,8 +10486,8 @@ def activity_centre():
     items = [item for item in reversed(load_activity_history()) if not item.get('dismissed_at')]
     counts = activity_counts(list(reversed(items)))
     return render_template_string("""
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>TrainerMate Activity</title>
-<style>:root{color-scheme:dark;--bg:#081225;--panel:#111827;--line:rgba(148,163,184,.18);--text:#f8fafc;--muted:#9ca3af;--blue:#2563eb;--warn:#f59e0b;--red:#ef4444}body{margin:0;background:linear-gradient(180deg,#081225,#0c1830);color:var(--text);font-family:Inter,Segoe UI,Arial,sans-serif}.wrap{max-width:980px;margin:0 auto;padding:24px}.top{display:flex;justify-content:space-between;gap:14px;align-items:flex-start;margin-bottom:18px}.btn{border:0;border-radius:12px;padding:10px 14px;background:var(--blue);color:#fff;font-weight:800;text-decoration:none;cursor:pointer}.btn.soft{background:#1f2937;border:1px solid var(--line)}.card{border:1px solid var(--line);border-radius:18px;background:rgba(17,24,39,.92);padding:16px;margin-bottom:12px}.card.unread{border-color:rgba(56,189,248,.42)}.meta{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.06em}.title{font-weight:900;font-size:18px;margin:5px 0}.summary{color:#dbeafe;line-height:1.45}.details{margin-top:12px;border-top:1px solid var(--line);padding-top:12px;color:#cbd5e1}.detail-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}.tile{border:1px solid var(--line);border-radius:12px;padding:10px;background:#0f172a}.tile strong{display:block;font-size:20px}.course{border-top:1px solid var(--line);padding:10px 0}.course:first-child{border-top:0}.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}.empty{color:var(--muted);border:1px solid var(--line);border-radius:18px;padding:24px;background:#111827}@media(max-width:720px){.detail-grid{grid-template-columns:1fr 1fr}.top{display:block}}</style></head><body><main class="wrap"><div class="top"><div><h1>Messages & Activity</h1><p style="color:var(--muted)">Support messages, automatic sync results, and things that need attention.</p><p><span>{{ counts.unread }} unread</span> - <span>{{ counts.total }} active</span></p></div><a class="btn soft" href="{{ url_for('home') }}">Back to dashboard</a></div>{% if items %}{% for item in items %}<article class="card {% if not item.read_at %}unread{% endif %}"><div class="meta">{{ item.created_at }} - {{ item.type|replace('_',' ') }}{% if not item.read_at %} - New{% endif %}</div><div class="title">{{ item.title }}</div><div class="summary">{{ item.summary or item.message }}</div>{% if item.details %}<div class="details"><div class="detail-grid"><div class="tile"><span>Checked</span><strong>{{ item.details.courses_checked or 0 }}</strong></div><div class="tile"><span>New</span><strong>{{ item.details.new_courses or 0 }}</strong></div><div class="tile"><span>Updated</span><strong>{{ item.details.course_updates or 0 }}</strong></div><div class="tile"><span>Zoom/FOBS</span><strong>{{ item.details.zoom_or_fobs_updates or 0 }}</strong></div></div></div>{% endif %}{% if item.items %}<div class="details"><strong>Course detail</strong>{% for c in item.items[:20] %}<div class="course"><strong>{{ c.provider or 'Provider' }}</strong> - {{ c.date_time or '' }}<br>{{ c.course_type or '' }}<br><span style="color:#9ca3af">{{ c.action or c.status or c.error }}</span></div>{% endfor %}</div>{% endif %}<div class="actions">{% if not item.read_at %}<form method="post" action="{{ url_for('read_activity_route', activity_id=item.id) }}"><button class="btn soft" type="submit">Mark read</button></form>{% endif %}<form method="post" action="{{ url_for('dismiss_activity_route', activity_id=item.id) }}"><button class="btn soft" type="submit">Dismiss</button></form></div></article>{% endfor %}{% else %}<div class="empty">No messages or activity yet.</div>{% endif %}</main></body></html>""", items=items, counts=counts, csrf_hidden_field=csrf_hidden_field)
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>TrainerMate Support</title>
+<link rel="stylesheet" href="/static/activity.css"></head><body><main class="wrap"><div class="top"><div><h1>Messages & Activity</h1><p style="color:var(--muted)">Support messages, automatic sync results, and things that need attention.</p><p><span>{{ counts.unread }} unread</span> - <span>{{ counts.total }} active</span></p></div><a class="btn soft" href="{{ url_for('home') }}">Back to dashboard</a></div>{% if items %}{% for item in items %}<article class="card {% if not item.read_at %}unread{% endif %}"><div class="meta">{{ item.created_at }} - {{ item.type|replace('_',' ') }}{% if not item.read_at %} - New{% endif %}</div><div class="title">{{ item.title }}</div><div class="summary">{{ item.summary or item.message }}</div>{% if item.details %}<div class="details"><div class="detail-grid"><div class="tile"><span>Checked</span><strong>{{ item.details.courses_checked or 0 }}</strong></div><div class="tile"><span>New</span><strong>{{ item.details.new_courses or 0 }}</strong></div><div class="tile"><span>Updated</span><strong>{{ item.details.course_updates or 0 }}</strong></div><div class="tile"><span>Zoom/FOBS</span><strong>{{ item.details.zoom_or_fobs_updates or 0 }}</strong></div></div></div>{% endif %}{% if item.get('items') %}<div class="details"><strong>Course detail</strong>{% for c in item.get('items')[:20] %}<div class="course"><strong>{{ c.provider or 'Provider' }}</strong> - {{ c.date_time or '' }}<br>{{ c.course_type or '' }}<br><span style="color:#9ca3af">{{ c.action or c.status or c.error }}</span></div>{% endfor %}</div>{% endif %}<div class="actions">{% if not item.read_at %}<form method="post" action="{{ url_for('read_activity_route', activity_id=item.id) }}"><button class="btn soft" type="submit">Mark read</button></form>{% endif %}<form method="post" action="{{ url_for('dismiss_activity_route', activity_id=item.id) }}"><button class="btn soft" type="submit">Dismiss</button></form></div></article>{% endfor %}{% else %}<div class="empty">No messages or activity yet.</div>{% endif %}</main></body></html>""", items=items, counts=counts, csrf_hidden_field=csrf_hidden_field)
 
 
 @app.route('/messages')
@@ -10213,8 +10495,56 @@ def messages_alias():
     return redirect(url_for('activity_centre'))
 
 
+@app.route('/support')
+def support_alias():
+    return redirect(url_for('home', section='support'))
+
+
+@app.route('/support/message', methods=['POST'])
+def support_message_route():
+    subject = (request.form.get('subject') or '').strip()
+    message = (request.form.get('message') or '').strip()
+    summary = (request.form.get('summary') or '').strip()
+    if not message:
+        if not request_wants_json():
+            set_flash('Type a support message first.', 'warning')
+            return redirect(url_for('home', section='support'))
+        return jsonify({'ok': False, 'message': 'Type a support message first.'}), 400
+    identity = remote_admin_identity_payload()
+    if not identity.get('ndors_trainer_id'):
+        if not request_wants_json():
+            set_flash('Please save your NDORS number before sending support messages.', 'warning')
+            return redirect(url_for('home', section='support'))
+        return jsonify({'ok': False, 'message': 'Please save your NDORS number before sending support messages.'}), 400
+    payload = dict(identity)
+    payload.update({
+        'subject': shorten_message(subject or identity.get('ndors_trainer_id') or 'TrainerMate support', 160),
+        'message': shorten_message(message, 4000),
+        'summary': shorten_message(summary, 2500),
+        'status': remote_admin_status_payload(),
+    })
+    try:
+        response = requests.post(f'{API_URL}/client/support-message', json=payload, timeout=10)
+        response.raise_for_status()
+        data = response.json() if response is not None else {}
+        thread = data.get('thread') if isinstance(data, dict) else {}
+        details = {'thread_id': thread.get('id') if isinstance(thread, dict) else '', 'subject': payload['subject']}
+        add_activity_item('support_message', 'Support message sent', 'Your message was sent to TrainerMate support. Replies will appear here.', 'info', details=details, source='support')
+        if not request_wants_json():
+            set_flash('Support message sent. Replies will appear in TrainerMate messages.', 'success')
+            return redirect(url_for('home', section='support'))
+        return jsonify({'ok': True, 'thread': thread})
+    except Exception as exc:
+        if not request_wants_json():
+            set_flash(f'Could not send to admin just now: {shorten_message(str(exc), 180)}', 'error')
+            return redirect(url_for('home', section='support'))
+        return jsonify({'ok': False, 'message': f'Could not send to admin just now: {shorten_message(str(exc), 180)}'}), 502
+
+
 @app.route('/api/activity')
 def api_activity():
+    if not dashboard_unlocked():
+        return jsonify({'ok': False, 'locked': True, 'counts': {}, 'items': [], 'popup': None})
     items = [item for item in load_activity_history() if not item.get('dismissed_at')]
     popup = latest_popup_activity()
     return jsonify({'ok': True, 'counts': activity_counts(items), 'items': list(reversed(items[-50:])), 'popup': popup})
@@ -10229,6 +10559,8 @@ def read_activity_route(activity_id):
 @app.route('/activity/<activity_id>/dismiss', methods=['POST'])
 def dismiss_activity_route(activity_id):
     dismiss_activity(activity_id)
+    if request.headers.get('X-Requested-With') == 'fetch':
+        return jsonify({'ok': True, 'dismissed': activity_id})
     return redirect(request.referrer or url_for('activity_centre'))
 
 
@@ -10285,6 +10617,8 @@ def dismiss_alert():
     if alert_id:
         dismissed.add(alert_id)
         save_alert_ack(dismissed)
+    if request.headers.get('X-Requested-With') == 'fetch':
+        return jsonify({'ok': True, 'dismissed': alert_id})
     target = request.referrer or url_for('home', section='dashboard')
     host_url = request.host_url or ''
     if host_url and target.startswith(host_url):
@@ -10473,42 +10807,6 @@ def zoom_disconnect(account_id):
     return redirect(url_for('home', section='zoom_accounts'))
 
 
-@app.route('/zoom/deauthorize', methods=['POST'])
-def zoom_deauthorize():
-    expected_token = ZOOM_DEAUTHORIZATION_VERIFICATION_TOKEN
-    received_token = (request.headers.get('authorization') or '').strip()
-    if expected_token and not hmac.compare_digest(received_token, expected_token):
-        return jsonify({'ok': False, 'message': 'Invalid deauthorization verification token.'}), 401
-
-    event = request.get_json(silent=True) or {}
-    payload = event.get('payload') if isinstance(event.get('payload'), dict) else {}
-    event_client_id = str(payload.get('client_id') or event.get('client_id') or '').strip()
-    if ZOOM_CLIENT_ID and event_client_id and event_client_id != ZOOM_CLIENT_ID:
-        return jsonify({'ok': False, 'message': 'Client ID does not match this TrainerMate app.'}), 400
-
-    for account in load_zoom_accounts():
-        clear_zoom_tokens(account.get('id') or '')
-    save_zoom_accounts([])
-
-    providers = load_providers()
-    changed = False
-    for provider in providers:
-        if provider.get('zoom_account_id'):
-            provider['zoom_account_id'] = ''
-            changed = True
-    if changed:
-        save_providers(providers)
-
-    update_app_state(
-        sync_running=False,
-        pid=None,
-        last_status='Needs attention',
-        last_run_status='deauthorized',
-        last_message='Zoom app deauthorized. Connect Zoom again before syncing courses.',
-    )
-    return jsonify({'ok': True, 'message': 'Zoom deauthorization processed.'})
-
-
 @app.route('/documents/<document_id>/view')
 def view_document(document_id):
     def unavailable(message):
@@ -10558,6 +10856,39 @@ def view_document(document_id):
     return response
 
 
+def download_provider_certificate_for_view(cert):
+    """Download one exact FOBS certificate only when the user opens it."""
+    cert = cert if isinstance(cert, dict) else {}
+    provider_id = provider_slug(cert.get('provider_id') or '')
+    document_id = provider_certificate_document_id_from_ref(cert.get('provider_reference') or '') or re.sub(r'\D+', '', str(cert.get('download_document_id') or ''))
+    if not provider_id or not document_id:
+        return cert, 'TrainerMate can see this certificate row, but FOBS did not provide an exact document id to download safely.'
+    provider = next((p for p in load_providers() if provider_slug(p.get('id') or p.get('name') or '') == provider_id), None)
+    if not provider:
+        return cert, 'TrainerMate could not find the matching provider settings for this certificate.'
+    try:
+        scan_provider_certificates(provider, cache_files=True, batch_progress={'id': provider_id, 'index': 1, 'total': 1})
+        conn = documents_conn()
+        try:
+            refreshed = conn.execute(
+                'SELECT * FROM provider_certificates WHERE provider_id = ? AND provider_reference = ? ORDER BY COALESCE(downloaded_at, '') DESC, COALESCE(updated_at, '') DESC LIMIT 1',
+                (provider_id, provider_certificate_reference(provider, 'document', document_id)),
+            ).fetchone()
+            if not refreshed:
+                refreshed = conn.execute(
+                    'SELECT * FROM provider_certificates WHERE provider_id = ? AND provider_reference LIKE ? ORDER BY COALESCE(downloaded_at, '') DESC, COALESCE(updated_at, '') DESC LIMIT 1',
+                    (provider_id, f'%document-{document_id}'),
+                ).fetchone()
+            refreshed = dict(refreshed) if refreshed else cert
+        finally:
+            conn.close()
+        if refreshed.get('cached_filename') and provider_certificate_cached_file_is_servable(refreshed):
+            return refreshed, ''
+        return refreshed, 'TrainerMate checked FOBS, but the certificate file could not be downloaded safely yet. Please check the provider login and try again.'
+    except Exception as exc:
+        return cert, f'TrainerMate could not download this file from FOBS yet: {shorten_message(str(exc), 180)}'
+
+
 @app.route('/provider-certificates/<certificate_id>/view')
 def view_provider_certificate_file(certificate_id):
     def unavailable(message):
@@ -10593,18 +10924,26 @@ def view_provider_certificate_file(certificate_id):
         cert = dict(cert) if cert else None
     finally:
         conn.close()
-    if not cert or not (cert.get('cached_filename') or '').strip():
-        return unavailable("This provider certificate is no longer in TrainerMate's current FOBS list, or the local copy has not been saved yet.")
-    if (cert.get('status') or 'seen') != 'seen':
-        return unavailable("This certificate no longer appears in the current FOBS certificate list. Refresh the provider if you think it should still be there.")
-    if (cert.get('download_status') or '') != PROVIDER_CACHE_VERSION:
-        return unavailable("TrainerMate needs to refresh this provider file before opening it. Refresh this provider's FOBS certificates to save a fresh copy.")
+    if not cert:
+        return unavailable("TrainerMate could not find this provider certificate record. Run Check FOBS to rebuild the certificate list.")
+
+    # FOBS document id is the source-of-truth key. Do not borrow another
+    # certificate's file by fuzzy title/expiry matching. If the exact file is not
+    # cached yet, download only this certificate on demand.
     try:
-        path = safe_provider_cache_path(cert.get('cached_filename'))
+        path = safe_provider_cache_path(cert.get('cached_filename')) if (cert.get('cached_filename') or '').strip() else None
     except Exception:
         path = None
     if not path or not path.exists() or not path.is_file():
-        return unavailable("TrainerMate can still see the certificate record, but the saved local file is missing. Refresh this provider's FOBS certificates to save a fresh copy.")
+        cert, download_error = download_provider_certificate_for_view(cert)
+        if download_error:
+            return unavailable(download_error)
+        try:
+            path = safe_provider_cache_path(cert.get('cached_filename')) if (cert.get('cached_filename') or '').strip() else None
+        except Exception:
+            path = None
+    if not path or not path.exists() or not path.is_file():
+        return unavailable("TrainerMate can still see the certificate record, but the exact provider file is not cached yet. Open Certificates and try View again after the check completes.")
     download_name = safe_provider_document_filename(
         cert.get('certificate_name') or 'provider certificate',
         cert.get('cached_filename') or 'certificate.pdf',
@@ -10632,15 +10971,66 @@ def view_provider_certificate_file(certificate_id):
 
 @app.post('/provider-certificates/<certificate_id>/delete')
 def delete_provider_certificate_route(certificate_id):
+    wants_json = request.headers.get('Accept') == 'application/json' or request.headers.get('X-Requested-With') == 'fetch'
     if not feature_enabled(check_access(timeout_seconds=HOME_ACCESS_TIMEOUT_SECONDS, prefer_cached=True) or {}, 'certificate_manage'):
         msg = paid_feature_message('Certificate management')
-        if request.headers.get('Accept') == 'application/json' or request.headers.get('X-Requested-With') == 'fetch':
+        if wants_json:
             return jsonify({'started': False, 'message': msg})
         set_flash(msg, 'warning')
         return redirect(url_for('home', section='files'))
-    started, message = start_provider_certificate_delete_async(certificate_id)
-    if request.headers.get('Accept') == 'application/json' or request.headers.get('X-Requested-With') == 'fetch':
-        return jsonify({'started': started, 'message': message})
+
+    cert = provider_certificate_row(certificate_id)
+    if not cert:
+        message = 'Certificate not found in the provider list.'
+        if wants_json:
+            return jsonify({'started': False, 'message': message})
+        set_flash(message, 'warning')
+        return redirect(url_for('home', section='files'))
+
+    selected_only = request.form.get('selected_only') == '1'
+    delete_matching = request.form.get('delete_matching') == '1'
+    matches = find_matching_provider_certificates_for_delete(cert)
+    if matches and not selected_only and not delete_matching:
+        names = ', '.join(sorted({(m.get('provider_name') or m.get('provider_id') or 'another provider') for m in matches}))
+        message = f'TrainerMate found same-named certificate copies in {names}. Remove those too?'
+        if wants_json:
+            return jsonify({
+                'started': False,
+                'confirm_required': True,
+                'message': message,
+                'certificate': {
+                    'name': cert.get('certificate_name') or 'this certificate',
+                    'provider': cert.get('provider_name') or cert.get('provider_id') or 'selected provider',
+                    'expiry_date': cert.get('expiry_date') or 'No expiry date shown',
+                },
+                'matching_count': len(matches),
+                'matching_certificate_ids': [m.get('id') for m in matches],
+                'matching_certificates': [
+                    {
+                        'id': m.get('id'),
+                        'name': m.get('certificate_name') or 'Matching certificate',
+                        'provider': m.get('provider_name') or m.get('provider_id') or 'another provider',
+                        'expiry_date': m.get('expiry_date') or 'No expiry date shown',
+                    }
+                    for m in matches
+                ],
+            })
+        return provider_certificate_delete_confirmation_page(cert, matches)
+
+    certificate_ids = [certificate_id]
+    if delete_matching:
+        allowed = {str(m.get('id') or '') for m in matches}
+        requested = [str(value or '').strip() for value in request.form.getlist('matching_certificate_ids')]
+        chosen = [value for value in requested if value in allowed]
+        # If the confirmation came from the simple JavaScript confirm dialog,
+        # no individual IDs are posted, so include every safe same-name match.
+        if not chosen:
+            chosen = [str(m.get('id') or '') for m in matches if m.get('id')]
+        certificate_ids.extend(chosen)
+
+    started, message = start_provider_certificate_delete_many_async(certificate_ids)
+    if wants_json:
+        return jsonify({'started': started, 'message': message, 'certificate_ids': certificate_ids})
     set_flash(message, 'success' if started else 'warning')
     return redirect(url_for('home', section='files'))
 
@@ -10667,7 +11057,7 @@ def scan_provider_certificates_route(provider_id):
         set_flash(paid_feature_message('Certificate management'), 'warning')
         return redirect(url_for('home', section='files'))
     started = start_certificate_scan_async(provider_id)
-    set_flash('Refreshing FOBS certificates.' if started else 'TrainerMate is already checking certificates. This will only take a moment.', 'success' if started else 'warning')
+    set_flash('Checking FOBS certificates.' if started else 'TrainerMate is already checking certificates. This will only take a moment.', 'success' if started else 'warning')
     return redirect(url_for('home', section='files'))
 
 
@@ -10677,7 +11067,7 @@ def scan_all_certificates():
         set_flash(paid_feature_message('Certificate management'), 'warning')
         return redirect(url_for('home', section='files'))
     started = start_certificate_scan_async('all')
-    set_flash('Refreshing FOBS certificates.' if started else 'TrainerMate is already checking certificates. This will only take a moment.', 'success' if started else 'warning')
+    set_flash('Checking FOBS certificates.' if started else 'TrainerMate is already checking certificates. This will only take a moment.', 'success' if started else 'warning')
     return redirect(url_for('home', section='files'))
 
 
@@ -10691,12 +11081,12 @@ def add_document():
         remember_add_document_form(request.form)
         set_flash(message, 'warning')
         return redirect(url_for('home', section='files'))
-    provider_ids = valid_document_provider_ids(request.form.getlist('provider_ids'))
+    provider_ids = selected_document_provider_ids(request.form)
     upload_state = ensure_provider_upload_runs_soon() if provider_ids else 'none'
     if provider_ids and upload_state == 'started':
-        message = 'Certificate added. TrainerMate is sending it to the selected provider portals now.'
+        message = 'Uploading certificate. TrainerMate is sending it to the selected provider portals now. You can keep using TrainerMate while this runs.'
     elif provider_ids and upload_state == 'queued':
-        message = 'Certificate added. TrainerMate will send it to the selected provider portals as soon as the current check finishes.'
+        message = 'Certificate queued. TrainerMate will send it to the selected provider portals as soon as the current check finishes.'
     set_flash(message, 'success' if ok else 'warning')
     return redirect(url_for('home', section='files'))
 
@@ -10743,6 +11133,8 @@ def dismiss_certificate_prompt(link_id):
     else:
         # Backwards-compatible fallback for old pages/forms.
         ok = dismiss_missing_certificate_link(link_id)
+    if request.headers.get('X-Requested-With') == 'fetch':
+        return jsonify({'ok': bool(ok), 'dismissed': alert_ids, 'link_id': link_id})
     set_flash('Certificate reminder dismissed.' if ok else 'Certificate link not found.', 'success' if ok else 'warning')
     return redirect(url_for('home', section='files'))
 
@@ -10842,656 +11234,15 @@ def save_account():
 def test_access():
     access = check_access(timeout_seconds=ACTION_ACCESS_TIMEOUT_SECONDS, prefer_cached=False)
     if access:
-        set_flash(f"Access {'allowed' if access.get('allowed') else 'blocked'} - Plan: {access.get('plan', 'unknown')}", 'success' if access.get('allowed') else 'warning')
+        access = normalize_access_payload(access)
+        set_flash(f"Access {'allowed' if access.get('allowed') else 'blocked'} - Plan: {access.get('plan', 'unknown')}", 'success' if account_is_paid(access) or access.get('allowed') else 'warning')
     else:
         set_flash('Could not reach licensing API or no account is saved.', 'error')
     return redirect(url_for('home'))
 
 
-
-def reviewer_zoom_access_token_or_message(account_id=''):
-    accounts = load_zoom_accounts()
-    account = next((a for a in accounts if a.get('id') == (account_id or get_default_zoom_account_id())), None)
-    if not account:
-        return '', 'Connect a Zoom account first.'
-    account_id = account.get('id') or ''
-    access_token = get_zoom_oauth_token(account_id, 'access')
-    if access_token:
-        return access_token, ''
-    ok, message = refresh_zoom_oauth_account(account, quiet=True)
-    if ok:
-        return get_zoom_oauth_token(account_id, 'access'), ''
-    return '', 'Zoom needs reconnecting. Open Zoom accounts and connect Zoom again.'
-
-
-def reviewer_course_by_id(course_id):
-    conn = sqlite3.connect(str(COURSES_DB_PATH))
-    conn.row_factory = sqlite3.Row
-    try:
-        ensure_courses_sync_columns(conn)
-        row = conn.execute('SELECT * FROM courses WHERE id = ?', (course_id,)).fetchone()
-        return dict(row) if row else None
-    finally:
-        conn.close()
-
-
-def reset_reviewer_course_state(disconnect_zoom=False):
-    """Reset course rows to a clean trainer-ready state."""
-    if not reviewer_demo_enabled():
-        return
-    conn = sqlite3.connect(str(COURSES_DB_PATH))
-    try:
-        ensure_courses_sync_columns(conn)
-        conn.execute("""
-            UPDATE courses
-               SET meeting_id = '',
-                   meeting_link = '',
-                   meeting_password = '',
-                   last_synced_at = '',
-                   last_sync_status = '',
-                   last_sync_action = 'Course imported from provider schedule.'
-             WHERE provider = 'Essex'
-        """)
-        conn.commit()
-    finally:
-        conn.close()
-    if disconnect_zoom:
-        save_zoom_accounts([])
-    update_app_state(
-        sync_running=False,
-        stop_requested=False,
-        pid=None,
-        current_provider='',
-        current_course='',
-        last_status='Idle',
-        last_run_status='',
-        last_message='TrainerMate has refreshed the course list.',
-        pending_sync_request={},
-        scan_request={},
-        run_summary={},
-        health_issues=[],
-        courses={},
-    )
-
-
-@app.route('/reset-dashboard-data', methods=['GET', 'POST'])
-def reset_dashboard_data():
-    if not reviewer_demo_enabled():
-        return redirect(url_for('home'))
-    if not reviewer_demo_logged_in():
-        return redirect(url_for('trainer_login', next=request.path))
-    reset_reviewer_course_state(disconnect_zoom=request.args.get('disconnect') == '1')
-    set_flash('TrainerMate has refreshed the course list.', 'success')
-    return redirect(url_for('home', section='dashboard', provider='essex'))
-
-
-def reviewer_update_course_zoom(course_id, meeting_id, join_url, password='', action='Zoom meeting created for TrainerMate'):
-    conn = sqlite3.connect(str(COURSES_DB_PATH))
-    try:
-        ensure_courses_sync_columns(conn)
-        conn.execute("""
-            UPDATE courses
-               SET meeting_id = ?, meeting_link = ?, meeting_password = ?, last_synced_at = ?,
-                   last_sync_status = 'success', last_sync_action = ?
-             WHERE id = ?
-        """, (normalize_zoom_meeting_id(meeting_id), join_url or '', password or '', utc_now_text(), action, course_id))
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def normalize_zoom_meeting_id(value):
-    text = str(value or '').strip()
-    digits_only = re.sub(r'\D', '', text)
-    if 9 <= len(digits_only) <= 12:
-        return digits_only
-    return ''
-
-
-def reviewer_zoom_topic_for_course(course):
-    return f"TrainerMate - {course.get('title') or 'Training course'}".strip()
-
-
-def reviewer_course_start_datetime(course):
-    start_dt = parse_dashboard_datetime(course.get('date_time') or '')
-    if not start_dt:
-        start_dt = datetime.now() + timedelta(days=7)
-    if start_dt.tzinfo is None:
-        start_dt = start_dt.replace(tzinfo=LOCAL_TIMEZONE)
-    return start_dt
-
-
-def reviewer_zoom_agenda_for_course(course, note=''):
-    bits = [
-        f"TrainerMate course: {course.get('title') or 'Training course'}",
-        f"Provider: {course.get('provider') or 'Provider'}",
-        f"Course date/time: {course.get('date_time') or 'Not set'}",
-    ]
-    if note:
-        bits.append(note)
-    return '\n'.join(bits)
-
-
-def reviewer_zoom_payload_for_course(course, replace=False):
-    start_dt = reviewer_course_start_datetime(course)
-    topic = reviewer_zoom_topic_for_course(course)
-    return {
-        'topic': topic,
-        'type': 2,
-        'start_time': start_dt.isoformat(),
-        'duration': 120,
-        'timezone': 'Europe/London',
-        'agenda': reviewer_zoom_agenda_for_course(course, 'TrainerMate detected or reused this meeting for the course, so it will not create a duplicate.'),
-        'settings': {
-            'join_before_host': False,
-            'waiting_room': True,
-            'approval_type': 2,
-        },
-    }
-
-
-def reviewer_zoom_request(method, url, token, **kwargs):
-    headers = kwargs.pop('headers', {}) or {}
-    headers['Authorization'] = f'Bearer {token}'
-    response = requests.request(method, url, headers=headers, timeout=kwargs.pop('timeout', 20), **kwargs)
-    if response.status_code == 401:
-        account = next((a for a in load_zoom_accounts() if a.get('id') == get_default_zoom_account_id()), None)
-        if account and refresh_zoom_oauth_account(account, quiet=True)[0]:
-            token = get_zoom_oauth_token(account.get('id') or '', 'access')
-            headers['Authorization'] = f'Bearer {token}'
-            response = requests.request(method, url, headers=headers, timeout=20, **kwargs)
-    return response
-
-
-def reviewer_parse_zoom_start_time(start_time_text):
-    if not start_time_text:
-        return None
-    try:
-        if start_time_text.endswith('Z'):
-            dt = datetime.fromisoformat(start_time_text.replace('Z', '+00:00'))
-        else:
-            dt = datetime.fromisoformat(start_time_text)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=LOCAL_TIMEZONE)
-        return dt.astimezone(LOCAL_TIMEZONE)
-    except Exception:
-        return None
-
-
-def reviewer_get_zoom_meeting_details(meeting_id, token):
-    meeting_id = normalize_zoom_meeting_id(meeting_id)
-    if not meeting_id:
-        return None
-    response = reviewer_zoom_request('GET', f'https://api.zoom.us/v2/meetings/{meeting_id}', token)
-    if response.status_code in (404, 410):
-        return None
-    response.raise_for_status()
-    data = response.json()
-    return {
-        'meeting_id': normalize_zoom_meeting_id(data.get('id') or meeting_id),
-        'meeting_link': data.get('join_url') or '',
-        'meeting_password': data.get('password') or '',
-        'topic': data.get('topic') or '',
-        'start_time': data.get('start_time') or '',
-        'agenda': data.get('agenda') or '',
-    }
-
-
-def reviewer_list_upcoming_zoom_meetings(token):
-    meetings = []
-    for meeting_type in ('scheduled', 'upcoming'):
-        next_page_token = ''
-        while True:
-            params = {'type': meeting_type, 'page_size': 100}
-            if next_page_token:
-                params['next_page_token'] = next_page_token
-            response = reviewer_zoom_request('GET', 'https://api.zoom.us/v2/users/me/meetings', token, params=params)
-            if response.status_code == 400 and params.get('page_size'):
-                params.pop('page_size', None)
-                response = reviewer_zoom_request('GET', 'https://api.zoom.us/v2/users/me/meetings', token, params=params)
-            if response.status_code >= 400:
-                break
-            data = response.json()
-            meetings.extend(data.get('meetings') or [])
-            next_page_token = data.get('next_page_token') or ''
-            if not next_page_token:
-                break
-    deduped = []
-    seen = set()
-    for meeting in meetings:
-        meeting_id = normalize_zoom_meeting_id(meeting.get('id') or '')
-        if not meeting_id or meeting_id in seen:
-            continue
-        seen.add(meeting_id)
-        deduped.append(meeting)
-    return deduped
-
-
-def reviewer_find_existing_zoom_meeting(course, token):
-    """Find an existing Zoom meeting for the course before creating one."""
-    expected_topic = reviewer_zoom_topic_for_course(course).lower()
-    expected_start = reviewer_course_start_datetime(course)
-    title_text = (course.get('title') or '').strip().lower()
-    for meeting in reviewer_list_upcoming_zoom_meetings(token):
-        topic = (meeting.get('topic') or '').strip().lower()
-        if not topic or (topic != expected_topic and not topic.startswith(expected_topic + ' -') and title_text not in topic):
-            continue
-        meeting_start = reviewer_parse_zoom_start_time(meeting.get('start_time') or '')
-        if not meeting_start:
-            continue
-        minutes_apart = abs((meeting_start - expected_start).total_seconds()) / 60.0
-        if minutes_apart > ZOOM_MATCH_WINDOW_MINUTES:
-            continue
-        full_details = reviewer_get_zoom_meeting_details(meeting.get('id') or '', token)
-        if full_details and full_details.get('meeting_id'):
-            return full_details
-    return None
-
-
-def reviewer_patch_zoom_meeting(course, meeting_id, token, action='Existing Zoom meeting verified and updated for TrainerMate'):
-    payload = reviewer_zoom_payload_for_course(course, replace=True)
-    response = reviewer_zoom_request('PATCH', f'https://api.zoom.us/v2/meetings/{meeting_id}', token, json=payload)
-    if response.status_code not in (200, 204):
-        return False, response
-    get_response = reviewer_zoom_request('GET', f'https://api.zoom.us/v2/meetings/{meeting_id}', token)
-    if get_response.status_code == 200:
-        data = get_response.json()
-        reviewer_update_course_zoom(course.get('id'), data.get('id') or meeting_id, data.get('join_url') or course.get('meeting_link'), data.get('password') or course.get('meeting_password') or '', action)
-    else:
-        reviewer_update_course_zoom(course.get('id'), meeting_id, course.get('meeting_link'), course.get('meeting_password'), action)
-    return True, response
-
-
-def reviewer_create_zoom_meeting(course, replace=False, progress=None):
-    def report(message):
-        if progress:
-            try:
-                progress(message)
-            except Exception:
-                pass
-
-    report('Checking the connected Zoom account.')
-    token, message = reviewer_zoom_access_token_or_message()
-    if not token:
-        return False, message
-
-    saved_meeting_id = ''.join(ch for ch in str(course.get('meeting_id') or '') if ch.isdigit())
-
-    # Saved meeting path: verify first, then update in place. This demonstrates
-    # meeting:read plus meeting:update/write behaviour without creating duplicates.
-    if saved_meeting_id:
-        report(f'Verifying saved Zoom meeting ID {saved_meeting_id}.')
-        existing = reviewer_zoom_request('GET', f'https://api.zoom.us/v2/meetings/{saved_meeting_id}', token)
-        if existing.status_code == 200:
-            report('Saved Zoom meeting exists. Verifying the course link now.')
-            ok, patch_response = reviewer_patch_zoom_meeting(course, saved_meeting_id, token, action='Zoom meeting already exists - verified')
-            if ok:
-                return True, f"Zoom meeting already exists - verified for {course.get('title')}. Meeting ID: {saved_meeting_id}"
-            # A successful read proves the linked meeting exists. Treat this as a
-            # successful verification rather than a failed sync, even if Zoom does
-            # not accept a metadata refresh for this meeting.
-            try:
-                data = existing.json()
-            except Exception:
-                data = {}
-            reviewer_update_course_zoom(
-                course.get('id'),
-                data.get('id') or saved_meeting_id,
-                data.get('join_url') or course.get('meeting_link') or '',
-                data.get('password') or course.get('meeting_password') or '',
-                'Zoom meeting already exists - verified',
-            )
-            return True, f"Zoom meeting already exists - verified for {course.get('title')}. Meeting ID: {saved_meeting_id}"
-        if existing.status_code not in (404, 410):
-            return False, 'TrainerMate could not verify the existing Zoom meeting just now. Please try again in a moment.'
-        report('Saved Zoom meeting was not found in Zoom. Searching for a matching meeting before creating one.')
-    else:
-        report('No saved meeting ID yet. Searching Zoom for an existing matching meeting first.')
-
-    # No valid saved ID or saved ID was deleted in Zoom: find a matching existing
-    # meeting before creating anything, so reviewer testing does not create duplicates.
-    matching = reviewer_find_existing_zoom_meeting(course, token)
-    if matching and matching.get('meeting_id'):
-        meeting_id = matching.get('meeting_id')
-        report(f'Matching Zoom meeting found: {meeting_id}. Linking it to this course.')
-        ok, patch_response = reviewer_patch_zoom_meeting(course, meeting_id, token, action='Zoom meeting already exists - verified')
-        if ok:
-            return True, f"Zoom meeting already exists - verified for {course.get('title')}. Meeting ID: {meeting_id}"
-        # The meeting was found by list/read, so count this as verified and linked
-        # rather than a failed sync if Zoom declines a metadata refresh.
-        reviewer_update_course_zoom(course.get('id'), meeting_id, matching.get('meeting_link') or '', matching.get('meeting_password') or '', 'Zoom meeting already exists - verified')
-        return True, f"Zoom meeting already exists - verified for {course.get('title')}. Meeting ID: {meeting_id}"
-
-    # Only create when there is no saved, verified, or matching meeting.
-    report('No existing matching Zoom meeting found. Creating one new meeting now.')
-    payload = reviewer_zoom_payload_for_course(course, replace=replace)
-    response = reviewer_zoom_request('POST', 'https://api.zoom.us/v2/users/me/meetings', token, json=payload)
-    response.raise_for_status()
-    data = response.json()
-    reviewer_update_course_zoom(course.get('id'), data.get('id'), data.get('join_url'), data.get('password') or '', 'Zoom meeting created for TrainerMate')
-    return True, f"Zoom meeting created for {course.get('title')}. Meeting ID: {data.get('id')}"
-
-
-def reviewer_demo_courses_for_sync(scan_provider='all', scan_days=7):
-    """Return courses that should be processed by the hosted sync."""
-    provider_filter = provider_slug(scan_provider or 'all')
-    try:
-        days = int(scan_days or 7)
-    except Exception:
-        days = 7
-    days = max(1, min(days, PAID_SYNC_WINDOW_DAYS))
-    start_dt = datetime.now() - timedelta(hours=1)
-    end_dt = datetime.now() + timedelta(days=days)
-
-    conn = sqlite3.connect(str(COURSES_DB_PATH))
-    conn.row_factory = sqlite3.Row
-    try:
-        ensure_courses_sync_columns(conn)
-        rows = conn.execute("""
-            SELECT *
-              FROM courses
-             WHERE COALESCE(active_in_portal, 1) = 1
-             ORDER BY date_time ASC, title ASC
-        """).fetchall()
-    finally:
-        conn.close()
-
-    out = []
-    for row in rows:
-        course = dict(row)
-        if provider_filter != 'all' and provider_slug(course.get('provider') or '') != provider_filter:
-            continue
-        course_dt = parse_dashboard_datetime(course.get('date_time') or '')
-        if course_dt and (course_dt < start_dt or course_dt > end_dt):
-            continue
-        out.append(course)
-    return out
-
-
-def reviewer_sync_seeded_courses(scan_provider='all', scan_days=7):
-    """Run the hosted course sync against the visible course list, without provider portal scraping."""
-    clear_stop_request()
-    token, token_message = reviewer_zoom_access_token_or_message()
-    if not token:
-        update_app_state(sync_running=False, pid=None, last_status='Needs attention', last_run_status='blocked', last_message=token_message)
-        return False, token_message
-
-    courses = reviewer_demo_courses_for_sync(scan_provider=scan_provider, scan_days=scan_days)
-    if not courses:
-        try:
-            days_text = int(scan_days or 7)
-        except Exception:
-            days_text = 7
-        message = f'Sync completed. No courses found in the next {days_text} days.'
-        finished_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        update_app_state(
-            sync_running=False,
-            pid=None,
-            current_provider='',
-            current_course='',
-            last_status='Completed',
-            last_run_status='completed',
-            last_run_finished_at=finished_at,
-            last_stopped_at=finished_at,
-            last_message=message,
-            run_summary={
-                'outcome': 'completed',
-                'message': message,
-                'courses_found': 0,
-                'courses_processed': 0,
-                'fobs_checked': 0,
-                'fobs_updated': 0,
-                'zoom_existing_verified': 0,
-                'fobs_failed': 0,
-                'health_issues': [],
-            },
-            health_issues=[],
-            pending_sync_request={},
-            scan_request={},
-            last_success_at=finished_at,
-        )
-        return True, message
-
-    started_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    summary = {
-        'outcome': 'running',
-        'message': 'TrainerMate is checking your courses.',
-        'providers': sorted({c.get('provider') or 'Provider' for c in courses}),
-        'courses_found': len(courses),
-        'courses_processed': 0,
-        'fobs_checked': 0,
-        'fobs_updated': 0,
-        'zoom_existing_verified': 0,
-        'fobs_failed': 0,
-        'health_issues': [],
-    }
-    update_app_state(
-        sync_running=True,
-        pid=os.getpid(),
-        last_pid=os.getpid(),
-        stop_requested=False,
-        last_status='Running',
-        last_run_status='running',
-        last_started_at=started_at,
-        last_run_started_at=started_at,
-        last_run_finished_at='',
-        last_message='TrainerMate started checking your courses.',
-        current_provider='',
-        current_course='',
-        run_summary=summary,
-        scan_request={'provider': provider_slug(scan_provider or 'all'), 'days': scan_days, 'started_at': started_at, 'source': 'dashboard'},
-    )
-
-    course_states = {}
-    failures = []
-    for course in courses:
-        if stop_requested():
-            break
-        provider = course.get('provider') or 'Provider'
-        title = course.get('title') or 'Training course'
-        date_time = course.get('date_time') or ''
-        course_key = f'{provider} | {title} | {date_time}'.strip(' |')
-
-        def progress(message):
-            course_states[course_key] = {
-                'status': 'running',
-                'last_action': message,
-                'updated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            }
-            summary['message'] = message
-            update_app_state(
-                current_provider=provider,
-                current_course=course_key,
-                courses=course_states,
-                run_summary=summary,
-                last_message=message,
-            )
-
-        progress(f'Checking course: {title}.')
-        try:
-            ok, message = reviewer_create_zoom_meeting(course, replace=False, progress=progress)
-        except Exception as exc:
-            ok, message = False, f'Zoom sync failed for {title}: {exc}'
-        summary['courses_processed'] += 1
-        summary['fobs_checked'] += 1
-        if ok:
-            if 'zoom meeting already exists - verified' in str(message or '').lower():
-                summary['zoom_existing_verified'] = int(summary.get('zoom_existing_verified') or 0) + 1
-            else:
-                summary['fobs_updated'] += 1
-            status = 'success'
-        else:
-            summary['fobs_failed'] += 1
-            failures.append(message)
-            status = 'error'
-        course_states[course_key] = {
-            'status': status,
-            'last_action': message,
-            'updated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        }
-        update_app_state(courses=course_states, run_summary=summary, last_message=message)
-
-    finished_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    stopped = stop_requested()
-    if stopped:
-        outcome = 'stopped'
-        final_status = 'Stopped'
-        final_message = 'Sync stopped.'
-    elif failures:
-        outcome = 'completed_with_warnings'
-        final_status = 'Completed with warnings'
-        final_message = f"Sync finished with {len(failures)} course issue(s)."
-        summary['health_issues'] = failures[:5]
-    else:
-        outcome = 'completed'
-        final_status = 'Completed'
-        verified_existing = int(summary.get('zoom_existing_verified') or 0)
-        created_or_refreshed = int(summary.get('fobs_updated') or 0)
-        if verified_existing and not created_or_refreshed:
-            final_message = f"Sync completed. {summary['courses_processed']} course(s) checked; {verified_existing} existing Zoom meeting(s) verified."
-        elif verified_existing and created_or_refreshed:
-            final_message = f"Sync completed. {summary['courses_processed']} course(s) checked; {verified_existing} existing meeting(s) verified and {created_or_refreshed} course(s) created/refreshed."
-        else:
-            final_message = f"Sync completed. {summary['courses_processed']} course(s) checked."
-
-    summary['outcome'] = outcome
-    summary['message'] = final_message
-    update_app_state(
-        sync_running=False,
-        pid=None,
-        current_provider='',
-        current_course='',
-        last_status=final_status,
-        last_run_status=outcome,
-        last_run_finished_at=finished_at,
-        last_stopped_at=finished_at,
-        last_message=final_message,
-        run_summary=summary,
-        health_issues=summary.get('health_issues') or [],
-        pending_sync_request={},
-        scan_request={},
-        **({'last_success_at': finished_at} if outcome == 'completed' else {}),
-    )
-    return not failures and not stopped, final_message
-
-
-def fail_reviewer_seeded_sync(message):
-    finished_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    safe_message = str(message or 'Sync failed.')[:500]
-    update_app_state(
-        sync_running=False,
-        pid=None,
-        current_provider='',
-        current_course='',
-        last_status='Failed',
-        last_run_status='failed',
-        last_run_finished_at=finished_at,
-        last_stopped_at=finished_at,
-        last_message=safe_message,
-        run_summary={
-            'outcome': 'failed',
-            'message': safe_message,
-            'courses_found': 0,
-            'courses_processed': 0,
-            'fobs_checked': 0,
-            'fobs_updated': 0,
-            'fobs_failed': 1,
-            'health_issues': [safe_message],
-        },
-        health_issues=[safe_message],
-        pending_sync_request={},
-        scan_request={},
-    )
-
-
-def reviewer_seeded_sync_worker(scan_provider='all', scan_days=7):
-    try:
-        reviewer_sync_seeded_courses(scan_provider=scan_provider, scan_days=scan_days)
-    except Exception as exc:
-        fail_reviewer_seeded_sync(f'Sync failed: {type(exc).__name__}: {exc}')
-
-
-def start_reviewer_seeded_sync_async(scan_provider='all', scan_days=7):
-    state = reconcile_running_state()
-    if state.get('sync_running'):
-        return False, 'Sync is already running.'
-    if not has_connected_zoom_account():
-        message = zoom_required_sync_message()
-        update_app_state(sync_running=False, stop_requested=False, pid=None, last_status='Needs attention', last_message=message)
-        return False, message
-    try:
-        days = int(scan_days or 7)
-    except Exception:
-        days = 7
-    days = max(1, min(days, PAID_SYNC_WINDOW_DAYS))
-    provider_id = provider_slug(scan_provider or 'all')
-    clear_stop_request()
-    started_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    update_app_state(
-        sync_running=True,
-        stop_requested=False,
-        pid=os.getpid(),
-        last_pid=os.getpid(),
-        last_status='Running',
-        last_run_status='running',
-        last_started_at=started_at,
-        last_run_started_at=started_at,
-        last_run_finished_at='',
-        last_message=f'TrainerMate is starting a sync for {"all providers" if provider_id == "all" else provider_id}, next {days} days.',
-        current_provider='',
-        current_course='',
-        run_summary={
-            'outcome': 'running',
-            'message': f'TrainerMate is starting a sync for {"all providers" if provider_id == "all" else provider_id}, next {days} days.',
-            'courses_found': 0,
-            'courses_processed': 0,
-            'fobs_checked': 0,
-            'fobs_updated': 0,
-            'zoom_existing_verified': 0,
-            'fobs_failed': 0,
-            'health_issues': [],
-        },
-        scan_request={'provider': provider_id, 'days': days, 'started_at': started_at, 'source': 'dashboard'},
-    )
-    thread = threading.Thread(target=reviewer_seeded_sync_worker, args=(provider_id, days), daemon=True)
-    thread.start()
-    scope_text = 'all providers' if provider_id == 'all' else provider_id
-    return True, f'Sync started for {scope_text}, next {days} days.'
-
-
-@app.post('/reviewer/course/<course_id>/zoom')
-def reviewer_create_or_verify_zoom(course_id):
-    if not reviewer_demo_enabled():
-        return redirect(url_for('home'))
-    course = reviewer_course_by_id(course_id)
-    if not course:
-        set_flash('Course not found.', 'warning')
-        return redirect(url_for('home', section='dashboard'))
-    if course.get('meeting_id'):
-        token, message = reviewer_zoom_access_token_or_message()
-        if not token:
-            set_flash(message, 'warning')
-        else:
-            r = requests.get(f"https://api.zoom.us/v2/meetings/{course.get('meeting_id')}", headers={'Authorization': f'Bearer {token}'}, timeout=20)
-            if r.status_code == 200:
-                ok, _ = reviewer_patch_zoom_meeting(course, course.get('meeting_id'), token)
-                if ok:
-                    set_flash('Existing Zoom meeting re-verified. The course note has been refreshed.', 'success')
-                else:
-                    reviewer_update_course_zoom(course_id, course.get('meeting_id'), course.get('meeting_link'), course.get('meeting_password'), 'Existing Zoom meeting verified for TrainerMate')
-                    set_flash('Existing Zoom meeting re-verified. The course note has been refreshed.', 'success')
-            else:
-                ok, msg = reviewer_create_zoom_meeting(course, replace=True)
-                set_flash(msg, 'success' if ok else 'warning')
-    else:
-        ok, msg = reviewer_create_zoom_meeting(course, replace=False)
-        set_flash(msg, 'success' if ok else 'warning')
-    return redirect(url_for('home', section='dashboard', provider='essex'))
-
 @app.route('/sync/course/<course_id>', methods=['POST'])
 def check_course_only(course_id):
-    if reviewer_demo_enabled():
-        return reviewer_create_or_verify_zoom(course_id)
     submitted_key = (request.form.get('course_key') or '').strip()
     submitted_provider = (request.form.get('provider') or '').strip()
     submitted_title = (request.form.get('title') or '').strip()
@@ -11527,19 +11278,11 @@ def check_course_only(course_id):
     if ok:
         message = f"Single-course confirmation check started: {course.get('provider')} - {course.get('title')} - {course.get('date_time')}."
     set_flash(message, 'success' if ok else 'warning')
-    return redirect(url_for('home', section='dashboard', provider=provider_id))
+    return redirect(url_for('home', section='dashboard', provider='all'))
 
 
 @app.post('/course/<course_id>/replace-zoom')
 def replace_course_zoom(course_id):
-    if reviewer_demo_enabled():
-        course = reviewer_course_by_id(course_id)
-        if not course:
-            set_flash('Course not found for Zoom replacement.', 'warning')
-            return redirect(url_for('home', section='dashboard'))
-        ok, msg = reviewer_create_zoom_meeting(course, replace=True)
-        set_flash(msg, 'success' if ok else 'warning')
-        return redirect(url_for('home', section='dashboard', provider='essex'))
     course = load_course_for_action(course_id)
     if not course:
         set_flash('Course not found for Zoom replacement.', 'warning')
@@ -11550,7 +11293,10 @@ def replace_course_zoom(course_id):
     scan_days = scan_days_for_course_datetime(course.get('date_time') or '', active_days)
     ok, message = start_sync_process(scan_provider=provider_id, scan_days=scan_days, target_course=course, allow_zoom_replace=True)
     if ok:
-        message = f"Zoom replacement started for: {course.get('provider')} - {course.get('title')} - {course.get('date_time')}."
+        if course_starts_within_hours(course.get('date_time') or '', 72):
+            message = f"Explicit Zoom replacement started for a course within 72 hours: {course.get('provider')} - {course.get('title')} - {course.get('date_time')}. TrainerMate will only work on this course."
+        else:
+            message = f"Zoom replacement started for: {course.get('provider')} - {course.get('title')} - {course.get('date_time')}."
     set_flash(message, 'success' if ok else 'warning')
     return redirect(url_for('home', section='dashboard', provider=provider_id))
 
@@ -11578,7 +11324,10 @@ def keep_fobs_zoom(course_id):
         conn.commit()
     finally:
         conn.close()
-    set_flash('Kept the existing FOBS Zoom link for this course.', 'success')
+    if course_starts_within_hours(course.get('date_time') or '', 72):
+        set_flash('Kept the existing FOBS Zoom link. TrainerMate will not disturb this near-course link unless you explicitly replace it later.', 'success')
+    else:
+        set_flash('Kept the existing FOBS Zoom link for this course.', 'success')
     return redirect(url_for('home', section='dashboard', provider=provider_slug(course.get('provider') or 'all')))
 
 
@@ -11586,16 +11335,13 @@ def keep_fobs_zoom(course_id):
 def start_sync():
     scan_provider = request.form.get('scan_provider') or request.args.get('provider') or 'all'
     scan_days = request.form.get('scan_days') or 7
-    if reviewer_demo_enabled():
-        ok, message = start_reviewer_seeded_sync_async(scan_provider=scan_provider, scan_days=scan_days)
-    else:
-        ok, message = start_sync_process(scan_provider=scan_provider, scan_days=scan_days)
+    ok, message = start_sync_process(scan_provider=scan_provider, scan_days=scan_days)
     set_flash(message, 'success' if ok else 'warning')
     redirect_provider = scan_provider if scan_provider and scan_provider != 'all' else None
     return redirect(url_for('home', section='dashboard', provider=redirect_provider))
 
 
-@app.route('/sync/stop', methods=['GET', 'POST'])
+@app.route('/sync/stop', methods=['POST'])
 def stop_sync():
     ok, message = stop_sync_process()
     set_flash(message, 'warning' if ok else 'error')
@@ -11670,7 +11416,7 @@ def remote_admin_status_payload():
     providers = load_providers()
     zoom_accounts = load_zoom_accounts()
     cert_status = certificate_scan_snapshot()
-    health_issues = state.get('health_issues') if isinstance(state.get('health_issues'), list) else []
+    health_issues = actionable_health_issues(state, providers)
     return {
         'sync_running': bool(state.get('sync_running')),
         'last_status': state.get('last_status') or '',
