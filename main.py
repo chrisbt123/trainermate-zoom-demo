@@ -415,7 +415,7 @@ def send_email(to_email: str, subject: str, body: str):
         raise HTTPException(status_code=400, detail="This account does not have a valid registered email address.")
     from_email = configured_from_email()
     if not from_email:
-        raise HTTPException(status_code=503, detail="Password email is not configured. Set RESEND_API_KEY and RESEND_FROM_EMAIL on Render.")
+        raise HTTPException(status_code=503, detail="Password email is not configured on the API service handling this request. Set RESEND_API_KEY and RESEND_FROM_EMAIL there, then restart/redeploy it.")
     if RESEND_API_KEY and RESEND_FROM_EMAIL:
         payload = json.dumps({
             "from": from_email,
@@ -2110,8 +2110,21 @@ function setView(name){
   renderAll();
 }
 document.querySelectorAll('#nav button').forEach(b=>b.addEventListener('click',()=>setView(b.dataset.view)));
+function looksLikeNdors(value){const text=String(value||'').trim(); return !!text && !text.includes('@') && !text.includes(' ') && /^[A-Za-z0-9_-]+$/.test(text) && text.length<=64;}
 function userByNdors(ndors){return ((snapshot&&snapshot.users)||[]).find(x=>String(x.ndors_trainer_id)===String(ndors));}
-function selectedUser(){return selected?userByNdors(selected):null;}
+function userBySelected(value){
+  const text=String(value||'').trim();
+  if(!text) return null;
+  return ((snapshot&&snapshot.users)||[]).find(x=>String(x.ndors_trainer_id)===text)
+    || ((snapshot&&snapshot.users)||[]).find(x=>String(x.email||'').toLowerCase()===text.toLowerCase())
+    || null;
+}
+function selectedUser(){return selected?userBySelected(selected):null;}
+function selectedNdors(){
+  const u=selectedUser();
+  const ndors=String((u&&u.ndors_trainer_id)||selected||'').trim();
+  return looksLikeNdors(ndors)?ndors:'';
+}
 function commandsFor(ndors){return ((snapshot&&snapshot.commands)||[]).filter(c=>String(c.ndors_trainer_id)===String(ndors));}
 function issueFor(user){
   const d=user.latest_device||{}, s=d.status||{};
@@ -2165,7 +2178,8 @@ function renderStats(){
 function renderUsers(){
   const q=lower(document.getElementById('userSearch')?.value||'');
   const list=((snapshot&&snapshot.users)||[]).filter(u=>lower(JSON.stringify(u)).includes(q));
-  const html=list.map(u=>`<tr class="user-row ${selected===u.ndors_trainer_id?'selected':''}" onclick="pick('${esc(u.ndors_trainer_id||'')}')">
+  const currentNdors=selectedNdors();
+  const html=list.map(u=>`<tr class="user-row ${currentNdors===u.ndors_trainer_id?'selected':''}" onclick="pick('${esc(u.ndors_trainer_id||'')}')">
     <td><strong>${esc(u.ndors_trainer_id||'')}</strong><div class="muted">${esc(u.email||'')}</div></td>
     <td>${esc(u.plan||'')}<div class="muted">${esc(u.status||'')}</div></td>
     <td>${esc((u.latest_device&&u.latest_device.app_version)||'Unknown')}<div class="muted">${ago(u.latest_device&&u.latest_device.last_seen_at)}</div>${u.update_needed?'<div class="bad">Update needed</div>':''}</td>
@@ -2176,12 +2190,13 @@ function renderUsers(){
   if(document.getElementById('users')) users.innerHTML=html||'<tr><td colspan="6" class="muted">No users found.</td></tr>';
 }
 function pick(ndors){
-  selected=ndors;
+  const picked=userBySelected(ndors);
+  selected=(picked&&picked.ndors_trainer_id)||ndors;
   if(selected) localStorage.setItem('tm_admin_selected', selected);
   const u=selectedUser();
   if(u && document.getElementById('licenceFor')){licenceFor.value=u.ndors_trainer_id||'';}
   renderAll();
-  setNotice('Selected trainer '+ndors+'.','ok');
+  setNotice('Selected trainer '+(selectedNdors()||selected)+'.','ok');
 }
 function statusPills(u){
   const d=u.latest_device||{};
@@ -2568,27 +2583,29 @@ async function setAccount(plan,status){
 }
 async function resetTrial(){if(!selected) return alert('Choose a trainer first.'); await api('/admin/api/accounts/'+encodeURIComponent(selected)+'/reset-trial',{method:'POST',body:JSON.stringify({free_syncs_used:0})}); setNotice('Trial reset.','ok'); pushAction('Trial reset',`Free trial reset for ${selected}.`,'ok'); await load();}
 async function forceResetPassword(){
-  if(!selected) return alert('Choose a trainer first.');
+  const ndors=selectedNdors();
+  if(!ndors) return alert('Choose a trainer with a valid NDORS trainer ID first.');
   const u=selectedUser();
-  const label=`${selected}${u&&u.email?' / '+u.email:''}`;
+  const label=`${ndors}${u&&u.email?' / '+u.email:''}`;
   if(!confirm(`Force reset TrainerMate password for ${label}?\n\nOnly do this after verifying the trainer. The new password is not logged.`)) return;
-  const typed=prompt(`Type the NDORS trainer ID exactly to confirm password reset:\n\n${selected}`);
-  if(typed!==selected){setNotice('Password reset cancelled - NDORS ID did not match.','warn'); pushAction('Force password reset','Cancelled - confirmation did not match.','warn'); return;}
-  const res=await api('/admin/api/accounts/'+encodeURIComponent(selected)+'/force-password-reset',{method:'POST',body:JSON.stringify({confirm_ndors_trainer_id:typed,confirm_reset:'RESET PASSWORD'})});
+  const typed=prompt(`Type the NDORS trainer ID exactly to confirm password reset:\n\n${ndors}`);
+  if(typed!==ndors){setNotice('Password reset cancelled - NDORS ID did not match.','warn'); pushAction('Force password reset','Cancelled - confirmation did not match.','warn'); return;}
+  const res=await api('/admin/api/accounts/'+encodeURIComponent(ndors)+'/force-password-reset',{method:'POST',body:JSON.stringify({confirm_ndors_trainer_id:typed,confirm_reset:'RESET PASSWORD'})});
   setNotice(`Temporary password emailed to ${res.delivered_to||'the registered user'}.`,'ok');
-  pushAction('Force password reset',`Temporary password emailed for ${selected}. User must change it on next login.`,'warn');
+  pushAction('Force password reset',`Temporary password emailed for ${ndors}. User must change it on next login.`,'warn');
   alert(`Temporary password sent to ${res.delivered_to||'the registered user'}.\n\nThe password was not shown to admin and was not logged.`);
   await load();
 }
 async function deleteUser(){
-  if(!selected) return alert('Choose a trainer first.');
+  const ndors=selectedNdors();
+  if(!ndors) return alert('Choose a trainer with a valid NDORS trainer ID first.');
   const u=selectedUser();
-  const label=`${selected}${u&&u.email?' / '+u.email:''}`;
+  const label=`${ndors}${u&&u.email?' / '+u.email:''}`;
   if(!confirm(`Delete trainer account ${label}?\n\nThis removes the admin/licensing account, login emails, devices, usage, queued commands, course snapshots and support bundles for this NDORS ID. Audit history is kept.`)) return;
-  const typed=prompt(`Final confirmation: type the NDORS trainer ID exactly to delete this user:\n\n${selected}`);
-  if(typed!==selected){setNotice('Delete cancelled - NDORS ID did not match.','warn'); pushAction('Delete user','Cancelled - confirmation did not match.','warn'); return;}
-  await api('/admin/api/accounts/'+encodeURIComponent(selected)+'/delete',{method:'POST',body:JSON.stringify({confirm_ndors_trainer_id:typed,confirm_delete:'DELETE USER'})});
-  setNotice('User deleted.','ok'); pushAction('User deleted',`Deleted trainer account ${selected}.`,'warn'); selected=''; await load();
+  const typed=prompt(`Final confirmation: type the NDORS trainer ID exactly to delete this user:\n\n${ndors}`);
+  if(typed!==ndors){setNotice('Delete cancelled - NDORS ID did not match.','warn'); pushAction('Delete user','Cancelled - confirmation did not match.','warn'); return;}
+  await api('/admin/api/accounts/'+encodeURIComponent(ndors)+'/delete',{method:'POST',body:JSON.stringify({confirm_ndors_trainer_id:typed,confirm_delete:'DELETE USER'})});
+  setNotice('User deleted.','ok'); pushAction('User deleted',`Deleted trainer account ${ndors}.`,'warn'); selected=''; localStorage.removeItem('tm_admin_selected'); await load();
 }
 async function sendTrainerMessage(){openMessageComposer('selected');}
 async function sendUpdatePrompt(){

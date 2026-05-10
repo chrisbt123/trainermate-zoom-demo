@@ -233,7 +233,7 @@ checks = {
         "SMTP_HOST",
         "RESEND_FROM_EMAIL",
         "send_temporary_password_email(",
-        "Set RESEND_API_KEY and RESEND_FROM_EMAIL on Render",
+        "Set RESEND_API_KEY and RESEND_FROM_EMAIL there",
         "delivered_to",
         "The password was not shown to admin",
         "User must change it on next login",
