@@ -435,6 +435,7 @@ def send_email(to_email: str, subject: str, body: str):
             headers={
                 "Authorization": f"Bearer {RESEND_API_KEY}",
                 "Content-Type": "application/json",
+                "User-Agent": "TrainerMate/1.0 password-reset",
             },
             method="POST",
         )
