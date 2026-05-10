@@ -17,6 +17,8 @@ from urllib.parse import parse_qs
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
+
+import trainermate_identity as identity_helpers
 from pydantic import BaseModel, Field
 from supabase import create_client, Client
 
@@ -1536,10 +1538,62 @@ def account_email_matches(account_rows, email: str):
     return False
 
 
+def get_account_rows_by_email(email: str):
+    supplied = identity_helpers.normalize_email(email)
+    if not supplied:
+        return []
+    rows = []
+    try:
+        result = execute_supabase(
+            supabase.table("accounts")
+            .select("*")
+            .eq("primary_email", supplied),
+            "read accounts by primary email",
+        )
+        rows.extend(result.data or [])
+    except Exception:
+        pass
+    try:
+        logins = execute_supabase(
+            supabase.table("account_logins")
+            .select("*, accounts(*)")
+            .eq("email", supplied),
+            "read account logins by email",
+        )
+        for row in logins.data or []:
+            account = row.get("accounts") if isinstance(row, dict) else None
+            if isinstance(account, dict):
+                rows.append(account)
+    except Exception:
+        pass
+    seen = set()
+    out = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        key = row.get("id") or row.get("ndors_trainer_id")
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(row)
+    return out
+
+
+def email_registered_to_other_ndors(email: str, ndors_trainer_id: str) -> bool:
+    supplied_ndors = identity_helpers.normalize_ndors(ndors_trainer_id).lower()
+    for row in get_account_rows_by_email(email):
+        row_ndors = identity_helpers.normalize_ndors(row.get("ndors_trainer_id")).lower()
+        if row_ndors and row_ndors != supplied_ndors:
+            return True
+    return False
+
 def create_free_account(ndors_trainer_id: str, email: str | None, password_hash_value: str | None = None):
+    clean_email = identity_helpers.normalize_email(email) if valid_email(email) else None
+    if clean_email and email_registered_to_other_ndors(clean_email, ndors_trainer_id):
+        clean_email = None
     row = {
-        "ndors_trainer_id": ndors_trainer_id,
-        "primary_email": email,
+        "ndors_trainer_id": identity_helpers.normalize_ndors(ndors_trainer_id),
+        "primary_email": clean_email,
         "plan": "free",
         "status": "active",
     }
@@ -1567,11 +1621,11 @@ def create_free_account(ndors_trainer_id: str, email: str | None, password_hash_
         "create usage row"
     )
 
-    if email:
+    if clean_email:
         execute_supabase(
             supabase.table("account_logins").insert({
                 "account_id": account["id"],
-                "email": email,
+                "email": clean_email,
                 "is_primary": True
             }),
             "create account login"
@@ -3649,26 +3703,39 @@ def register_account(payload: AccountRegisterRequest, request: Request):
     try:
         account = get_account_by_ndors(payload.ndors_trainer_id)
         new_hash = password_hash(payload.password)
+        supplied_email = identity_helpers.normalize_email(payload.email)
+        if email_registered_to_other_ndors(supplied_email, payload.ndors_trainer_id):
+            raise HTTPException(status_code=409, detail="That email is already registered to another TrainerMate account.")
         if not account:
-            account = create_free_account(payload.ndors_trainer_id, payload.email, new_hash)
+            account = create_free_account(payload.ndors_trainer_id, supplied_email, new_hash)
         else:
             existing_hash = account.get("password_hash") or ""
-            primary_email = (account.get("primary_email") or "").strip().lower()
-            supplied_email = (payload.email or "").strip().lower()
-            if existing_hash and not password_matches(payload.password, existing_hash):
+            primary_email = identity_helpers.normalize_email(account.get("primary_email"))
+            if primary_email and primary_email != supplied_email:
+                raise HTTPException(status_code=403, detail="That email does not match the registered account. Please log in with the registered email or contact support.")
+            if existing_hash:
                 raise HTTPException(status_code=409, detail="This NDORS ID is already registered. Please log in instead.")
             updates = {
-                "primary_email": payload.email or account.get("primary_email"),
                 "last_login_at": utc_now(),
+                "password_hash": new_hash,
+                "password_set_at": utc_now(),
+                "password_must_change": False,
             }
-            if not existing_hash:
-                updates["password_hash"] = new_hash
-                updates["password_set_at"] = utc_now()
-                updates["password_must_change"] = False
-            if primary_email and supplied_email and primary_email != supplied_email and existing_hash:
-                raise HTTPException(status_code=403, detail="That email does not match the registered account.")
+            if not primary_email:
+                updates["primary_email"] = supplied_email
             updated_rows = update_accounts_by_ndors(payload.ndors_trainer_id, updates, "register existing account")
             account = best_account_row(updated_rows) or dict(account, **updates)
+            try:
+                execute_supabase(
+                    supabase.table("account_logins").insert({
+                        "account_id": account.get("id"),
+                        "email": supplied_email,
+                        "is_primary": True,
+                    }),
+                    "create account login for registered account",
+                )
+            except Exception:
+                pass
         ensure_device(account["id"], payload.device_id, payload.device_name)
         response = access_response_for_account(account, payload.app_version)
         cache_access_response(payload.ndors_trainer_id, response)

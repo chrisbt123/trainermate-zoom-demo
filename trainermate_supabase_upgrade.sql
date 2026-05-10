@@ -57,3 +57,13 @@ create unique index if not exists idx_devices_account_device on public.devices (
 create unique index if not exists idx_usage_account_id on public.usage (account_id);
 create unique index if not exists idx_licences_licence_key on public.licences (licence_key);
 create index if not exists idx_password_reset_tokens_lookup on public.password_reset_tokens (token_hash, ndors_trainer_id, used_at);
+
+-- Account identity guardrails. Run duplicate checks before adding these indexes on an existing database:
+-- select lower(ndors_trainer_id), count(*) from public.accounts group by lower(ndors_trainer_id) having count(*) > 1;
+-- select lower(primary_email), count(*) from public.accounts where coalesce(primary_email, '') <> '' group by lower(primary_email) having count(*) > 1;
+-- select lower(email), count(*) from public.account_logins group by lower(email) having count(*) > 1;
+create unique index if not exists idx_accounts_primary_email_unique_lower
+  on public.accounts (lower(primary_email))
+  where coalesce(primary_email, '') <> '';
+create unique index if not exists idx_account_logins_email_unique_lower
+  on public.account_logins (lower(email));

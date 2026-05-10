@@ -19,6 +19,7 @@ from trainermate_activity import (
     mark_activity_read,
 )
 import trainermate_certificates as certificate_helpers
+import trainermate_identity as identity_helpers
 from trainermate_courses import (
     parse_dashboard_datetime,
     suppress_stale_same_provider_slot_duplicates,
@@ -105,6 +106,7 @@ PROVIDER_CACHE_VERSION = 'v3_exact_document_cache'
 
 API_URL = os.getenv('TRAINERMATE_API_URL', 'http://127.0.0.1:8000')
 BASE_DIR = Path(__file__).resolve().parent
+PROFILE_BASE_DIR = BASE_DIR / 'trainer_profiles'
 APP_STATE_PATH = BASE_DIR / 'app_state.json'
 PROVIDERS_PATH = BASE_DIR / 'providers.json'
 PROVIDER_CATALOGUE_PATH = BASE_DIR / 'provider_catalogue.json'
@@ -298,6 +300,7 @@ body.tm-modal-open{overflow:hidden}.tm-top-flash{display:none}
 
 @app.before_request
 def security_before_request():
+    set_active_data_paths()
     if not is_local_request():
         abort(403)
     if request.method in {'POST', 'PUT', 'PATCH', 'DELETE'} and not validate_csrf():
@@ -467,6 +470,7 @@ def save_json(path: Path, data):
     last_exc = None
     for attempt in range(8):
         try:
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             with tmp.open('w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2, sort_keys=True)
             os.replace(tmp, path)
@@ -485,6 +489,55 @@ def save_json(path: Path, data):
             except Exception:
                 pass
     raise last_exc
+
+
+PROFILED_FILENAMES = {
+    'APP_STATE_PATH': 'app_state.json',
+    'PROVIDERS_PATH': 'providers.json',
+    'COURSES_DB_PATH': 'courses.db',
+    'ZOOM_ACCOUNTS_PATH': 'zoom_accounts.json',
+    'ALERT_ACK_PATH': 'dashboard_alerts_ack.json',
+    'COURSE_REMOVAL_CONFIRM_PATH': 'course_removal_confirmed.json',
+    'PROVIDER_CERTIFICATE_MANIFEST_PATH': 'provider_certificate_cache_manifest.json',
+    'AUTOMATION_SETTINGS_PATH': 'automation_settings.json',
+    'ACCESS_CACHE_PATH': 'access_cache.json',
+    'BOT_LOG_PATH': 'bot_debug.log',
+}
+
+
+def active_profile_slug():
+    ndors = keyring.get_password('trainermate', 'ndors_id') or ''
+    return identity_helpers.profile_slug_for_ndors(ndors)
+
+
+def active_profile_dir():
+    root = PROFILE_BASE_DIR / active_profile_slug()
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return root
+
+
+def set_active_data_paths():
+    """Point trainer-owned local files at the signed-in trainer profile."""
+    global APP_STATE_PATH, PROVIDERS_PATH, COURSES_DB_PATH, ZOOM_ACCOUNTS_PATH
+    global ALERT_ACK_PATH, COURSE_REMOVAL_CONFIRM_PATH, DOCUMENTS_DIR
+    global PROVIDER_CERTIFICATE_MANIFEST_PATH, AUTOMATION_SETTINGS_PATH, ACCESS_CACHE_PATH, BOT_LOG_PATH
+    root = active_profile_dir()
+    APP_STATE_PATH = root / PROFILED_FILENAMES['APP_STATE_PATH']
+    PROVIDERS_PATH = root / PROFILED_FILENAMES['PROVIDERS_PATH']
+    COURSES_DB_PATH = root / PROFILED_FILENAMES['COURSES_DB_PATH']
+    ZOOM_ACCOUNTS_PATH = root / PROFILED_FILENAMES['ZOOM_ACCOUNTS_PATH']
+    ALERT_ACK_PATH = root / PROFILED_FILENAMES['ALERT_ACK_PATH']
+    COURSE_REMOVAL_CONFIRM_PATH = root / PROFILED_FILENAMES['COURSE_REMOVAL_CONFIRM_PATH']
+    PROVIDER_CERTIFICATE_MANIFEST_PATH = root / PROFILED_FILENAMES['PROVIDER_CERTIFICATE_MANIFEST_PATH']
+    AUTOMATION_SETTINGS_PATH = root / PROFILED_FILENAMES['AUTOMATION_SETTINGS_PATH']
+    ACCESS_CACHE_PATH = root / PROFILED_FILENAMES['ACCESS_CACHE_PATH']
+    BOT_LOG_PATH = root / PROFILED_FILENAMES['BOT_LOG_PATH']
+    DOCUMENTS_DIR = root / 'trainer_documents'
+
+
+set_active_data_paths()
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -756,23 +809,11 @@ def get_identity():
 
 
 def mask_email(email: str) -> str:
-    email = (email or '').strip()
-    if '@' not in email:
-        return email
-    name, domain = email.split('@', 1)
-    if len(name) <= 2:
-        masked_name = name[:1] + '-' * max(0, len(name) - 1)
-    else:
-        masked_name = name[:2] + '-' * max(1, len(name) - 2)
-    return f'{masked_name}@{domain}'
+    return identity_helpers.mask_email(email)
 
 
 def mask_ndors(ndors: str) -> str:
-    text = re.sub(r'\s+', '', str(ndors or '').strip())
-    if not text:
-        return ''
-    suffix = text[-3:] if len(text) > 3 else text[-1:]
-    return ('*' * max(3, len(text) - len(suffix))) + suffix
+    return identity_helpers.mask_ndors(ndors)
 
 
 def service_status_rows(*, access, identity, zoom_accounts, zoom_connected, providers, state):
@@ -851,8 +892,9 @@ def clear_local_auth_rate_limit(scope, identity=''):
     with LOCAL_AUTH_RATE_LIMIT_LOCK:
         LOCAL_AUTH_RATE_LIMITS.pop(local_auth_rate_key(scope, identity), None)
 
-def password_record_exists():
-    return bool(keyring.get_password(AUTH_KEYRING_SERVICE, 'password_hash'))
+def password_record_exists(ndors=None):
+    ndors = ndors or get_identity().get('ndors')
+    return bool(keyring.get_password(AUTH_KEYRING_SERVICE, identity_helpers.local_password_key(ndors)))
 
 
 def hash_local_password(password, salt_hex=None):
@@ -866,8 +908,9 @@ def hash_local_password(password, salt_hex=None):
     return f'pbkdf2_sha256${AUTH_ITERATIONS}${salt_hex}${digest}'
 
 
-def verify_local_password(password):
-    record = keyring.get_password(AUTH_KEYRING_SERVICE, 'password_hash') or ''
+def verify_local_password(password, ndors=None):
+    ndors = ndors or get_identity().get('ndors')
+    record = keyring.get_password(AUTH_KEYRING_SERVICE, identity_helpers.local_password_key(ndors)) or ''
     try:
         method, iterations_text, salt_hex, expected = record.split('$', 3)
         if method != 'pbkdf2_sha256':
@@ -883,8 +926,11 @@ def verify_local_password(password):
         return False
 
 
-def set_local_password(password):
-    keyring.set_password(AUTH_KEYRING_SERVICE, 'password_hash', hash_local_password(password))
+def set_local_password(password, ndors=None):
+    ndors = ndors or get_identity().get('ndors')
+    if not ndors:
+        return
+    keyring.set_password(AUTH_KEYRING_SERVICE, identity_helpers.local_password_key(ndors), hash_local_password(password))
 
 
 def dashboard_unlocked():
@@ -895,10 +941,10 @@ def dashboard_unlocked():
     if session.get('trainer_auth_ok'):
         return True
     if (
-        password_record_exists()
+        password_record_exists(get_identity().get('ndors'))
         and (get_identity().get('ndors') or '').strip()
         and local_remember_me_enabled()
-        and keyring.get_password(AUTH_KEYRING_SERVICE, 'remembered_login') == REMEMBERED_AUTH_MARKER
+        and keyring.get_password(AUTH_KEYRING_SERVICE, identity_helpers.remembered_login_key(get_identity().get('ndors'))) == REMEMBERED_AUTH_MARKER
     ):
         return True
     return False
@@ -926,11 +972,12 @@ def local_remember_me_enabled():
 
 def set_local_remember_me(enabled):
     keyring.set_password(AUTH_KEYRING_SERVICE, 'remember_me', '1' if enabled else '0')
+    ndors = get_identity().get('ndors')
     if enabled:
-        keyring.set_password(AUTH_KEYRING_SERVICE, 'remembered_login', REMEMBERED_AUTH_MARKER)
+        keyring.set_password(AUTH_KEYRING_SERVICE, identity_helpers.remembered_login_key(ndors), REMEMBERED_AUTH_MARKER)
     else:
         try:
-            keyring.delete_password(AUTH_KEYRING_SERVICE, 'remembered_login')
+            keyring.delete_password(AUTH_KEYRING_SERVICE, identity_helpers.remembered_login_key(ndors))
         except Exception:
             pass
 
@@ -944,18 +991,13 @@ def auth_public_path():
 
 
 def provider_keyring_service(provider_id: str) -> str:
-    # Legacy dashboard keyring service. Kept for backwards compatibility.
-    return f'trainermate_provider_{provider_slug(provider_id)}'
+    return f'trainermate_provider_{active_profile_slug()}_{provider_slug(provider_id)}'
 
 
 def provider_keyring_services(provider_id: str):
     """Return every keyring service that either dashboard or bot may use."""
     pid = provider_slug(provider_id)
     services = [provider_keyring_service(pid)]
-    if pid == 'essex':
-        services.extend(['essex_portal', 'road_safety_portal'])
-    else:
-        services.extend([f'road_safety_provider_{pid}', 'road_safety_portal'])
 
     seen = set()
     ordered = []
@@ -1199,18 +1241,18 @@ def save_zoom_accounts(accounts):
 
 
 def set_zoom_tokens(account_id: str, access_token: str, refresh_token: str):
-    keyring.set_password('trainermate_zoom_oauth', f'access::{account_id}', access_token)
-    keyring.set_password('trainermate_zoom_oauth', f'refresh::{account_id}', refresh_token)
+    keyring.set_password(f'trainermate_zoom_oauth::{active_profile_slug()}', f'access::{account_id}', access_token)
+    keyring.set_password(f'trainermate_zoom_oauth::{active_profile_slug()}', f'refresh::{account_id}', refresh_token)
 
 
 def get_zoom_oauth_token(account_id: str, token_kind: str):
-    return keyring.get_password('trainermate_zoom_oauth', f'{token_kind}::{account_id}') or ''
+    return keyring.get_password(f'trainermate_zoom_oauth::{active_profile_slug()}', f'{token_kind}::{account_id}') or ''
 
 
 def clear_zoom_tokens(account_id: str):
     for prefix in ('access', 'refresh'):
         try:
-            keyring.delete_password('trainermate_zoom_oauth', f'{prefix}::{account_id}')
+            keyring.delete_password(f'trainermate_zoom_oauth::{active_profile_slug()}', f'{prefix}::{account_id}')
         except Exception:
             pass
 
@@ -7863,6 +7905,8 @@ def start_sync_process(scan_provider='all', scan_days=7, target_course=None, all
         env = os.environ.copy()
         env['PYTHONUNBUFFERED'] = '1'
         env['TRAINERMATE_API_URL'] = API_URL
+        env['TRAINERMATE_DATA_DIR'] = str(active_profile_dir())
+        env['TRAINERMATE_PROFILE_SLUG'] = active_profile_slug()
         env['TRAINERMATE_SCAN_DAYS'] = str(scan_days)
         env['TRAINERMATE_SCAN_PROVIDER'] = scan_provider
         env['TRAINERMATE_SCAN_SCOPE'] = str(scan_scope or 'short')
@@ -8581,17 +8625,20 @@ TEMPLATE = """
         </div>
         {% if zoom_accounts %}
           {% for account in zoom_accounts %}
+            {% set zoom_status = (account.status or 'connected')|lower %}
+            {% set zoom_usable = zoom_status in ['connected', 'ok', 'active'] %}
             <div class='zoom-card'>
               <div class='zoom-header'>
                 <div>
                   <strong>{{ account.nickname }}</strong>
-                  <div class='helper'>{{ account.email or 'Connected account' }}</div>
+                  <div class='helper'>{{ account.email or 'Saved Zoom account' }}</div>
                 </div>
-                <span class='status-tag'>{% if account.is_default %}Default{% else %}Connected{% endif %}</span>
+                <span class='status-tag {% if not zoom_usable %}warn{% endif %}'>{% if not zoom_usable %}Needs reconnect{% elif account.is_default %}Default{% else %}Connected{% endif %}</span>
               </div>
               <div class='inline-actions'>
-                {% if not account.is_default %}<form method='post' action='{{ url_for("zoom_set_default", account_id=account.id) }}'>{{ csrf_hidden_field()|safe }}<button class='btn soft small' type='submit'>Make default</button></form>{% endif %}
-                <form method='post' action='{{ url_for("zoom_disconnect", account_id=account.id) }}' onsubmit='return confirm("Disconnect this Zoom account?")'>{{ csrf_hidden_field()|safe }}<button class='btn warn small' type='submit'>Disconnect</button></form>
+                {% if not zoom_usable %}<a class='btn small' href='{{ url_for("zoom_connect_start", zoom_nickname=account.nickname) }}'>Reconnect Zoom</a>{% endif %}
+                {% if zoom_usable and not account.is_default %}<form method='post' action='{{ url_for("zoom_set_default", account_id=account.id) }}'>{{ csrf_hidden_field()|safe }}<button class='btn soft small' type='submit'>Make default</button></form>{% endif %}
+                <form method='post' action='{{ url_for("zoom_disconnect", account_id=account.id) }}' onsubmit='return confirm("Remove this saved Zoom account from TrainerMate?")'>{{ csrf_hidden_field()|safe }}<button class='btn warn small' type='submit'>{% if zoom_usable %}Disconnect{% else %}Remove saved account{% endif %}</button></form>
               </div>
             </div>
           {% endfor %}
@@ -9868,7 +9915,7 @@ def auth_welcome():
         AUTH_TEMPLATE,
         identity=get_identity(),
         ndors_prefill=safe_ndors_prefill(get_identity().get('ndors')),
-        has_password=password_record_exists(),
+        has_password=password_record_exists(get_identity().get('ndors')),
         next_url=safe_next_url(request.args.get('next') or ''),
         message=session.pop('auth_message', ''),
         auth_mode=session.pop('auth_mode', request.args.get('mode') or 'login'),
@@ -9953,7 +10000,7 @@ def auth_change_password():
             return redirect(url_for('auth_change_password_page', next=next_url))
         data = response.json()
         access = data.get('access') if isinstance(data, dict) else {}
-        set_local_password(new_password)
+        set_local_password(new_password, ndors)
         set_local_remember_me(False)
         clear_password_change_required()
         remember_dashboard_login(ndors)
@@ -9998,8 +10045,6 @@ def auth_register():
         session['auth_mode'] = 'register'
         return redirect(url_for('auth_welcome', next=next_url, mode='register'))
 
-    keyring.set_password('trainermate', 'ndors_id', ndors)
-    keyring.set_password('trainermate', 'email', email)
     payload = {
         'ndors_trainer_id': ndors,
         'email': email,
@@ -10015,7 +10060,6 @@ def auth_register():
         if response.status_code in {200, 201}:
             data = response.json()
             access = data.get('access') if isinstance(data, dict) else {}
-            save_cached_access(access)
         else:
             try:
                 remote_warning = response.json().get('detail') or response.text
@@ -10029,10 +10073,13 @@ def auth_register():
         session['auth_mode'] = 'register'
         return redirect(url_for('auth_welcome', next=next_url, mode='register'))
 
+    keyring.set_password('trainermate', 'ndors_id', ndors)
+    keyring.set_password('trainermate', 'email', email)
+    set_active_data_paths()
     # Only set the local dashboard password after the account service accepts
     # registration. This avoids turning registration into a password bypass for
     # an existing NDORS account.
-    set_local_password(password)
+    set_local_password(password, ndors)
     set_local_remember_me(remember_me)
     remember_dashboard_login(ndors)
     clear_local_auth_rate_limit('register', ndors)
@@ -10068,7 +10115,7 @@ def auth_login():
         session['auth_message'] = 'Use your NDORS trainer ID to log in. Email address login is no longer accepted.'
         session['auth_mode'] = 'login'
         return redirect(url_for('auth_welcome', next=next_url, mode='login'))
-    if password_record_exists() and verify_local_password(password) and (not saved_ndors or not ndors or ndors.lower() == saved_ndors.lower()):
+    if password_record_exists(ndors) and verify_local_password(password, ndors) and (not saved_ndors or not ndors or ndors.lower() == saved_ndors.lower()):
         try:
             response = requests.post(f'{API_URL}/login-account', json={
                 'ndors_trainer_id': ndors or saved_ndors,
@@ -10123,7 +10170,7 @@ def auth_login():
                 detail = response.json().get('detail') or response.text
             except Exception:
                 detail = response.text or 'Login failed.'
-            if password_record_exists() and verify_local_password(password):
+            if password_record_exists(ndors) and verify_local_password(password, ndors):
                 if ndors:
                     keyring.set_password('trainermate', 'ndors_id', ndors)
                 set_local_remember_me(remember_me)
@@ -10138,7 +10185,7 @@ def auth_login():
         keyring.set_password('trainermate', 'ndors_id', ndors)
         if account.get('email'):
             keyring.set_password('trainermate', 'email', account.get('email'))
-        set_local_password(password)
+        set_local_password(password, ndors)
         if account.get('password_must_change'):
             require_password_change(ndors)
             clear_local_auth_rate_limit('login', ndors)
@@ -10152,7 +10199,7 @@ def auth_login():
         if access:
             save_cached_access(access)
     except Exception as exc:
-        if password_record_exists() and verify_local_password(password):
+        if password_record_exists(ndors) and verify_local_password(password, ndors):
             set_local_remember_me(remember_me)
             remember_dashboard_login(ndors or saved_ndors)
             return redirect(next_url)
@@ -10248,7 +10295,7 @@ def auth_confirm_password_reset():
         data = response.json()
         access = data.get('access') if isinstance(data, dict) else {}
         keyring.set_password('trainermate', 'ndors_id', ndors)
-        set_local_password(password)
+        set_local_password(password, ndors)
         set_local_remember_me(False)
         session.pop('reset_ndors', None)
         clear_password_change_required()

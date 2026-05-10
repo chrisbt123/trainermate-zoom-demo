@@ -91,6 +91,7 @@ LOCAL_TIMEZONE = ZoneInfo("Europe/London")
 
 BOT_MODE = (os.getenv("BOT_MODE") or "normal").strip().lower()
 ALLOW_ZOOM_REPLACE_ON_MISMATCH = (os.getenv("TRAINERMATE_ALLOW_ZOOM_REPLACE_ON_MISMATCH") or "").strip().lower() in {"1", "true", "yes", "y"}
+NEAR_COURSE_PROTECTION_HOURS = int(os.getenv("TRAINERMATE_NEAR_COURSE_PROTECTION_HOURS", "72") or "72")
 
 ALLOW_ZOOM_CREATION = False
 ALLOW_AUTOMATION = False
@@ -103,6 +104,21 @@ LICENSED_SYNC_WINDOW_DAYS = FREE_SYNC_WINDOW_DAYS
 class ZoomAuthRequired(RuntimeError):
     """Raised when the linked Zoom account token is expired or unauthorized."""
     pass
+
+
+def course_starts_within_protection_window(date_time_text, hours=NEAR_COURSE_PROTECTION_HOURS):
+    try:
+        course_dt = datetime.strptime((date_time_text or "").strip(), "%Y-%m-%d %H:%M").replace(tzinfo=LOCAL_TIMEZONE)
+    except Exception:
+        return False
+    now = datetime.now(LOCAL_TIMEZONE)
+    return now <= course_dt <= (now + timedelta(hours=max(1, int(hours or 72))))
+
+
+def near_course_protection_message(base_message, date_time_text):
+    if course_starts_within_protection_window(date_time_text):
+        return f"{base_message}. Course starts within {NEAR_COURSE_PROTECTION_HOURS} hours, so the existing FOBS link is protected unless you explicitly choose Replace."
+    return base_message
 
 
 def zoom_auth_error_message(account_id=None):
@@ -125,18 +141,21 @@ def get_zoom_credentials():
 ZOOM_USER_ID = "me"
 
 BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = Path(os.getenv("TRAINERMATE_DATA_DIR") or BASE_DIR)
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+TRAINERMATE_PROFILE_SLUG = (os.getenv("TRAINERMATE_PROFILE_SLUG") or "signed-out").strip() or "signed-out"
 
 try:
     from dotenv import load_dotenv
-    load_dotenv(BASE_DIR / ".env")
+    load_dotenv(BASE_DIR / ".env", encoding="utf-8-sig")
 except Exception:
     pass
 
-APP_STATE_PATH = str(BASE_DIR / "app_state.json")
+APP_STATE_PATH = str(DATA_DIR / "app_state.json")
 ZOOM_SETTINGS_PATH = str(BASE_DIR / "zoom_settings.json")
 ZOOM_TEMPLATE_PATH = str(BASE_DIR / "zoom_template.json")
-PROVIDERS_PATH = str(BASE_DIR / "providers.json")
-ZOOM_ACCOUNTS_PATH = str(BASE_DIR / "zoom_accounts.json")
+PROVIDERS_PATH = str(DATA_DIR / "providers.json")
+ZOOM_ACCOUNTS_PATH = str(DATA_DIR / "zoom_accounts.json")
 ZOOM_OAUTH_KEYRING_SERVICE = "trainermate_zoom_oauth"
 # Zoom OAuth credentials must come from environment variables, a local .env file,
 # or TrainerMate's local advanced setup file. Do not hardcode production secrets.
@@ -156,21 +175,15 @@ def _load_zoom_oauth_config_file():
 
 
 _zoom_oauth_config = _load_zoom_oauth_config_file()
-ZOOM_CLIENT_ID = (os.getenv("ZOOM_CLIENT_ID") or _zoom_oauth_config.get("client_id") or "").strip()
 _legacy_zoom_client_secret = (_zoom_oauth_config.get("client_secret") or "").strip()
-if _legacy_zoom_client_secret:
+if _legacy_zoom_client_secret and not keyring.get_password(ZOOM_OAUTH_KEYRING_SERVICE, "client_secret"):
+    keyring.set_password(ZOOM_OAUTH_KEYRING_SERVICE, "client_secret", _legacy_zoom_client_secret)
+    _zoom_oauth_config.pop("client_secret", None)
     try:
-        keyring.set_password(ZOOM_OAUTH_KEYRING_SERVICE, "client_secret", _legacy_zoom_client_secret)
+        ZOOM_OAUTH_CONFIG_PATH.write_text(json.dumps(_zoom_oauth_config, indent=2), encoding="utf-8")
     except Exception:
         pass
-    try:
-        sanitized = dict(_zoom_oauth_config)
-        sanitized.pop("client_secret", None)
-        with ZOOM_OAUTH_CONFIG_PATH.open("w", encoding="utf-8") as f:
-            json.dump(sanitized, f, indent=2)
-        _zoom_oauth_config = sanitized
-    except Exception as exc:
-        print(f"[ZOOM] Could not sanitize local OAuth config: {exc}")
+ZOOM_CLIENT_ID = (os.getenv("ZOOM_CLIENT_ID") or _zoom_oauth_config.get("client_id") or "").strip()
 ZOOM_CLIENT_SECRET = (os.getenv("ZOOM_CLIENT_SECRET") or keyring.get_password(ZOOM_OAUTH_KEYRING_SERVICE, "client_secret") or "").strip()
 
 
@@ -421,15 +434,7 @@ def get_provider_keyring_aliases(provider_id):
     provider_id = provider_slug(provider_id)
     aliases = []
 
-    # Prefer the dashboard's provider-specific service first, then the older
-    # bot aliases. Dashboard now also writes to all aliases, but this protects
-    # installs that still have only the dashboard value saved.
-    aliases.append(f"trainermate_provider_{provider_id}")
-
-    if provider_id == "essex":
-        aliases.extend(["essex_portal", "road_safety_portal"])
-    else:
-        aliases.extend([f"road_safety_provider_{provider_id}", "road_safety_portal"])
+    aliases.append(f"trainermate_provider_{TRAINERMATE_PROFILE_SLUG}_{provider_id}")
     seen = set()
     ordered = []
     for alias in aliases:
@@ -988,7 +993,7 @@ def persist_run_summary(summary):
 # DATABASE SETUP
 # ============================================================
 
-conn = sqlite3.connect(str(BASE_DIR / "courses.db"))
+conn = sqlite3.connect(str(DATA_DIR / "courses.db"))
 cursor = conn.cursor()
 
 cursor.execute("""
@@ -1037,7 +1042,7 @@ conn.commit()
 
 def _get_zoom_oauth_token(account_id, token_kind):
     try:
-        return keyring.get_password(ZOOM_OAUTH_KEYRING_SERVICE, f"{token_kind}::{account_id}") or ""
+        return keyring.get_password(f"{ZOOM_OAUTH_KEYRING_SERVICE}::{TRAINERMATE_PROFILE_SLUG}", f"{token_kind}::{account_id}") or ""
     except Exception:
         return ""
 
@@ -1046,9 +1051,9 @@ def _get_zoom_oauth_token(account_id, token_kind):
 def _set_zoom_oauth_tokens(account_id, access_token, refresh_token):
     try:
         if access_token:
-            keyring.set_password(ZOOM_OAUTH_KEYRING_SERVICE, f"access::{account_id}", access_token)
+            keyring.set_password(f"{ZOOM_OAUTH_KEYRING_SERVICE}::{TRAINERMATE_PROFILE_SLUG}", f"access::{account_id}", access_token)
         if refresh_token:
-            keyring.set_password(ZOOM_OAUTH_KEYRING_SERVICE, f"refresh::{account_id}", refresh_token)
+            keyring.set_password(f"{ZOOM_OAUTH_KEYRING_SERVICE}::{TRAINERMATE_PROFILE_SLUG}", f"refresh::{account_id}", refresh_token)
         mark_zoom_account_connected(account_id)
     except Exception as exc:
         print(f"[ZOOM] Failed to persist refreshed OAuth tokens for {account_id}: {exc}")
@@ -1594,7 +1599,7 @@ def ensure_zoom_topic_matches_course(meeting_id, provider, title, date_time, acc
 
 
 def bulk_update_existing_zoom_meetings(
-    db_path=str(BASE_DIR / "courses.db"),
+    db_path=str(DATA_DIR / "courses.db"),
     settings_patch=None,
     provider=None,
     title=None,
@@ -2223,6 +2228,21 @@ def course_starts_within_next_minutes(date_time_text, minutes=60):
     return 0 <= delta_seconds < (minutes * 60)
 
 
+def course_should_not_open_for_client_privacy(date_time_text):
+    """Avoid opening course details for past/current/imminent courses.
+
+    FOBS course detail pages may expose client information for courses already
+    running, already completed, or due to start very soon. Later same-day
+    pickups remain eligible so trainers can still sync newly assigned courses.
+    """
+    try:
+        course_dt = datetime.strptime((date_time_text or '').strip(), "%Y-%m-%d %H:%M").replace(tzinfo=LOCAL_TIMEZONE)
+    except Exception:
+        return False
+    now_local = datetime.now(LOCAL_TIMEZONE)
+    return course_dt <= (now_local + timedelta(minutes=60))
+
+
 def course_row_is_within_next_minutes(row_cells, minutes=60):
     if not isinstance(row_cells, (list, tuple)) or len(row_cells) < 3:
         return False, ""
@@ -2238,6 +2258,23 @@ def course_row_is_within_next_minutes(row_cells, minutes=60):
         return False, ""
 
     return course_starts_within_next_minutes(db_date_time, minutes=minutes), db_date_time
+
+
+def course_row_should_not_open_for_client_privacy(row_cells):
+    if not isinstance(row_cells, (list, tuple)) or len(row_cells) < 3:
+        return False, ""
+
+    date_text = (row_cells[1] or '').strip()
+    time_text = (row_cells[2] or '').strip()
+    if not date_text or not time_text:
+        return False, ""
+
+    try:
+        db_date_time = convert_portal_date_time_to_db_format(date_text, time_text)
+    except Exception:
+        return False, ""
+
+    return course_should_not_open_for_client_privacy(db_date_time), db_date_time
 
 
 def course_status_blocks_sync(status_text):
@@ -2939,12 +2976,12 @@ def test_open_zoom_edit_screen(page, conn, provider, courses_url=None, max_rows=
         print(f"\nChecking row {target['row_number']}...")
 
         try:
-            imminent_from_row, imminent_db_date_time = course_row_is_within_next_minutes(target["row_cells"], minutes=60)
-            if imminent_from_row:
-                course_key = build_course_key(provider, target["title_text"], imminent_db_date_time, fallback=target["row_number"])
+            privacy_blocked_from_row, privacy_blocked_db_date_time = course_row_should_not_open_for_client_privacy(target["row_cells"])
+            if privacy_blocked_from_row:
+                course_key = build_course_key(provider, target["title_text"], privacy_blocked_db_date_time, fallback=target["row_number"])
                 ensure_course(course_key)
-                print(f"[SAFETY] Skipping imminent course from list row without opening details: {course_key}")
-                mark_skipped(course_key, "Skipped before opening details: course starts within next 60 minutes")
+                print(f"[SAFETY] Skipping course from list row without opening details because it is current, past, or starts within 60 minutes: {course_key}")
+                mark_skipped(course_key, "Skipped before opening details: course is current, past, or starts within next 60 minutes")
                 stats["skipped"] += 1
                 continue
 
@@ -3034,9 +3071,9 @@ def test_open_zoom_edit_screen(page, conn, provider, courses_url=None, max_rows=
                 back_to_list_safely()
                 continue
 
-            if course_starts_within_next_minutes(db_date_time, minutes=60):
-                print(f"[SAFETY] Skipping imminent course after opening details without editing: {course_key}")
-                mark_skipped(course_key, "Skipped after verification: course starts within next 60 minutes")
+            if course_should_not_open_for_client_privacy(db_date_time):
+                print(f"[SAFETY] Skipping course after opening details because it is current, past, or starts within 60 minutes: {course_key}")
+                mark_skipped(course_key, "Skipped after verification: course is current, past, or starts within next 60 minutes")
                 stats["skipped"] += 1
                 back_to_list_safely()
                 continue
@@ -3099,7 +3136,7 @@ def test_open_zoom_edit_screen(page, conn, provider, courses_url=None, max_rows=
                         topic_ok, topic_msg = ensure_zoom_topic_matches_course(
                             portal_zoom_to_save.get("meeting_id"), provider, title_text, db_date_time,
                             account_id=provider_zoom_account_id,
-                        )
+                        ) if not course_starts_within_protection_window(db_date_time) else (False, "Course starts soon; Zoom topic left unchanged.")
                         if topic_ok:
                             print("[ZOOM] Meeting topic checked/updated for current course title.")
                         else:
@@ -3128,6 +3165,7 @@ def test_open_zoom_edit_screen(page, conn, provider, courses_url=None, max_rows=
                     message = "Zoom link mismatch confirmed on FOBS - manual decision needed"
                     if mismatch_reason:
                         message = f"Zoom link mismatch confirmed on FOBS ({mismatch_reason}) - manual decision needed"
+                    message = near_course_protection_message(message, db_date_time)
                     print(f"[FOBS] {message}. Leaving FOBS unchanged.")
                     update_course_sync_state(conn, title_text, db_date_time, provider, "needs_attention", message)
                     mark_skipped(course_key, message)
@@ -3213,7 +3251,7 @@ def test_open_zoom_edit_screen(page, conn, provider, courses_url=None, max_rows=
                             topic_ok, topic_msg = ensure_zoom_topic_matches_course(
                                 portal_zoom_to_save.get("meeting_id"), provider, title_text, db_date_time,
                                 account_id=provider_zoom_account_id,
-                            )
+                            ) if not course_starts_within_protection_window(db_date_time) else (False, "Course starts soon; Zoom topic left unchanged.")
                             if topic_ok:
                                 print("[ZOOM] Meeting topic checked/updated for current course title.")
                             else:
@@ -3240,6 +3278,7 @@ def test_open_zoom_edit_screen(page, conn, provider, courses_url=None, max_rows=
                         message = "Zoom link mismatch confirmed on FOBS - manual decision needed"
                         if mismatch_reason:
                             message = f"Zoom link mismatch confirmed on FOBS ({mismatch_reason}) - manual decision needed"
+                        message = near_course_protection_message(message, db_date_time)
                         print(f"[FOBS] {message}. Leaving FOBS unchanged after recheck.")
                         update_course_sync_state(conn, title_text, db_date_time, provider, "needs_attention", message)
                         mark_skipped(course_key, message)
@@ -3386,8 +3425,8 @@ def process_courses(courses, provider_name="Unknown"):
             print(f"[WINDOW] Saving future course for visibility only, outside active sync window: {course.get('title', '')} ({course.get('date_time', '')})")
             stats["skipped_outside_window"] += 1
 
-        if course_starts_within_next_minutes(course.get("date_time", ""), minutes=60):
-            print(f"Skipping imminent course within next 60 minutes: {course['title']} ({course['date_time']})")
+        if course_should_not_open_for_client_privacy(course.get("date_time", "")):
+            print(f"Skipping course that is current, past, or within next 60 minutes: {course['title']} ({course['date_time']})")
             stats["skipped_imminent"] += 1
             continue
 
