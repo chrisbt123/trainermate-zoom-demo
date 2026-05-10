@@ -9,6 +9,7 @@ import re
 import smtplib
 import threading
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 from urllib.parse import parse_qs
@@ -279,6 +280,11 @@ class AdminAccountDeleteRequest(BaseModel):
     confirm_delete: str = Field(..., min_length=1)
 
 
+class AdminInvalidAccountDeleteRequest(BaseModel):
+    confirm_account_identifier: str = Field(..., min_length=1)
+    confirm_delete: str = Field(..., min_length=1)
+
+
 class AdminPasswordResetRequest(BaseModel):
     confirm_ndors_trainer_id: str = Field(..., min_length=1)
     confirm_reset: str = Field(..., min_length=1)
@@ -435,7 +441,15 @@ def send_email(to_email: str, subject: str, body: str):
         try:
             with urllib.request.urlopen(request, timeout=20) as response:
                 if response.status >= 300:
-                    raise HTTPException(status_code=503, detail="Password email provider rejected the message.")
+                    provider_detail = response.read().decode("utf-8", errors="replace")[:500]
+                    raise HTTPException(status_code=503, detail=f"Password email provider rejected the message: {provider_detail or response.status}")
+        except urllib.error.HTTPError as exc:
+            provider_detail = ""
+            try:
+                provider_detail = exc.read().decode("utf-8", errors="replace")[:500]
+            except Exception:
+                provider_detail = str(exc)
+            raise HTTPException(status_code=503, detail=f"Password email provider rejected the message: {provider_detail or exc}")
         except HTTPException:
             raise
         except Exception as exc:
@@ -2125,6 +2139,10 @@ function selectedNdors(){
   const ndors=String((u&&u.ndors_trainer_id)||selected||'').trim();
   return looksLikeNdors(ndors)?ndors:'';
 }
+function selectedIdentifier(){
+  const u=selectedUser();
+  return String((u&&u.ndors_trainer_id)||selected||'').trim();
+}
 function commandsFor(ndors){return ((snapshot&&snapshot.commands)||[]).filter(c=>String(c.ndors_trainer_id)===String(ndors));}
 function issueFor(user){
   const d=user.latest_device||{}, s=d.status||{};
@@ -2598,7 +2616,7 @@ async function forceResetPassword(){
 }
 async function deleteUser(){
   const ndors=selectedNdors();
-  if(!ndors) return alert('Choose a trainer with a valid NDORS trainer ID first.');
+  if(!ndors) return deleteInvalidUser();
   const u=selectedUser();
   const label=`${ndors}${u&&u.email?' / '+u.email:''}`;
   if(!confirm(`Delete trainer account ${label}?\n\nThis removes the admin/licensing account, login emails, devices, usage, queued commands, course snapshots and support bundles for this NDORS ID. Audit history is kept.`)) return;
@@ -2606,6 +2624,18 @@ async function deleteUser(){
   if(typed!==ndors){setNotice('Delete cancelled - NDORS ID did not match.','warn'); pushAction('Delete user','Cancelled - confirmation did not match.','warn'); return;}
   await api('/admin/api/accounts/'+encodeURIComponent(ndors)+'/delete',{method:'POST',body:JSON.stringify({confirm_ndors_trainer_id:typed,confirm_delete:'DELETE USER'})});
   setNotice('User deleted.','ok'); pushAction('User deleted',`Deleted trainer account ${ndors}.`,'warn'); selected=''; localStorage.removeItem('tm_admin_selected'); await load();
+}
+async function deleteInvalidUser(){
+  const identifier=selectedIdentifier();
+  if(!identifier) return alert('Choose a trainer first.');
+  if(looksLikeNdors(identifier)) return alert('Use the normal delete button for this NDORS trainer ID.');
+  const u=selectedUser();
+  const label=`${identifier}${u&&u.email&&u.email!==identifier?' / '+u.email:''}`;
+  if(!confirm(`Delete invalid trainer account ${label}?\n\nThis is a cleanup tool for bad legacy/test rows where the NDORS trainer ID was saved as an email or another invalid value. Audit history is kept.`)) return;
+  const typed=prompt(`Final confirmation: type this invalid account identifier exactly:\n\n${identifier}`);
+  if(typed!==identifier){setNotice('Delete cancelled - confirmation did not match.','warn'); pushAction('Delete invalid user','Cancelled - confirmation did not match.','warn'); return;}
+  await api('/admin/api/invalid-accounts/'+encodeURIComponent(identifier)+'/delete',{method:'POST',body:JSON.stringify({confirm_account_identifier:typed,confirm_delete:'DELETE INVALID USER'})});
+  setNotice('Invalid account deleted.','ok'); pushAction('Invalid account deleted',`Deleted invalid account ${identifier}.`,'warn'); selected=''; localStorage.removeItem('tm_admin_selected'); await load();
 }
 async function sendTrainerMessage(){openMessageComposer('selected');}
 async function sendUpdatePrompt(){
@@ -2866,19 +2896,22 @@ def admin_force_password_reset(ndors_trainer_id: str, payload: AdminPasswordRese
     return {"ok": True, "delivered_to": mask_email_address(to_email), "must_change": True}
 
 
-@app.post("/admin/api/accounts/{ndors_trainer_id}/delete")
-def admin_delete_account(ndors_trainer_id: str, payload: AdminAccountDeleteRequest, request: Request):
-    require_admin(request)
-    ndors = (ndors_trainer_id or "").strip()
-    if not valid_ndors_id(ndors):
-        raise HTTPException(status_code=400, detail="Admin account deletes must use an NDORS trainer ID")
-    if (payload.confirm_ndors_trainer_id or "").strip() != ndors or (payload.confirm_delete or "").strip() != "DELETE USER":
-        raise HTTPException(status_code=400, detail="Delete confirmation did not match")
-    accounts = get_accounts_by_ndors(ndors)
+def delete_account_rows(identifier: str, *, valid_ndors: bool):
+    account_ids = []
+    deleted = {"accounts": 0}
+    accounts = []
+    if valid_ndors:
+        accounts = get_accounts_by_ndors(identifier)
+    else:
+        result = execute_supabase(
+            supabase.table("accounts").select("*").eq("ndors_trainer_id", identifier),
+            "read invalid account for delete",
+        )
+        accounts = result.data or []
     if not accounts:
         raise HTTPException(status_code=404, detail="Account not found")
     account_ids = [row.get("id") for row in accounts if isinstance(row, dict) and row.get("id")]
-    deleted = {"accounts": len(account_ids)}
+    deleted["accounts"] = len(account_ids)
 
     def run_delete(table_name, query):
         try:
@@ -2918,13 +2951,38 @@ def admin_delete_account(ndors_trainer_id: str, payload: AdminAccountDeleteReque
         ("device_heartbeats", "ndors_trainer_id"),
         ("synced_courses", "ndors_trainer_id"),
     ):
-        run_delete(table_name, supabase.table(table_name).delete().eq(column, ndors))
+        run_delete(table_name, supabase.table(table_name).delete().eq(column, identifier))
 
-    run_delete("accounts", supabase.table("accounts").delete().eq("ndors_trainer_id", ndors))
+    run_delete("accounts", supabase.table("accounts").delete().eq("ndors_trainer_id", identifier))
     cache = load_access_cache()
-    cache.pop(cache_key(ndors), None)
+    cache.pop(cache_key(identifier), None)
     save_access_cache(cache)
-    admin_audit("account_delete", {"ndors_trainer_id": ndors, "account_count": len(account_ids), "severity": "danger", "deleted": deleted})
+    return deleted
+
+
+@app.post("/admin/api/accounts/{ndors_trainer_id}/delete")
+def admin_delete_account(ndors_trainer_id: str, payload: AdminAccountDeleteRequest, request: Request):
+    require_admin(request)
+    ndors = (ndors_trainer_id or "").strip()
+    if not valid_ndors_id(ndors):
+        raise HTTPException(status_code=400, detail="Admin account deletes must use an NDORS trainer ID")
+    if (payload.confirm_ndors_trainer_id or "").strip() != ndors or (payload.confirm_delete or "").strip() != "DELETE USER":
+        raise HTTPException(status_code=400, detail="Delete confirmation did not match")
+    deleted = delete_account_rows(ndors, valid_ndors=True)
+    admin_audit("account_delete", {"ndors_trainer_id": ndors, "account_count": deleted.get("accounts"), "severity": "danger", "deleted": deleted})
+    return {"ok": True, "deleted": deleted}
+
+
+@app.post("/admin/api/invalid-accounts/{account_identifier}/delete")
+def admin_delete_invalid_account(account_identifier: str, payload: AdminInvalidAccountDeleteRequest, request: Request):
+    require_admin(request)
+    identifier = (account_identifier or "").strip()
+    if valid_ndors_id(identifier):
+        raise HTTPException(status_code=400, detail="Use the normal delete button for valid NDORS trainer IDs")
+    if (payload.confirm_account_identifier or "").strip() != identifier or (payload.confirm_delete or "").strip() != "DELETE INVALID USER":
+        raise HTTPException(status_code=400, detail="Delete confirmation did not match")
+    deleted = delete_account_rows(identifier, valid_ndors=False)
+    admin_audit("invalid_account_delete", {"account_identifier": identifier, "account_count": deleted.get("accounts"), "severity": "danger", "deleted": deleted})
     return {"ok": True, "deleted": deleted}
 
 
