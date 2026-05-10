@@ -28,3 +28,4 @@ admin_token_local.txt
 trainer_documents/
 backup/
 archive/
+.upgrade-backups/
