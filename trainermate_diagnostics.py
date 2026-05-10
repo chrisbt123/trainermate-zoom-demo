@@ -1,4 +1,5 @@
 import os
+import re
 
 
 def debug_tools_enabled():
@@ -32,10 +33,30 @@ def tail_log(path, max_lines=120, latest_markers=None):
     return lines[-max_lines:]
 
 
+def mask_email(email):
+    email = (email or '').strip()
+    if '@' not in email:
+        return email
+    name, domain = email.split('@', 1)
+    if len(name) <= 2:
+        masked_name = name[:1] + '-' * max(0, len(name) - 1)
+    else:
+        masked_name = name[:2] + '-' * max(1, len(name) - 2)
+    return f'{masked_name}@{domain}'
+
+
+def mask_ndors(ndors):
+    text = re.sub(r'\s+', '', str(ndors or '').strip())
+    if not text:
+        return ''
+    suffix = text[-3:] if len(text) > 3 else text[-1:]
+    return ('*' * max(3, len(text) - len(suffix))) + suffix
+
+
 def support_summary_lines(*, identity, plan_label, build_label, status, last_sync, providers, zoom_accounts):
     return [
-        f"NDORS: {identity.get('ndors') or 'Not saved'}",
-        f"Email: {identity.get('email') or 'Not saved'}",
+        f"NDORS: {mask_ndors(identity.get('ndors')) or 'Not saved'}",
+        f"Email: {mask_email(identity.get('email')) or 'Not saved'}",
         f"Plan: {plan_label}",
         f"Version: {build_label}",
         f"Status: {status}",

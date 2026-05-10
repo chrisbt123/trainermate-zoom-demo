@@ -8632,7 +8632,7 @@ TEMPLATE = """
             <div class='provider-card'>
               <div class='provider-header'><div><strong>Support summary</strong><div class='helper'>Useful if you need to paste details into a message.</div></div></div>
               <div class='stack' id='tmSupportSummary'>
-                <div class='helper'><strong>NDORS:</strong> {{ identity.ndors or 'Not saved' }}</div>
+                <div class='helper'><strong>NDORS:</strong> {{ masked_ndors or 'Not saved' }}</div>
                 <div class='helper'><strong>Plan:</strong> {{ account_plan_label }}</div>
                 <div class='helper'><strong>Version:</strong> {{ build_label }}</div>
                 <div class='helper'><strong>Status:</strong> {{ friendly_status }}</div>
@@ -10375,7 +10375,7 @@ def home():
     debug_latest_message = state.get('last_message') or state.get('last_status') or status_message or 'Idle'
     initial_debug_log = '\n'.join(tail_bot_log(80)) or 'No debug output yet.'
     support_plan_label = 'Paid' if is_paid_account else 'Free'
-    support_subject = (identity.get('ndors') or 'NDORS not saved').strip()
+    support_subject = ('NDORS ' + mask_ndors(identity.get('ndors'))) if identity.get('ndors') else 'NDORS not saved'
     support_summary_text = support_message_text(
         subject=support_subject,
         identity=identity,
