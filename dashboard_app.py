@@ -775,6 +775,25 @@ def mask_ndors(ndors: str) -> str:
     return ('*' * max(3, len(text) - len(suffix))) + suffix
 
 
+def service_status_rows(*, access, identity, zoom_accounts, zoom_connected, providers, state):
+    api_url = (API_URL or '').strip()
+    api_is_local = api_url.startswith('http://127.0.0.1') or api_url.startswith('http://localhost')
+    resend_ready = bool(os.getenv('RESEND_API_KEY') and os.getenv('RESEND_FROM_EMAIL'))
+    provider_count = len(providers or [])
+    active_providers = sum(1 for p in providers or [] if p.get('active', True))
+    zoom_count = len(zoom_accounts or [])
+    return [
+        {'label': 'Account', 'value': 'Signed in' if identity.get('ndors') else 'Not signed in', 'state': 'ok' if identity.get('ndors') else 'warn', 'detail': f"NDORS {mask_ndors(identity.get('ndors'))}" if identity.get('ndors') else 'Login is required before sync and support tools.'},
+        {'label': 'Plan', 'value': (access or {}).get('plan', 'Free').title(), 'state': 'ok' if (access or {}).get('allowed', True) else 'warn', 'detail': (access or {}).get('reason') or 'Account access loaded.'},
+        {'label': 'API', 'value': 'Local desktop API' if api_is_local else 'Live HTTPS API', 'state': 'ok', 'detail': api_url or 'Not configured'},
+        {'label': 'Password email', 'value': 'Ready' if resend_ready else 'Not configured', 'state': 'ok' if resend_ready else 'warn', 'detail': 'Reset emails can be sent.' if resend_ready else 'Resend settings are missing on this API service.'},
+        {'label': 'Zoom', 'value': 'Connected' if zoom_connected else ('Reconnect needed' if zoom_count else 'Not connected'), 'state': 'ok' if zoom_connected else 'warn', 'detail': f"{zoom_count} saved Zoom account(s)."},
+        {'label': 'Providers', 'value': f"{active_providers}/{provider_count} active", 'state': 'ok' if active_providers else 'warn', 'detail': 'FOBS/provider details stay local on this computer.'},
+        {'label': 'Secure storage', 'value': 'Local', 'state': 'ok', 'detail': 'Provider passwords and Zoom tokens are kept on this computer, not in support summaries.'},
+        {'label': 'Sync', 'value': 'Running' if state.get('sync_running') else 'Idle', 'state': 'warn' if state.get('sync_running') else 'ok', 'detail': shorten_message(state.get('last_message') or state.get('last_status') or 'Ready', 140)},
+    ]
+
+
 def friendly_password_reset_error(detail: str) -> str:
     text = str(detail or '').strip()
     lower_text = text.lower()
@@ -8077,7 +8096,6 @@ TEMPLATE = """
       <a class='nav {% if current_section == "zoom_accounts" %}active{% endif %}' href='{{ url_for("home", section="zoom_accounts") }}'><span class='nav-left'><span class='nav-icon nav-icon-zoom'></span><span>Zoom accounts</span></span></a>
       <a class='nav {% if current_section == "automation" %}active{% endif %}' href='{{ url_for("home", section="automation") }}'><span class='nav-left'><span class='nav-icon nav-icon-sync'></span><span>Automatic Sync</span></span></a>
       <a class='nav {% if current_section == "support" %}active{% endif %}' href='{{ url_for("home", section="support") }}'><span class='nav-left'><span class='nav-icon nav-icon-activity'></span><span>Support{% if activity_counts.unread %}<span class='nav-alert'>{{ activity_counts.unread }}</span>{% endif %}</span></span></a>
-      <a class='nav {% if current_section == "diagnostics" %}active{% endif %}' href='{{ url_for("home", section="diagnostics") }}'><span class='nav-left'><span class='nav-icon nav-icon-activity'></span><span>Diagnostics</span></span></a>
     </div>
     <div class='main'>
       {% if flash %}<div class='flash tm-top-flash'>{{ flash.text }}</div>{% endif %}
@@ -8610,12 +8628,12 @@ TEMPLATE = """
       {% elif current_section == 'support' %}
         <section class='panel'>
           <div class='hero'>
-            <div><h2>Support</h2><p class='muted'>Send a message with your NDORS number attached, or open WhatsApp if that is quicker.</p></div>
-            <div class='hero-actions'><a class='btn soft' id='tmSupportWhatsAppTop' href='{{ support_whatsapp_url }}' target='_blank' rel='noopener'>Message on WhatsApp</a></div>
+            <div><h2>Support</h2><p class='muted'>Messages, service status and redacted diagnostics in one place.</p></div>
+            <div class='hero-actions'><a class='btn soft' href='{{ url_for("activity_centre") }}'>Message centre</a><a class='btn soft' id='tmSupportWhatsAppTop' href='{{ support_whatsapp_url }}' target='_blank' rel='noopener'>Message on WhatsApp</a></div>
           </div>
           <div class='block grid-two'>
             <div class='provider-card'>
-              <div class='provider-header'><div><strong>Contact support</strong><div class='helper'>Subject defaults to your NDORS number so it is easy to find you in admin.</div></div></div>
+              <div class='provider-header'><div><strong>Contact support</strong><div class='helper'>Subject and summary use masked account details.</div></div></div>
               <form class='stack' id='tmSupportForm' method='post' action='{{ url_for("support_message_route") }}'>
                 {{ csrf_hidden_field()|safe }}
                 <div class='field'><label>Subject</label><input id='tmSupportSubject' name='subject' value='{{ support_subject }}' autocomplete='off'></div>
@@ -8643,14 +8661,24 @@ TEMPLATE = """
             </div>
           </div>
         </section>
+        <section class='panel'>
+          <div class='head'><h3>Service status</h3><p>Quick local checks for account, Zoom, email, providers and sync.</p></div>
+          <div class='block grid-two'>
+            {% for row in service_status_rows %}
+              <div class='provider-card'>
+                <div class='provider-header'><div><strong>{{ row.label }}</strong><div class='helper'>{{ row.detail }}</div></div><span class='status-tag {{ "ok" if row.state == "ok" else "due" }}'>{{ row.value }}</span></div>
+                {% if row.label == 'Zoom' and row.state != 'ok' %}<a class='btn soft small' href='{{ url_for("home", section="zoom_accounts") }}'>Reconnect Zoom</a>{% endif %}
+              </div>
+            {% endfor %}
+          </div>
+        </section>
         <section class='panel'><div class='head'><h3>Recent support messages</h3><p>Support replies, sync summaries, course updates and items that need attention.</p></div><div class='block stack'>
           {% if activity_items %}{% for item in activity_items[:12] %}<div class='provider-card'><div class='provider-header'><div><strong>{{ item.title }}</strong><div class='helper'>{{ item.created_at }} - {{ item.type|replace('_',' ') }}{% if not item.read_at %} - New{% endif %}</div></div><span class='status-tag {{ "bad" if item.severity in ["warning","error"] else "ok" }}'>{{ item.severity }}</span></div><p>{{ item.summary or item.message }}</p>{% if item.get('items') %}<details><summary>View course detail</summary>{% for c in item.get('items')[:10] %}<div class='helper' style='padding:8px 0;border-top:1px solid var(--line)'><strong>{{ c.provider }}</strong> - {{ c.date_time }}<br>{{ c.course_type }}<br>{{ c.action or c.status or c.error }}</div>{% endfor %}</details>{% endif %}</div>{% endfor %}<a class='btn soft' href='{{ url_for("activity_centre") }}'>Open full support history</a>{% else %}<div class='empty'>No messages yet.</div>{% endif %}
         </div></section>
-      {% elif current_section == 'diagnostics' %}
         <section class='panel'>
           <div class='hero'>
             <div><h2>Diagnostics</h2><p class='muted'>Local read-only status for support and troubleshooting.</p></div>
-            <div class='hero-actions'><a class='btn soft' href='{{ url_for("home", section="support") }}'>Contact support</a></div>
+            <div class='hero-actions'><a class='btn soft' href='{{ url_for("support_bundle_download") }}'>Download redacted bundle</a><button class='btn soft' type='button' id='tmCopySupportSummaryBottom'>Copy support summary</button></div>
           </div>
           <div class='block grid-two'>
             <div class='provider-card'>
@@ -10273,9 +10301,9 @@ def home():
     if selected_provider == 'provider':
         selected_provider = 'all'
     current_section = (request.args.get('section') or 'dashboard').strip().lower()
-    if current_section == 'activity':
+    if current_section in {'activity', 'diagnostics'}:
         current_section = 'support'
-    if current_section not in {'dashboard', 'setup', 'manage_providers', 'zoom_accounts', 'automation', 'support', 'diagnostics', 'calendar', 'files'}:
+    if current_section not in {'dashboard', 'setup', 'manage_providers', 'zoom_accounts', 'automation', 'support', 'calendar', 'files'}:
         current_section = 'dashboard'
     if current_section == 'dashboard' and not providers:
         current_section = 'setup'
@@ -10396,6 +10424,14 @@ def home():
         zoom_accounts=zoom_accounts,
     )
     diagnostics_log_text = sanitize_support_text('\n'.join(tail_bot_log(160)) or 'No debug output yet.')
+    service_rows = service_status_rows(
+        access=access,
+        identity=identity,
+        zoom_accounts=zoom_accounts,
+        zoom_connected=zoom_connected,
+        providers=providers,
+        state=state,
+    )
     support_whatsapp_url = 'https://wa.me/447368271579?text=' + quote(support_summary_text)
     provider_form = make_provider_defaults(request.args.get('provider_name', ''), request.args.get('login_url', ''), True)
     if request.args.get('zoom_account_id') is not None:
@@ -10473,6 +10509,7 @@ def home():
         activity_counts=activity_counts(),
         support_subject=support_subject,
         support_whatsapp_url=support_whatsapp_url,
+        service_status_rows=service_rows,
         certificate_attention_items=certificate_attention,
         certificate_alerts_visible=certificate_alerts_visible,
         certificate_scan=certificate_scan,
@@ -11473,6 +11510,7 @@ def remote_admin_status_payload():
 
 def remote_admin_support_bundle():
     status = remote_admin_status_payload()
+    identity = get_identity()
     docs = load_documents()
     courses = []
     try:
@@ -11489,6 +11527,15 @@ def remote_admin_support_bundle():
             'dashboard_url': DASHBOARD_CANONICAL_URL,
         },
         'status': status,
+        'support_summary': support_summary_lines(
+            identity=identity,
+            plan_label='Paid' if account_is_paid(check_access(prefer_cached=True) or {}) else 'Free',
+            build_label=BUILD_LABEL,
+            status=status.get('last_status') or 'Ready',
+            last_sync=(reconcile_running_state().get('last_sync_at') or ''),
+            providers=load_providers(),
+            zoom_accounts=load_zoom_accounts(),
+        ),
         'documents': {
             'summary': document_summary(docs),
             'expiry_warnings': document_expiry_warnings(docs, limit=10),
@@ -11511,6 +11558,18 @@ def remote_admin_support_bundle():
             'bot_tail': sanitize_support_text('\n'.join(tail_bot_log(160))),
         },
     }
+
+
+@app.route('/support/bundle.json')
+def support_bundle_download():
+    bundle = remote_admin_support_bundle()
+    payload = json.dumps(bundle, indent=2, sort_keys=True)
+    filename = f"trainermate-support-bundle-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+    return Response(
+        payload,
+        mimetype='application/json',
+        headers={'Content-Disposition': f'attachment; filename="{filename}"'},
+    )
 
 
 def remote_admin_identity_payload():

@@ -116,10 +116,12 @@ checks = {
     ],
     "diagnostics module and page": [
         "from trainermate_diagnostics import",
-        "current_section == \"diagnostics\"",
-        "current_section == 'diagnostics'",
+        "current_section in {'activity', 'diagnostics'}",
+        "service_status_rows",
         "diagnostics_summary_lines",
         "diagnostics_log_text",
+        "support_bundle_download",
+        "Download redacted bundle",
     ],
     "diagnostics helper module": [
         "def debug_tools_enabled():",
@@ -132,6 +134,7 @@ checks = {
         "tmSupportForm",
         "tmSupportWhatsApp",
         "tmCopySupportSummary",
+        "tmCopySupportSummaryBottom",
     ],
     "shared provider utils": [
         "from trainermate_utils import provider_slug",

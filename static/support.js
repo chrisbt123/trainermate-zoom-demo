@@ -26,7 +26,7 @@
   });
 
   document.addEventListener('click', function(e){
-    if(e.target && e.target.id === 'tmCopySupportSummary'){
+    if(e.target && (e.target.id === 'tmCopySupportSummary' || e.target.id === 'tmCopySupportSummaryBottom')){
       var text = buildSupportMessage();
       if(navigator.clipboard && navigator.clipboard.writeText){
         navigator.clipboard.writeText(text).then(function(){
