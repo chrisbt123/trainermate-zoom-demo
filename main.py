@@ -43,6 +43,7 @@ BROKER_CODE_TTL_SECONDS = int(os.getenv("TRAINERMATE_ZOOM_BROKER_CODE_TTL_SECOND
 ALLOWED_LOCAL_CALLBACKS = {
     "http://127.0.0.1:5000/zoom/callback",
     "http://localhost:5000/zoom/callback",
+    "http://127.0.0.1:8421/zoom/callback",
 }
 
 app = FastAPI(title=APP_NAME, docs_url=None, redoc_url=None)
