@@ -1,15 +1,15 @@
 # TrainerMate Zoom Marketplace Review Pack
 
-This file is the working evidence pack for a published Zoom Marketplace OAuth app review.
+This file is the working evidence pack for the Zoom Marketplace Development review. Deployment-specific instructions are in `ZOOM_DEVELOPMENT_REVIEW.md`.
 
 ## App Type
 
 - App: TrainerMate
 - Zoom integration type: OAuth user-managed app
-- Redirect URI used by the desktop app: configured by `TRAINERMATE_ZOOM_REDIRECT_URI`, falling back to the value in `zoom_oauth_config.json`.
+- Isolated reviewer redirect URI: `https://review.trainermate.xyz/zoom/callback`, configured through `TRAINERMATE_ZOOM_REDIRECT_URI`.
 - Local callback after relay: `http://127.0.0.1:5000/zoom/callback`
 
-For Marketplace review, the registered redirect URI should use a production-owned domain, for example `https://app.trainermate.co.uk/zoom/callback` or another stable TrainerMate domain. Avoid names that look temporary, such as `demo.*`, unless that domain is the permanent production relay and the TDD explains it.
+The Development Zoom app must register exactly `https://review.trainermate.xyz/zoom/callback`. This separate reviewer service must not share credentials or writable data with the production desktop OAuth broker.
 
 ## Required Zoom Scopes
 
@@ -23,9 +23,11 @@ Request only the minimum scopes below:
   - `GET /v2/users/me/meetings`
   - `GET /v2/meetings/{meetingId}`
   - Used to match existing scheduled meetings to course dates/titles and verify stored Zoom meeting details.
-- `meeting:write` or current granular equivalent for:
+- `meeting:update:meeting` for:
   - `PATCH /v2/meetings/{meetingId}`
   - Used to update existing meeting topic/settings when a course changes or when TrainerMate must align Zoom settings with TrainerMate's saved meeting policy.
+
+TrainerMate uses this permission to update the title/topic of an existing Zoom meeting owned by the connected user when linked course details change.
 
 Do not request admin scopes unless the published app is explicitly account-level and admin-installed. TrainerMate's current implementation uses `me` for user-level access and should be submitted as user-level unless the product decision changes.
 

@@ -1,4 +1,6 @@
-# TrainerMate Reviewer Demo - Fast Deploy
+# TrainerMate Development Reviewer Demo - Fast Deploy
+
+Use the isolated `render-review.yaml` blueprint and the instructions in `ZOOM_DEVELOPMENT_REVIEW.md`. Do not replace the existing service configured by `render.yaml`; that service is the production desktop OAuth broker.
 
 This is a standalone hosted reviewer demo for Zoom Marketplace review.
 
@@ -20,10 +22,10 @@ It uses:
 Set these in Render > Service > Environment:
 
 ```text
-ZOOM_CLIENT_ID=your production Zoom client id
-ZOOM_CLIENT_SECRET=your production Zoom client secret
-ZOOM_REDIRECT_URI=https://demo.trainermate.xyz/zoom/callback
-REVIEWER_PASSWORD=choose a temporary reviewer password
+ZOOM_CLIENT_ID=<Zoom Marketplace Development client id>
+ZOOM_CLIENT_SECRET=<Zoom Marketplace Development client secret>
+TRAINERMATE_ZOOM_REDIRECT_URI=https://review.trainermate.xyz/zoom/callback
+TRAINERMATE_REVIEWER_PASSWORD=<temporary reviewer password supplied privately>
 FLASK_SECRET_KEY=generate a long random string
 SESSION_COOKIE_SECURE=1
 ```
@@ -52,7 +54,7 @@ pip install -r requirements.txt
 ## Reviewer URL
 
 ```text
-https://demo.trainermate.xyz
+https://review.trainermate.xyz
 ```
 
 ## Important
@@ -61,5 +63,5 @@ Do not change Zoom Marketplace redirect, scopes, Client ID, or Client Secret dur
 The Marketplace redirect must remain:
 
 ```text
-https://demo.trainermate.xyz/zoom/callback
+https://review.trainermate.xyz/zoom/callback
 ```

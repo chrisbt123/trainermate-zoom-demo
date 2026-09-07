@@ -2,7 +2,9 @@
 
 Hosted Render app for Zoom Marketplace review.
 
-Reviewer URL: `https://demo.trainermate.xyz`
+Development reviewer URL: `https://review.trainermate.xyz`
+
+Use `render-review.yaml` and `ZOOM_DEVELOPMENT_REVIEW.md` for the isolated Development reviewer service. The existing `render.yaml` remains the production desktop OAuth broker configuration.
 
 Start command:
 

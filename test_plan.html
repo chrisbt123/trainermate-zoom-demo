@@ -126,7 +126,7 @@
         </tr>
         <tr>
           <td>Reviewer dashboard</td>
-          <td><span class="mono">https://demo.trainermate.xyz</span></td>
+          <td><span class="mono">https://review.trainermate.xyz</span></td>
         </tr>
         <tr>
           <td>Login email</td>
@@ -138,11 +138,11 @@
         </tr>
         <tr>
           <td>OAuth redirect URI</td>
-          <td><span class="mono">https://demo.trainermate.xyz/zoom/callback</span></td>
+          <td><span class="mono">https://review.trainermate.xyz/zoom/callback</span></td>
         </tr>
         <tr>
           <td>Client ID</td>
-          <td>The environment uses the Production Zoom Client ID during authorization.</td>
+          <td>The isolated reviewer environment uses the Zoom Marketplace Development Client ID during authorization.</td>
         </tr>
         <tr>
           <td>Submission notes</td>
@@ -196,9 +196,15 @@
         </tr>
         <tr>
           <td><code>meeting:write:meeting</code></td>
-          <td>Creates a scheduled Zoom meeting for a course when no valid existing meeting is linked or found. It is also used where applicable to refresh the meeting associated with a course.</td>
-          <td>Run sync on an unchecked seeded course, then use <strong>Replace/update Zoom</strong> or re-run sync on the same course.</td>
-          <td>TrainerMate creates one meeting when needed, then verifies or updates the same meeting rather than creating a duplicate.</td>
+          <td>Creates one scheduled Zoom meeting for a seeded course when no valid existing meeting is linked or found.</td>
+          <td>Run the course action on an unchecked seeded course.</td>
+          <td>TrainerMate creates one meeting, saves its Meeting ID and displays it for review.</td>
+        </tr>
+        <tr>
+          <td><code>meeting:update:meeting</code></td>
+          <td>TrainerMate uses this permission to update the title/topic of an existing Zoom meeting owned by the connected user when linked course details change.</td>
+          <td>Create or link a meeting for a seeded course, then run the existing-meeting update action on that same course.</td>
+          <td>TrainerMate PATCHes and re-fetches the same meeting. The updated topic and unchanged Meeting ID are shown, and no duplicate is created.</td>
         </tr>
       </table>
 
@@ -245,7 +251,7 @@
 
       <h3>Step 1 - Log in to TrainerMate</h3>
       <ol>
-        <li>Open <span class="mono">https://demo.trainermate.xyz</span>.</li>
+        <li>Open <span class="mono">https://review.trainermate.xyz</span>.</li>
         <li>Sign in using the reviewer email and password supplied in the submission notes.</li>
         <li>Confirm the TrainerMate dashboard loads with seeded scheduled courses.</li>
       </ol>
@@ -261,8 +267,8 @@
       <ol>
         <li>Open <strong>Zoom accounts</strong>.</li>
         <li>Click <strong>Connect Zoom account</strong>.</li>
-        <li>Approve TrainerMate in the Zoom authorization screen.</li>
-        <li>Confirm Zoom redirects back to <span class="mono">https://demo.trainermate.xyz/zoom/callback</span>.</li>
+        <li>Confirm the Zoom authorization screen identifies the Development version of TrainerMate, then approve it.</li>
+        <li>Confirm Zoom redirects back to <span class="mono">https://review.trainermate.xyz/zoom/callback</span>.</li>
       </ol>
       <p><strong>Expected result:</strong> TrainerMate displays the connected Zoom account. This demonstrates OAuth authorization, redirect handling, token exchange, and <code>user:read:user</code> account verification.</p>
 
@@ -288,9 +294,12 @@
 
       <h3>Step 6 - Update an existing course meeting</h3>
       <ol>
-        <li>On a synced course, click <strong>Replace/update Zoom</strong>.</li>
+        <li>Note the Meeting ID on a synced course.</li>
+        <li>Run the existing-meeting update action for that course.</li>
+        <li>Confirm TrainerMate displays the updated topic, the same Meeting ID, and confirmation that no duplicate was created.</li>
+        <li>Open Zoom and confirm the same meeting now has the updated review topic.</li>
       </ol>
-      <p><strong>Expected result:</strong> TrainerMate updates or refreshes the existing Zoom meeting associated with the course, demonstrating the meeting write/update capability without creating a duplicate.</p>
+      <p><strong>Expected result:</strong> TrainerMate PATCHes the existing meeting, re-fetches it, verifies the updated topic and unchanged Meeting ID, and does not create a duplicate. This demonstrates <code>meeting:update:meeting</code>.</p>
 
       <h3>Step 7 - Optional deleted meeting scenario</h3>
       <ol>
@@ -314,8 +323,8 @@
         Before submitting, confirm these items are complete in the Zoom Marketplace build flow and submission notes. They are common review blockers and are separate from the in-app test flow above.
       </p>
       <ul>
-        <li>Production OAuth redirect URI is set to <span class="mono">https://demo.trainermate.xyz/zoom/callback</span>.</li>
-        <li>Deauthorization/uninstall URL is set to <span class="mono">https://demo.trainermate.xyz/zoom/deauthorize</span>, reachable over HTTPS, and removes the stored Zoom connection/tokens for the deauthorized user.</li>
+        <li>Development OAuth redirect URI is set to <span class="mono">https://review.trainermate.xyz/zoom/callback</span>.</li>
+        <li>Reviewer credentials and Zoom Development credentials are configured only in the isolated reviewer service environment.</li>
         <li>If a Zoom verification token is configured, the hosted environment uses the same value in <span class="mono">ZOOM_DEAUTHORIZATION_VERIFICATION_TOKEN</span> or <span class="mono">ZOOM_VERIFICATION_TOKEN</span>.</li>
         <li>Requested scopes exactly match the scopes covered in this plan; remove any unused development scopes before submission.</li>
         <li>Reviewer credentials are included in the submission notes and have seeded course data available immediately after login.</li>
@@ -350,17 +359,17 @@
       <h2>9. Expected reviewer completion criteria</h2>
       <ul>
         <li>Reviewer can log in to TrainerMate.</li>
-        <li>Reviewer can authorize Zoom using the Production Client ID.</li>
+        <li>Reviewer can authorize Zoom using the Development Client ID.</li>
         <li>Reviewer can see the connected Zoom account after callback.</li>
         <li>Reviewer can set the scan window to at least 14 days and run seeded course sync from the dashboard.</li>
         <li>Reviewer can create or link meetings for seeded courses.</li>
         <li>Reviewer can run the same action again without creating a duplicate meeting.</li>
-        <li>Reviewer can update or refresh an existing course meeting.</li>
+        <li>Reviewer can update an existing course meeting, see the changed topic, and verify that its Meeting ID is unchanged.</li>
         <li>Reviewer can disconnect and reconnect Zoom.</li>
       </ul>
     </section>
 
-    <p class="small">Last updated for Zoom Marketplace review: May 2026. Includes reviewer guidance to use a 14-day or longer scan window.</p>
+    <p class="small">Updated for the Zoom Marketplace Development review of <code>meeting:update:meeting</code>.</p>
   </main>
 </body>
 </html>

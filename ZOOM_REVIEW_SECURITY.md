@@ -1,10 +1,10 @@
 # TrainerMate Zoom Marketplace review notes
 
-TrainerMate's hosted reviewer environment is a Render-hosted Flask app for Zoom Marketplace review. It uses seeded training course rows so reviewers can exercise the Zoom workflow without needing private FOBS/provider credentials.
+TrainerMate's hosted reviewer environment is a separate Render-hosted Flask app for the Zoom Marketplace Development review. It uses seeded training course rows so reviewers can exercise the Zoom workflow without needing private FOBS/provider credentials. See `ZOOM_DEVELOPMENT_REVIEW.md` and deploy with `render-review.yaml`; do not replace the production desktop OAuth broker.
 
 ## OAuth and redirect URL
 
-- Published review redirect URL: `https://demo.trainermate.xyz/zoom/callback`
+- Development review redirect URL: `https://review.trainermate.xyz/zoom/callback`
 - The app reads the redirect URL from `TRAINERMATE_ZOOM_REDIRECT_URI` or `ZOOM_REDIRECT_URI`.
 - The app must be served over HTTPS for Zoom OAuth review.
 
@@ -14,10 +14,10 @@ Set these in Render environment variables only. Do not commit them to GitHub.
 
 ```text
 TRAINERMATE_REVIEWER_DEMO=1
-ZOOM_CLIENT_ID=<production Zoom client id>
-ZOOM_CLIENT_SECRET=<production Zoom client secret>
-ZOOM_REDIRECT_URI=https://demo.trainermate.xyz/zoom/callback
-REVIEWER_PASSWORD=<temporary reviewer password>
+ZOOM_CLIENT_ID=<Zoom Marketplace Development client id>
+ZOOM_CLIENT_SECRET=<Zoom Marketplace Development client secret>
+TRAINERMATE_ZOOM_REDIRECT_URI=https://review.trainermate.xyz/zoom/callback
+TRAINERMATE_REVIEWER_PASSWORD=<temporary reviewer password>
 FLASK_SECRET_KEY=<long random secret>
 SESSION_COOKIE_SECURE=1
 ```
@@ -39,7 +39,7 @@ SESSION_COOKIE_SECURE=1
 
 ## Reviewer test path
 
-1. Open `https://demo.trainermate.xyz`.
+1. Open `https://review.trainermate.xyz`.
 2. Log in with the reviewer password.
 3. Open Zoom accounts and connect the reviewer Zoom account.
 4. Run seeded course sync or use a course-level Zoom action.

@@ -139,10 +139,16 @@ def _load_zoom_oauth_config_file():
     return {}
 
 _zoom_oauth_config = _load_zoom_oauth_config_file()
-ZOOM_CLIENT_ID = (os.getenv('ZOOM_CLIENT_ID') or _zoom_oauth_config.get('client_id') or '').strip()
+ISOLATED_REVIEWER_SERVICE = os.getenv('TRAINERMATE_REVIEWER_DEMO', '').strip().lower() in {'1', 'true', 'yes', 'on'}
+ZOOM_CLIENT_ID = (
+    os.getenv('ZOOM_CLIENT_ID')
+    if ISOLATED_REVIEWER_SERVICE
+    else (os.getenv('ZOOM_CLIENT_ID') or _zoom_oauth_config.get('client_id'))
+    or ''
+).strip()
 ZOOM_OAUTH_KEYRING_SERVICE = 'trainermate_zoom_oauth'
 _legacy_zoom_client_secret = (_zoom_oauth_config.get('client_secret') or '').strip()
-if _legacy_zoom_client_secret:
+if _legacy_zoom_client_secret and not ISOLATED_REVIEWER_SERVICE:
     try:
         keyring.set_password(ZOOM_OAUTH_KEYRING_SERVICE, 'client_secret', _legacy_zoom_client_secret)
     except Exception:
@@ -155,9 +161,19 @@ if _legacy_zoom_client_secret:
         _zoom_oauth_config = sanitized
     except Exception:
         pass
-ZOOM_CLIENT_SECRET = (os.getenv('ZOOM_CLIENT_SECRET') or keyring.get_password(ZOOM_OAUTH_KEYRING_SERVICE, 'client_secret') or '').strip()
+ZOOM_CLIENT_SECRET = (
+    os.getenv('ZOOM_CLIENT_SECRET')
+    if ISOLATED_REVIEWER_SERVICE
+    else (os.getenv('ZOOM_CLIENT_SECRET') or keyring.get_password(ZOOM_OAUTH_KEYRING_SERVICE, 'client_secret'))
+    or ''
+).strip()
 LOCAL_ZOOM_CALLBACK_URI = 'http://127.0.0.1:5000/zoom/callback'
-ZOOM_APPROVED_RELAY_URI = (os.getenv('TRAINERMATE_ZOOM_REDIRECT_URI') or os.getenv('ZOOM_REDIRECT_URI') or _zoom_oauth_config.get('redirect_uri') or 'https://demo.trainermate.xyz/zoom/callback').strip()
+ZOOM_APPROVED_RELAY_URI = (
+    (os.getenv('TRAINERMATE_ZOOM_REDIRECT_URI') or os.getenv('ZOOM_REDIRECT_URI'))
+    if ISOLATED_REVIEWER_SERVICE
+    else (os.getenv('TRAINERMATE_ZOOM_REDIRECT_URI') or os.getenv('ZOOM_REDIRECT_URI') or _zoom_oauth_config.get('redirect_uri') or 'https://demo.trainermate.xyz/zoom/callback')
+    or ''
+).strip()
 ZOOM_DEAUTHORIZATION_VERIFICATION_TOKEN = (
     os.getenv('ZOOM_DEAUTHORIZATION_VERIFICATION_TOKEN')
     or os.getenv('ZOOM_VERIFICATION_TOKEN')
@@ -189,7 +205,7 @@ PROVIDER_PRESETS = {
 
 app = Flask(__name__)
 REVIEWER_DEMO_MODE = os.getenv('TRAINERMATE_REVIEWER_DEMO', '1').strip().lower() in {'1', 'true', 'yes', 'on'}
-REVIEWER_PASSWORD = os.getenv('REVIEWER_PASSWORD', '').strip()
+REVIEWER_PASSWORD = (os.getenv('TRAINERMATE_REVIEWER_PASSWORD') or os.getenv('REVIEWER_PASSWORD') or '').strip()
 REVIEWER_TOKEN_STORE_PATH = BASE_DIR / 'reviewer_zoom_tokens.json'
 REVIEWER_DEMO_SEEDED = False
 
@@ -243,6 +259,11 @@ def csrf_hidden_field():
 
 def reviewer_demo_enabled():
     return REVIEWER_DEMO_MODE
+
+
+def reviewer_demo_configured():
+    """Fail closed until the isolated reviewer service has an external password."""
+    return bool(REVIEWER_PASSWORD)
 
 
 def reviewer_demo_public_path():
@@ -10017,14 +10038,18 @@ def compact_activity_items(limit=4):
 def trainer_login():
     if not reviewer_demo_enabled():
         return redirect(url_for('home'))
+    if not reviewer_demo_configured():
+        return render_template_string("""
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>TrainerMate reviewer environment unavailable</title></head>
+<body><main><h1>Reviewer environment unavailable</h1><p>The reviewer login has not been configured. Please contact TrainerMate support.</p></main></body></html>
+        """), 503
     error = ''
     default_email = os.getenv('TRAINERMATE_LOGIN_EMAIL', 'reviewer@zoom.us').strip() or 'reviewer@zoom.us'
     entered_email = default_email
     if request.method == 'POST':
         entered_email = (request.form.get('email') or '').strip().lower()
         supplied = request.form.get('password') or ''
-        expected = REVIEWER_PASSWORD or 'zoomreview'
-        if entered_email == default_email.lower() and hmac.compare_digest(supplied, expected):
+        if entered_email == default_email.lower() and hmac.compare_digest(supplied, REVIEWER_PASSWORD):
             session['reviewer_demo_ok'] = True
             return redirect(request.args.get('next') or url_for('home'))
         error = 'The email or password was not accepted.'
@@ -10425,16 +10450,10 @@ def zoom_callback():
         nickname = session.get('zoom_oauth_nickname') or email or (me_data.get('display_name') or 'Zoom account')
         upsert_zoom_account(email, nickname, access_token, refresh_token)
         set_flash(f'Zoom connected for {email or nickname}.', 'success')
-    except requests.HTTPError as exc:
-        response_text = ''
-        try:
-            response_text = exc.response.text[:400]
-        except Exception:
-            response_text = ''
-        detail = f'{exc}' + (f' | {response_text}' if response_text else '')
-        set_flash(f'Zoom connection failed: {detail}', 'error')
-    except Exception as exc:
-        set_flash(f'Zoom connection failed: {exc}', 'error')
+    except requests.HTTPError:
+        set_flash('Zoom connection failed. Please return to Zoom accounts and try again.', 'error')
+    except Exception:
+        set_flash('Zoom connection failed. Please return to Zoom accounts and try again.', 'error')
     session.pop('zoom_oauth_state', None)
     session.pop('zoom_oauth_nickname', None)
     return redirect(url_for('home', section='zoom_accounts'))
@@ -10952,6 +10971,10 @@ def reviewer_zoom_topic_for_course(course):
     return f"TrainerMate - {course.get('title') or 'Training course'}".strip()
 
 
+def reviewer_zoom_updated_topic_for_course(course):
+    return f"{reviewer_zoom_topic_for_course(course)} - Updated for review"
+
+
 def reviewer_course_start_datetime(course):
     start_dt = parse_dashboard_datetime(course.get('date_time') or '')
     if not start_dt:
@@ -11089,17 +11112,34 @@ def reviewer_find_existing_zoom_meeting(course, token):
 
 
 def reviewer_patch_zoom_meeting(course, meeting_id, token, action='Existing Zoom meeting verified and updated for TrainerMate'):
-    payload = reviewer_zoom_payload_for_course(course, replace=True)
-    response = reviewer_zoom_request('PATCH', f'https://api.zoom.us/v2/meetings/{meeting_id}', token, json=payload)
+    normalized_meeting_id = normalize_zoom_meeting_id(meeting_id)
+    if not normalized_meeting_id:
+        return False, 'The linked Zoom Meeting ID is invalid.'
+    expected_topic = reviewer_zoom_updated_topic_for_course(course)
+    response = reviewer_zoom_request(
+        'PATCH',
+        f'https://api.zoom.us/v2/meetings/{normalized_meeting_id}',
+        token,
+        json={'topic': expected_topic},
+    )
     if response.status_code not in (200, 204):
-        return False, response
-    get_response = reviewer_zoom_request('GET', f'https://api.zoom.us/v2/meetings/{meeting_id}', token)
-    if get_response.status_code == 200:
-        data = get_response.json()
-        reviewer_update_course_zoom(course.get('id'), data.get('id') or meeting_id, data.get('join_url') or course.get('meeting_link'), data.get('password') or course.get('meeting_password') or '', action)
-    else:
-        reviewer_update_course_zoom(course.get('id'), meeting_id, course.get('meeting_link'), course.get('meeting_password'), action)
-    return True, response
+        return False, 'Zoom did not accept the existing-meeting update.'
+    get_response = reviewer_zoom_request('GET', f'https://api.zoom.us/v2/meetings/{normalized_meeting_id}', token)
+    if get_response.status_code != 200:
+        return False, 'Zoom accepted the update, but TrainerMate could not verify it.'
+    data = get_response.json()
+    verified_id = normalize_zoom_meeting_id(data.get('id') or '')
+    verified_topic = (data.get('topic') or '').strip()
+    if verified_id != normalized_meeting_id or verified_topic != expected_topic:
+        return False, 'Zoom accepted the update, but the same meeting and updated topic were not verified.'
+    reviewer_update_course_zoom(
+        course.get('id'),
+        verified_id,
+        data.get('join_url') or course.get('meeting_link'),
+        data.get('password') or course.get('meeting_password') or '',
+        f'{action}. Topic verified: {expected_topic}',
+    )
+    return True, {'meeting_id': verified_id, 'topic': verified_topic}
 
 
 def reviewer_create_zoom_meeting(course, replace=False, progress=None):
@@ -11126,22 +11166,8 @@ def reviewer_create_zoom_meeting(course, replace=False, progress=None):
             report('Saved Zoom meeting exists. Verifying the course link now.')
             ok, patch_response = reviewer_patch_zoom_meeting(course, saved_meeting_id, token, action='Zoom meeting already exists - verified')
             if ok:
-                return True, f"Zoom meeting already exists - verified for {course.get('title')}. Meeting ID: {saved_meeting_id}"
-            # A successful read proves the linked meeting exists. Treat this as a
-            # successful verification rather than a failed sync, even if Zoom does
-            # not accept a metadata refresh for this meeting.
-            try:
-                data = existing.json()
-            except Exception:
-                data = {}
-            reviewer_update_course_zoom(
-                course.get('id'),
-                data.get('id') or saved_meeting_id,
-                data.get('join_url') or course.get('meeting_link') or '',
-                data.get('password') or course.get('meeting_password') or '',
-                'Zoom meeting already exists - verified',
-            )
-            return True, f"Zoom meeting already exists - verified for {course.get('title')}. Meeting ID: {saved_meeting_id}"
+                return True, f"Existing Zoom meeting updated and verified. Topic: {patch_response['topic']}. Same Meeting ID: {saved_meeting_id}. No duplicate was created."
+            return False, str(patch_response)
         if existing.status_code not in (404, 410):
             return False, 'TrainerMate could not verify the existing Zoom meeting just now. Please try again in a moment.'
         report('Saved Zoom meeting was not found in Zoom. Searching for a matching meeting before creating one.')
@@ -11156,11 +11182,8 @@ def reviewer_create_zoom_meeting(course, replace=False, progress=None):
         report(f'Matching Zoom meeting found: {meeting_id}. Linking it to this course.')
         ok, patch_response = reviewer_patch_zoom_meeting(course, meeting_id, token, action='Zoom meeting already exists - verified')
         if ok:
-            return True, f"Zoom meeting already exists - verified for {course.get('title')}. Meeting ID: {meeting_id}"
-        # The meeting was found by list/read, so count this as verified and linked
-        # rather than a failed sync if Zoom declines a metadata refresh.
-        reviewer_update_course_zoom(course.get('id'), meeting_id, matching.get('meeting_link') or '', matching.get('meeting_password') or '', 'Zoom meeting already exists - verified')
-        return True, f"Zoom meeting already exists - verified for {course.get('title')}. Meeting ID: {meeting_id}"
+            return True, f"Existing Zoom meeting updated and verified. Topic: {patch_response['topic']}. Same Meeting ID: {meeting_id}. No duplicate was created."
+        return False, str(patch_response)
 
     # Only create when there is no saved, verified, or matching meeting.
     report('No existing matching Zoom meeting found. Creating one new meeting now.')

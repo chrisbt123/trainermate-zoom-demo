@@ -1,4 +1,4 @@
-# TrainerMate actual dashboard reviewer demo
+# TrainerMate Development reviewer dashboard
 
 This package is the real `dashboard_app.py` dashboard, patched for a hosted Zoom Marketplace reviewer mode.
 
@@ -9,10 +9,10 @@ It uses dummy provider/course data, but keeps the real TrainerMate dashboard UI 
 Required:
 
 - `TRAINERMATE_REVIEWER_DEMO=1`
-- `ZOOM_CLIENT_ID=<Production Zoom Client ID>`
-- `ZOOM_CLIENT_SECRET=<Production Zoom Client Secret>`
-- `ZOOM_REDIRECT_URI=https://demo.trainermate.xyz/zoom/callback`
-- `REVIEWER_PASSWORD=<temporary reviewer password>`
+- `ZOOM_CLIENT_ID=<Zoom Marketplace Development Client ID>`
+- `ZOOM_CLIENT_SECRET=<Zoom Marketplace Development Client Secret>`
+- `TRAINERMATE_ZOOM_REDIRECT_URI=https://review.trainermate.xyz/zoom/callback`
+- `TRAINERMATE_REVIEWER_PASSWORD=<temporary reviewer password>`
 - `FLASK_SECRET_KEY=<long random secret>`
 - `SESSION_COOKIE_SECURE=1`
 
@@ -39,7 +39,7 @@ gunicorn app:app
 
 ## Reviewer flow
 
-1. Open `https://demo.trainermate.xyz`.
+1. Open `https://review.trainermate.xyz`.
 2. Log in with the shared reviewer password.
 3. Open Zoom accounts and connect Zoom.
 4. Return to Dashboard.

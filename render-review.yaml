@@ -1,0 +1,33 @@
+services:
+  - type: web
+    name: trainermate-zoom-development-review
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    healthCheckPath: /healthz
+    autoDeploy: false
+    envVars:
+      - key: TRAINERMATE_REVIEWER_DEMO
+        value: "1"
+      - key: TRAINERMATE_REVIEWER_PASSWORD
+        sync: false
+      - key: TRAINERMATE_LOGIN_EMAIL
+        value: reviewer@zoom.us
+      - key: ZOOM_CLIENT_ID
+        sync: false
+      - key: ZOOM_CLIENT_SECRET
+        sync: false
+      - key: TRAINERMATE_ZOOM_REDIRECT_URI
+        value: https://review.trainermate.xyz/zoom/callback
+      - key: FLASK_SECRET_KEY
+        sync: false
+      - key: SESSION_COOKIE_SECURE
+        value: "1"
+      - key: TRAINERMATE_STARTUP_CERTIFICATE_SCAN
+        value: "0"
+      - key: TRAINERMATE_STARTUP_ZOOM_HEALTH_CHECK
+        value: "0"
+      - key: TRAINERMATE_AUTOMATION_SCHEDULER
+        value: "0"
+      - key: TRAINERMATE_REMOTE_ADMIN
+        value: "0"
