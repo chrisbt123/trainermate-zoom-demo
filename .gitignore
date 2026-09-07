@@ -30,3 +30,4 @@ backup/
 archive/
 .upgrade-backups/
 access_cache.json
+access_cache.json
