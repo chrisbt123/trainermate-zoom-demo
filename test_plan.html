@@ -325,7 +325,7 @@
       <ul>
         <li>Development OAuth redirect URI is set to <span class="mono">https://review.trainermate.xyz/zoom/callback</span>.</li>
         <li>Reviewer credentials and Zoom Development credentials are configured only in the isolated reviewer service environment.</li>
-        <li>If a Zoom verification token is configured, the hosted environment uses the same value in <span class="mono">ZOOM_DEAUTHORIZATION_VERIFICATION_TOKEN</span> or <span class="mono">ZOOM_VERIFICATION_TOKEN</span>.</li>
+        <li>The hosted environment verifies Zoom webhook requests with the Webhook Secret Token configured server-side as <span class="mono">ZOOM_WEBHOOK_SECRET_TOKEN</span> and Zoom's <span class="mono">x-zm-signature</span> header.</li>
         <li>Requested scopes exactly match the scopes covered in this plan; remove any unused development scopes before submission.</li>
         <li>Reviewer credentials are included in the submission notes and have seeded course data available immediately after login.</li>
         <li>Support, documentation, privacy policy, and terms URLs are live and actionable.</li>

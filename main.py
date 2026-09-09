@@ -35,8 +35,11 @@ PENDING_PATH = Path(os.getenv("TRAINERMATE_ZOOM_PENDING_PATH", "/tmp/trainermate
 
 ZOOM_CLIENT_ID = os.getenv("ZOOM_CLIENT_ID", "").strip()
 ZOOM_CLIENT_SECRET = os.getenv("ZOOM_CLIENT_SECRET", "").strip()
+ZOOM_WEBHOOK_SECRET_TOKEN = os.getenv("ZOOM_WEBHOOK_SECRET_TOKEN", "").strip()
 ZOOM_REDIRECT_URI = os.getenv("TRAINERMATE_ZOOM_REDIRECT_URI", "https://demo.trainermate.xyz/zoom/callback").strip()
 STATE_SECRET = os.getenv("TRAINERMATE_ZOOM_OAUTH_STATE_SECRET", "").strip()
+ADMIN_API_URL = os.getenv("TRAINERMATE_ADMIN_API_URL", "https://trainermate-admin-api.onrender.com").strip().rstrip("/")
+ZOOM_DEAUTH_RELAY_SECRET = os.getenv("TRAINERMATE_ZOOM_DEAUTH_RELAY_SECRET", "").strip()
 STATE_TTL_SECONDS = int(os.getenv("TRAINERMATE_ZOOM_STATE_TTL_SECONDS", "600"))
 BROKER_CODE_TTL_SECONDS = int(os.getenv("TRAINERMATE_ZOOM_BROKER_CODE_TTL_SECONDS", "300"))
 
@@ -186,6 +189,73 @@ def pop_broker_code(code: str) -> dict[str, Any]:
     return entry
 
 
+def clear_pending_zoom_user(user_id: str, account_id: str) -> int:
+    data = load_pending()
+    kept = {}
+    removed = 0
+    for code, entry in data.items():
+        zoom_user = entry.get("zoom_user") if isinstance(entry.get("zoom_user"), dict) else {}
+        entry_user_id = str(zoom_user.get("id") or "").strip()
+        entry_account_id = str(zoom_user.get("account_id") or "").strip()
+        if entry_user_id == user_id and entry_account_id == account_id:
+            removed += 1
+            continue
+        kept[code] = entry
+    if removed:
+        save_pending(kept)
+    return removed
+
+
+def verify_zoom_webhook_signature(raw_body: bytes, timestamp: str, signature: str) -> bool:
+    timestamp = (timestamp or "").strip()
+    signature = (signature or "").strip()
+    if not ZOOM_WEBHOOK_SECRET_TOKEN or not timestamp or not signature:
+        return False
+    message = b"v0:" + timestamp.encode("utf-8") + b":" + raw_body
+    digest = hmac.new(
+        ZOOM_WEBHOOK_SECRET_TOKEN.encode("utf-8"),
+        message,
+        hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(signature, "v0=" + digest)
+
+
+def zoom_url_validation_response(payload: dict[str, Any]) -> dict[str, str]:
+    plain_token = payload.get("plainToken") if isinstance(payload, dict) else None
+    if not isinstance(plain_token, str) or not plain_token:
+        raise HTTPException(status_code=400, detail="Invalid Zoom URL validation request.")
+    encrypted_token = hmac.new(
+        ZOOM_WEBHOOK_SECRET_TOKEN.encode("utf-8"),
+        plain_token.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return {"plainToken": plain_token, "encryptedToken": encrypted_token}
+
+
+def relay_zoom_deauthorization(payload: dict[str, Any]) -> None:
+    if not ADMIN_API_URL or not ZOOM_DEAUTH_RELAY_SECRET:
+        raise HTTPException(status_code=503, detail="Zoom deauthorization relay is not configured.")
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    relay_request = urllib.request.Request(
+        ADMIN_API_URL + "/internal/zoom/deauthorization",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-TrainerMate-Zoom-Relay-Secret": ZOOM_DEAUTH_RELAY_SECRET,
+            "User-Agent": "TrainerMate-Zoom-Broker/1.0",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(relay_request, timeout=15) as response:
+            if int(getattr(response, "status", 0) or 0) not in range(200, 300):
+                raise HTTPException(status_code=503, detail="Zoom deauthorization relay was not accepted.")
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=503, detail="Zoom deauthorization relay is temporarily unavailable.")
+
+
 def zoom_token_request(params: dict[str, str]) -> dict[str, Any]:
     if not service_ready():
         raise HTTPException(status_code=503, detail="Zoom OAuth is not configured")
@@ -262,6 +332,52 @@ def health():
     return JSONResponse({"ok": True, "service": "trainermate-zoom-broker", "zoom_configured": service_ready()})
 
 
+@app.get("/zoom/app-info")
+def zoom_app_info():
+    if not ZOOM_CLIENT_ID:
+        raise HTTPException(status_code=503, detail="Zoom OAuth is not configured")
+    return {"client_id": ZOOM_CLIENT_ID}
+
+
+@app.post("/zoom/deauthorize")
+async def zoom_deauthorize(request: Request):
+    raw_body = await request.body()
+    timestamp = request.headers.get("x-zm-request-timestamp") or ""
+    signature = request.headers.get("x-zm-signature") or ""
+    if not verify_zoom_webhook_signature(raw_body, timestamp, signature):
+        raise HTTPException(status_code=401, detail="Invalid Zoom webhook signature.")
+
+    try:
+        event = json.loads(raw_body)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid Zoom webhook payload.")
+    if not isinstance(event, dict):
+        raise HTTPException(status_code=400, detail="Invalid Zoom webhook payload.")
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+
+    if event.get("event") == "endpoint.url_validation":
+        return zoom_url_validation_response(payload)
+    if event.get("event") != "app_deauthorized":
+        return {"ok": True, "message": "Zoom webhook received."}
+
+    user_id = str(payload.get("user_id") or "").strip()
+    account_id = str(payload.get("account_id") or "").strip()
+    client_id = str(payload.get("client_id") or "").strip()
+    if not user_id or not account_id or not client_id:
+        raise HTTPException(status_code=400, detail="Invalid Zoom deauthorization payload.")
+    if not ZOOM_CLIENT_ID or client_id != ZOOM_CLIENT_ID:
+        raise HTTPException(status_code=400, detail="Zoom client ID does not match TrainerMate.")
+
+    relay_zoom_deauthorization({
+        "user_id": user_id,
+        "account_id": account_id,
+        "client_id": client_id,
+        "deauthorization_time": str(payload.get("deauthorization_time") or "").strip(),
+    })
+    clear_pending_zoom_user(user_id, account_id)
+    return {"ok": True, "message": "Zoom deauthorization processed."}
+
+
 @app.post("/zoom/oauth/start")
 def zoom_oauth_start(payload: ZoomOAuthStartRequest):
     if not service_ready():
@@ -326,6 +442,7 @@ def zoom_oauth_callback(request: Request):
             "ndors": state.get("ndors") or "",
             "email": state.get("email") or "",
             "device_id": state.get("device_id") or "",
+            "authorized_at": now_ts(),
             "token_data": token_data,
             "zoom_user": zoom_api_get_me(access_token),
         })
@@ -355,6 +472,8 @@ def zoom_oauth_redeem(payload: ZoomOAuthRedeemRequest):
         "expires_in": token_data.get("expires_in"),
         "scope": token_data.get("scope") or "",
         "token_type": token_data.get("token_type") or "bearer",
+        "zoom_client_id": ZOOM_CLIENT_ID,
+        "zoom_authorized_at": int(entry.get("authorized_at") or 0),
         "zoom_user": entry.get("zoom_user") if isinstance(entry.get("zoom_user"), dict) else {},
     }
 

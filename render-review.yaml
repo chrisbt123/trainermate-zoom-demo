@@ -18,6 +18,8 @@ services:
         sync: false
       - key: ZOOM_CLIENT_SECRET
         sync: false
+      - key: ZOOM_WEBHOOK_SECRET_TOKEN
+        sync: false
       - key: TRAINERMATE_ZOOM_REDIRECT_URI
         value: https://review.trainermate.xyz/zoom/callback
       - key: FLASK_SECRET_KEY

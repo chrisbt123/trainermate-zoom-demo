@@ -174,11 +174,7 @@ ZOOM_APPROVED_RELAY_URI = (
     else (os.getenv('TRAINERMATE_ZOOM_REDIRECT_URI') or os.getenv('ZOOM_REDIRECT_URI') or _zoom_oauth_config.get('redirect_uri') or 'https://demo.trainermate.xyz/zoom/callback')
     or ''
 ).strip()
-ZOOM_DEAUTHORIZATION_VERIFICATION_TOKEN = (
-    os.getenv('ZOOM_DEAUTHORIZATION_VERIFICATION_TOKEN')
-    or os.getenv('ZOOM_VERIFICATION_TOKEN')
-    or ''
-).strip()
+ZOOM_WEBHOOK_SECRET_TOKEN = (os.getenv('ZOOM_WEBHOOK_SECRET_TOKEN') or '').strip()
 # Keep the pending Zoom Marketplace redirect stable. Localhost is only used
 # after the hosted callback relays the browser back to the desktop app.
 ZOOM_REDIRECT_URI = ZOOM_APPROVED_RELAY_URI
@@ -448,6 +444,8 @@ body.tm-modal-open{overflow:hidden}.tm-top-flash{display:none}
 
 @app.before_request
 def security_before_request():
+    if request.endpoint == 'zoom_deauthorize':
+        return None
     if reviewer_demo_enabled():
         ensure_reviewer_demo_seed()
         if not reviewer_demo_public_path() and not reviewer_demo_logged_in():
@@ -10494,13 +10492,37 @@ def zoom_disconnect(account_id):
 
 @app.route('/zoom/deauthorize', methods=['POST'])
 def zoom_deauthorize():
-    expected_token = ZOOM_DEAUTHORIZATION_VERIFICATION_TOKEN
-    received_token = (request.headers.get('authorization') or '').strip()
-    if expected_token and not hmac.compare_digest(received_token, expected_token):
-        return jsonify({'ok': False, 'message': 'Invalid deauthorization verification token.'}), 401
+    raw_body = request.get_data(cache=True)
+    timestamp = (request.headers.get('x-zm-request-timestamp') or '').strip()
+    received_signature = (request.headers.get('x-zm-signature') or '').strip()
+    if not ZOOM_WEBHOOK_SECRET_TOKEN or not timestamp or not received_signature:
+        return jsonify({'ok': False, 'message': 'Invalid Zoom webhook signature.'}), 401
+
+    message = b'v0:' + timestamp.encode('utf-8') + b':' + raw_body
+    expected_signature = 'v0=' + hmac.new(
+        ZOOM_WEBHOOK_SECRET_TOKEN.encode('utf-8'),
+        message,
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(received_signature, expected_signature):
+        return jsonify({'ok': False, 'message': 'Invalid Zoom webhook signature.'}), 401
 
     event = request.get_json(silent=True) or {}
     payload = event.get('payload') if isinstance(event.get('payload'), dict) else {}
+    if event.get('event') == 'endpoint.url_validation':
+        plain_token = payload.get('plainToken')
+        if not isinstance(plain_token, str) or not plain_token:
+            return jsonify({'ok': False, 'message': 'Invalid Zoom URL validation request.'}), 400
+        encrypted_token = hmac.new(
+            ZOOM_WEBHOOK_SECRET_TOKEN.encode('utf-8'),
+            plain_token.encode('utf-8'),
+            hashlib.sha256,
+        ).hexdigest()
+        return jsonify({'plainToken': plain_token, 'encryptedToken': encrypted_token})
+
+    if event.get('event') != 'app_deauthorized':
+        return jsonify({'ok': True, 'message': 'Zoom webhook received.'})
+
     event_client_id = str(payload.get('client_id') or event.get('client_id') or '').strip()
     if ZOOM_CLIENT_ID and event_client_id and event_client_id != ZOOM_CLIENT_ID:
         return jsonify({'ok': False, 'message': 'Client ID does not match this TrainerMate app.'}), 400

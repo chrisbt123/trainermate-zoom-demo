@@ -55,7 +55,7 @@ class ReviewerDevelopmentTests(unittest.TestCase):
 
     def test_oauth_callback_is_environment_configured_and_hides_raw_failures(self):
         source = APP.read_text(encoding="utf-8-sig")
-        config = source[source.index("_zoom_oauth_config ="):source.index("ZOOM_DEAUTHORIZATION_VERIFICATION_TOKEN")]
+        config = source[source.index("_zoom_oauth_config ="):source.index("ZOOM_WEBHOOK_SECRET_TOKEN")]
         callback = source[source.index("def zoom_callback"):source.index("@app.route('/zoom/set-default")]
         self.assertIn("if ISOLATED_REVIEWER_SERVICE", config)
         self.assertIn("os.getenv('ZOOM_CLIENT_ID')", config)

@@ -10,7 +10,13 @@ services:
         sync: false
       - key: ZOOM_CLIENT_SECRET
         sync: false
+      - key: ZOOM_WEBHOOK_SECRET_TOKEN
+        sync: false
       - key: TRAINERMATE_ZOOM_REDIRECT_URI
         value: https://demo.trainermate.xyz/zoom/callback
       - key: TRAINERMATE_ZOOM_OAUTH_STATE_SECRET
+        sync: false
+      - key: TRAINERMATE_ADMIN_API_URL
+        value: https://trainermate-admin-api.onrender.com
+      - key: TRAINERMATE_ZOOM_DEAUTH_RELAY_SECRET
         sync: false
