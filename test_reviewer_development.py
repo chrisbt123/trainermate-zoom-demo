@@ -23,6 +23,19 @@ def load_functions(*names, namespace=None):
 
 
 class ReviewerDevelopmentTests(unittest.TestCase):
+    def test_synced_reviewer_course_renders_verify_action(self):
+        source = APP.read_text(encoding="utf-8-sig")
+        table = source[source.index("<strong>Upcoming courses</strong>"):source.index("<h3>Items to check</h3>")]
+        self.assertIn("reviewer_demo_mode=reviewer_demo_enabled()", source)
+        self.assertIn("{% if reviewer_demo_mode %}", table)
+        self.assertIn("{% if row.meeting_id %}Verify Zoom meeting{% else %}Create Zoom meeting{% endif %}", table)
+        self.assertNotIn("row.is_action_needed and reviewer_demo_mode", table)
+
+    def test_course_without_meeting_uses_create_label_not_verify_only(self):
+        source = APP.read_text(encoding="utf-8-sig")
+        table = source[source.index("<strong>Upcoming courses</strong>"):source.index("<h3>Items to check</h3>")]
+        self.assertIn("{% else %}Create Zoom meeting{% endif %}", table)
+
     def test_reviewer_password_has_no_builtin_fallback_and_fails_closed(self):
         source = APP.read_text(encoding="utf-8-sig")
         login = source[source.index("def trainer_login"):source.index("@app.route('/logout'")]
@@ -113,6 +126,75 @@ class ReviewerDevelopmentTests(unittest.TestCase):
         self.assertFalse(any(call[0] == "POST" for call in calls))
         self.assertEqual(saves[0][1], "123456789")
         self.assertEqual(saves[0][3], "unchanged-passcode")
+
+    def test_verify_reads_updates_and_rereads_only_saved_meeting(self):
+        calls = []
+
+        class Response:
+            def __init__(self, status_code):
+                self.status_code = status_code
+
+        def request(method, url, _token, **kwargs):
+            calls.append((method, url, kwargs))
+            return Response(200)
+
+        values = load_functions(
+            "reviewer_verify_existing_zoom_meeting",
+            namespace={
+                "normalize_zoom_meeting_id": lambda value: "89603497442",
+                "reviewer_zoom_access_token_or_message": lambda: ("development-token", ""),
+                "reviewer_zoom_request": request,
+                "reviewer_patch_zoom_meeting": lambda course, meeting_id, token: (
+                    True,
+                    {"meeting_id": meeting_id, "topic": "TrainerMate - Emergency First Aid at Work - Updated for review"},
+                ),
+            },
+        )
+        ok, message = values["reviewer_verify_existing_zoom_meeting"](
+            {"id": "course-efaw-001", "meeting_id": "896 0349 7442"}
+        )
+
+        self.assertTrue(ok)
+        self.assertEqual(calls, [("GET", "https://api.zoom.us/v2/meetings/89603497442", {})])
+        self.assertIn("Same Meeting ID: 89603497442", message)
+        self.assertIn("No duplicate was created", message)
+
+    def test_verify_missing_existing_meeting_fails_without_creation(self):
+        calls = []
+
+        class Response:
+            status_code = 404
+
+        def request(method, url, _token, **kwargs):
+            calls.append((method, url, kwargs))
+            return Response()
+
+        values = load_functions(
+            "reviewer_verify_existing_zoom_meeting",
+            namespace={
+                "normalize_zoom_meeting_id": lambda value: "89603497442",
+                "reviewer_zoom_access_token_or_message": lambda: ("development-token", ""),
+                "reviewer_zoom_request": request,
+                "reviewer_patch_zoom_meeting": lambda *args: self.fail("PATCH must not run for an inaccessible meeting"),
+            },
+        )
+        ok, message = values["reviewer_verify_existing_zoom_meeting"](
+            {"id": "course-efaw-001", "meeting_id": "89603497442"}
+        )
+
+        self.assertFalse(ok)
+        self.assertEqual([call[0] for call in calls], ["GET"])
+        self.assertIn("No replacement meeting was created", message)
+
+    def test_reviewer_verify_route_keeps_authentication_and_csrf_enforcement(self):
+        source = APP.read_text(encoding="utf-8-sig")
+        security = source[source.index("def security_before_request"):source.index("@app.after_request")]
+        route = source[source.index("@app.post('/reviewer/course/<course_id>/zoom')"):source.index("@app.route('/sync/course/<course_id>'")]
+        self.assertIn("reviewer_demo_logged_in()", security)
+        self.assertIn("validate_csrf()", security)
+        self.assertIn("reviewer_course_by_id(course_id)", route)
+        self.assertIn("reviewer_verify_existing_zoom_meeting(course)", route)
+        self.assertIn("reviewer_create_zoom_meeting(course, replace=False)", route)
 
     def test_reset_clears_seeded_course_link_without_touching_zoom_unless_requested(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -7734,7 +7734,7 @@ body{background:linear-gradient(180deg,#0b1728 0,#102237 106px,#d8e2ea 106px,#d8
                               <td>{{ row.date_label }}</td>
                               <td>{{ row.time_label }}</td>
                               <td><span class='status-tag {{ row.status_class }}'>{{ row.status_label }}</span></td>
-                              <td>{{ row.short_message }}{% if row.show_upgrade %}<a class='upgrade-link' href='https://www.trainermate.xyz/upgrade' target='_blank' rel='noopener'>Upgrade</a>{% endif %}{% if reviewer_demo_mode %}<form method='post' action='{{ url_for("reviewer_create_or_verify_zoom", course_id=row.id) }}' style='display:inline;margin-left:10px'><button class='btn small' type='submit'>{% if row.meeting_id %}Verify Zoom meeting{% else %}Create Zoom meeting{% endif %}</button></form><form method='post' action='{{ url_for("replace_course_zoom", course_id=row.id) }}' style='display:inline;margin-left:8px'><button class='btn soft small' type='submit'>Replace/update Zoom</button></form>{% endif %}{% if row.is_action_needed and not state.sync_running and not reviewer_demo_mode %}<form method='post' action='{{ url_for("check_course_only", course_id=row.id) }}' style='display:inline;margin-left:10px'><input type='hidden' name='course_key' value='{{ course_action_exact_key(row) }}'><input type='hidden' name='provider' value='{{ row.provider or "" }}'><input type='hidden' name='title' value='{{ row.title or "" }}'><input type='hidden' name='date_time' value='{{ row.date_time_raw or "" }}'><button class='btn small' type='submit'>Check course only</button></form>{% endif %}{% if row.can_confirm_removed %}<form method='post' action='{{ url_for("confirm_course_removed", course_id=row.id) }}' style='display:inline;margin-left:10px' onsubmit='return confirm("Only confirm if this course has genuinely been deleted/cancelled in FOBS. Remove it from TrainerMate?")'><button class='btn warn small' type='submit'>Confirm removed</button></form>{% endif %}</td>
+                              <td>{{ row.short_message }}{% if row.show_upgrade %}<a class='upgrade-link' href='https://www.trainermate.xyz/upgrade' target='_blank' rel='noopener'>Upgrade</a>{% endif %}{% if reviewer_demo_mode %}<form method='post' action='{{ url_for("reviewer_create_or_verify_zoom", course_id=row.id) }}' style='display:inline;margin-left:10px'><button class='btn small' type='submit'>{% if row.meeting_id %}Verify Zoom meeting{% else %}Create Zoom meeting{% endif %}</button></form>{% endif %}{% if row.is_action_needed and not state.sync_running and not reviewer_demo_mode %}<form method='post' action='{{ url_for("check_course_only", course_id=row.id) }}' style='display:inline;margin-left:10px'><input type='hidden' name='course_key' value='{{ course_action_exact_key(row) }}'><input type='hidden' name='provider' value='{{ row.provider or "" }}'><input type='hidden' name='title' value='{{ row.title or "" }}'><input type='hidden' name='date_time' value='{{ row.date_time_raw or "" }}'><button class='btn small' type='submit'>Check course only</button></form>{% endif %}{% if row.can_confirm_removed %}<form method='post' action='{{ url_for("confirm_course_removed", course_id=row.id) }}' style='display:inline;margin-left:10px' onsubmit='return confirm("Only confirm if this course has genuinely been deleted/cancelled in FOBS. Remove it from TrainerMate?")'><button class='btn warn small' type='submit'>Confirm removed</button></form>{% endif %}</td>
                             </tr>
                           {% endfor %}
                         </tbody>
@@ -10212,6 +10212,7 @@ def home():
         ZOOM_CLIENT_ID=ZOOM_CLIENT_ID,
         ZOOM_CLIENT_SECRET=ZOOM_CLIENT_SECRET,
         ZOOM_REDIRECT_URI=ZOOM_REDIRECT_URI,
+        reviewer_demo_mode=reviewer_demo_enabled(),
         csrf_hidden_field=csrf_hidden_field,
         csrf_token=csrf_token,
         course_action_exact_key=course_action_exact_key,
@@ -11504,6 +11505,23 @@ def start_reviewer_seeded_sync_async(scan_provider='all', scan_days=7):
     return True, f'Sync started for {scope_text}, next {days} days.'
 
 
+def reviewer_verify_existing_zoom_meeting(course):
+    """Read, update, and re-read one saved reviewer meeting without creating."""
+    meeting_id = normalize_zoom_meeting_id(course.get('meeting_id') or '')
+    if not meeting_id:
+        return False, 'This course has no valid saved Zoom Meeting ID to verify.'
+    token, message = reviewer_zoom_access_token_or_message()
+    if not token:
+        return False, message
+    existing = reviewer_zoom_request('GET', f'https://api.zoom.us/v2/meetings/{meeting_id}', token)
+    if existing.status_code != 200:
+        return False, 'The existing Zoom meeting could not be verified. No replacement meeting was created.'
+    ok, result = reviewer_patch_zoom_meeting(course, meeting_id, token)
+    if not ok:
+        return False, str(result)
+    return True, f"Existing Zoom meeting updated and verified. Topic: {result['topic']}. Same Meeting ID: {meeting_id}. No duplicate was created."
+
+
 @app.post('/reviewer/course/<course_id>/zoom')
 def reviewer_create_or_verify_zoom(course_id):
     if not reviewer_demo_enabled():
@@ -11513,21 +11531,8 @@ def reviewer_create_or_verify_zoom(course_id):
         set_flash('Course not found.', 'warning')
         return redirect(url_for('home', section='dashboard'))
     if course.get('meeting_id'):
-        token, message = reviewer_zoom_access_token_or_message()
-        if not token:
-            set_flash(message, 'warning')
-        else:
-            r = requests.get(f"https://api.zoom.us/v2/meetings/{course.get('meeting_id')}", headers={'Authorization': f'Bearer {token}'}, timeout=20)
-            if r.status_code == 200:
-                ok, _ = reviewer_patch_zoom_meeting(course, course.get('meeting_id'), token)
-                if ok:
-                    set_flash('Existing Zoom meeting re-verified. The course note has been refreshed.', 'success')
-                else:
-                    reviewer_update_course_zoom(course_id, course.get('meeting_id'), course.get('meeting_link'), course.get('meeting_password'), 'Existing Zoom meeting verified for TrainerMate')
-                    set_flash('Existing Zoom meeting re-verified. The course note has been refreshed.', 'success')
-            else:
-                ok, msg = reviewer_create_zoom_meeting(course, replace=True)
-                set_flash(msg, 'success' if ok else 'warning')
+        ok, message = reviewer_verify_existing_zoom_meeting(course)
+        set_flash(message, 'success' if ok else 'warning')
     else:
         ok, msg = reviewer_create_zoom_meeting(course, replace=False)
         set_flash(msg, 'success' if ok else 'warning')
